@@ -12,6 +12,8 @@ class AgentState(TypedDict):
     conversation_id: str     # NestJS conversation UUID (used by execute_workflow SSE event)
     product_catalog: list    # [{product_id, name, description, price, stock}] from NestJS
     user_context: dict       # {name, email, phone, address}
+    contact_id: str          # NestJS contact UUID
+    contact_tags: list       # [{"id", "name", "color"}] from NestJS — current tags on the contact
     # Triage
     intent: str  # "sales" | "tracking" | "complaint" | "faq"
     # Sales flow

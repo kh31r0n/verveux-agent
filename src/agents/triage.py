@@ -4,10 +4,12 @@ from typing import Literal
 import structlog
 from langchain_core.runnables import RunnableConfig
 
+from langgraph.config import get_stream_writer
+
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context
+from .utils import format_contact_tags, format_user_context
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +25,8 @@ Intenciones disponibles:
 
 Reglas:
 - Responde SOLO con un objeto JSON en una línea — sin markdown, sin texto adicional.
-- Esquema JSON: {"intent": "<sales|tracking|complaint|faq>"}
+- Esquema JSON: {"intent": "<sales|tracking|complaint|faq>", "suggest_tags": ["NombreTag"]}
+- "suggest_tags" es opcional. Incluye "Urgente" si el usuario suena muy molesto, frustrado, o tiene un problema serio.
 - Si el mensaje es un saludo o no encaja claramente, clasifica como "faq".
 """
 
@@ -60,7 +63,7 @@ async def triage_node(
         metadata={"thread_id": thread_id, "node": "triage"},
     )
 
-    messages_payload = [{"role": "system", "content": _TRIAGE_SYSTEM_PROMPT + format_user_context(state)}]
+    messages_payload = [{"role": "system", "content": _TRIAGE_SYSTEM_PROMPT + format_user_context(state) + format_contact_tags(state)}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):
             role = "assistant" if msg.type == "ai" else "user"
@@ -104,11 +107,26 @@ async def triage_node(
         intent: str = parsed.get("intent", "faq")
     except (json.JSONDecodeError, AttributeError):
         logger.warning("triage_json_parse_failed", raw=full_response[:200])
+        parsed = {}
         intent = "faq"
 
     valid_intents = {"sales", "tracking", "complaint", "faq"}
     if intent not in valid_intents:
         intent = "faq"
+
+    # Emit tag_contact SSE events for suggested tags
+    suggested_tags: list = parsed.get("suggest_tags", []) if isinstance(parsed, dict) else []
+    contact_id: str = state.get("contact_id", "")
+    if suggested_tags and contact_id:
+        write = get_stream_writer()
+        for tag_name in suggested_tags:
+            if isinstance(tag_name, str) and tag_name.strip():
+                write({
+                    "type": "tag_contact",
+                    "contact_id": contact_id,
+                    "tag_name": tag_name.strip(),
+                })
+                logger.info("triage_suggest_tag", thread_id=thread_id, tag=tag_name)
 
     logger.info("triage_classified", thread_id=thread_id, intent=intent)
 

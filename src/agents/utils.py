@@ -22,3 +22,14 @@ def format_user_context(state) -> str:
         return ""
 
     return "\n\nContexto del usuario (la persona con quien estás hablando):\n" + "\n".join(lines)
+
+
+def format_contact_tags(state) -> str:
+    """Return a formatted string describing the contact's current tags for LLM system prompts."""
+    tags: list = state.get("contact_tags") or []
+    if not tags:
+        return ""
+    tag_names = [t.get("name", "") for t in tags if t.get("name")]
+    if not tag_names:
+        return ""
+    return "\n\nEtiquetas actuales del contacto: " + ", ".join(tag_names)

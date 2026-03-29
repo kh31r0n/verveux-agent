@@ -96,6 +96,8 @@ class ChatStreamRequest(BaseModel):
     conversation_id: str = ""
     product_catalog: list = []  # [{product_id, name, description, price, stock}]
     user_context: dict = {}     # {name, email, phone, address}
+    contact_id: str = ""        # NestJS contact UUID
+    contact_tags: list = []     # [{"id", "name", "color"}] current tags on the contact
 
 
 class ChatResumeRequest(BaseModel):
@@ -158,6 +160,13 @@ async def _stream_graph(
                         "order_data": event_data.get("order_data", {}),
                         "tracking_data": event_data.get("tracking_data", {}),
                         "complaint_data": event_data.get("complaint_data", {}),
+                    })
+
+                elif event_kind == "tag_contact":
+                    yield _sse_event({
+                        "type": "tag_contact",
+                        "contact_id": event_data.get("contact_id", ""),
+                        "tag_name": event_data.get("tag_name", ""),
                     })
 
             elif chunk_type == "updates":
@@ -290,6 +299,8 @@ async def chat_stream(
         "conversation_id": req.conversation_id,
         "product_catalog": req.product_catalog,
         "user_context": req.user_context,
+        "contact_id": req.contact_id,
+        "contact_tags": req.contact_tags,
     }
 
     logger.info(

@@ -1,0 +1,16 @@
+# ── Database ──────────────────────────────────────────────────────────────────
+# Overridden by docker-compose environment block when running in Docker.
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ticket_support
+
+# ── Keycloak JWT validation ──────────────────────────────────────────────────
+KEYCLOAK_ISSUER=https://keycloak.cl/realms/frontend
+KEYCLOAK_JWKS_URL=https://keycloak.cl/realms/frontend/protocol/openid-connect/certs
+KEYCLOAK_CLIENT_ID=helena
+
+# ── LangFuse observability (optional) ────────────────────────────────────────
+LANGFUSE_SECRET_KEY=
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_HOST=http://localhost:3010
+LANGSMITH_API_KEY=lsv2_pt_
+
+OPENAI_API_KEY=sk-proj--

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "langgraph-fundamentals": {
+      "source": "langchain-ai/langchain-skills",
+      "sourceType": "github",
+      "computedHash": "d754005c69632037ca79c4daa8177b03e5a0f17f40cde3b0f532b33a8df88ded"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+# ============================================================
+# LangGraph Studio dev server
+#
+# Builds the same venv as the main Dockerfile, then adds
+# langgraph-cli on top and runs `langgraph dev`.
+# ============================================================
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:0.4 /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+
+# Install project deps into .venv
+COPY pyproject.toml uv.lock* ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Copy source so the project is importable
+COPY src/ ./src/
+COPY migrations/ ./migrations/
+RUN uv sync --frozen --no-dev
+
+# Add langgraph-cli (includes the Studio API server)
+RUN uv pip install "langgraph-cli[inmem]>=0.1"
+
+COPY langgraph.json ./
+
+EXPOSE 2024
+
+CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-browser"]

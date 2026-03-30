@@ -69,7 +69,7 @@ async def orchestrator_node(
     write = get_stream_writer()
 
     stream = await client.chat.completions.create(
-        model="gpt-5",
+        model="gpt-5.4-nano",
         messages=messages_payload,
         stream=True,
         stream_options={"include_usage": True},

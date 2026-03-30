@@ -73,12 +73,12 @@ async def tracking_collect_node(
 
         extraction_gen = trace.generation(
             name="tracking_extraction_llm",
-            model="gpt-5",
+            model="gpt-5.4-nano",
             input={"messages": extraction_messages},
         )
 
         extraction_stream = await client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-5.4-nano",
             messages=extraction_messages,
             stream=True,
         )
@@ -143,12 +143,12 @@ async def tracking_collect_node(
 
     conv_gen = trace.generation(
         name="tracking_conversational_llm",
-        model="gpt-5",
+        model="gpt-5.4-nano",
         input={"messages": conv_messages},
     )
 
     conv_stream = await client.chat.completions.create(
-        model="gpt-5",
+        model="gpt-5.4-nano",
         messages=conv_messages,
         stream=True,
         stream_options={"include_usage": True},

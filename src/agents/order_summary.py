@@ -120,12 +120,12 @@ async def order_summary_node(
 
     gen = trace.generation(
         name="order_summary_llm",
-        model="gpt-5",
+        model="gpt-5.4-nano",
         input={"messages": intro_messages},
     )
 
     stream = await client.chat.completions.create(
-        model="gpt-5",
+        model="gpt-5.4-nano",
         messages=intro_messages,
         stream=True,
         stream_options={"include_usage": True},

@@ -91,7 +91,7 @@ app = FastAPI(
 class ChatStreamRequest(BaseModel):
     thread_id: str
     message: str
-    openai_api_key: str
+    openai_api_key: str = ""
     project_id: str = ""
     conversation_id: str = ""
     product_catalog: list = []  # [{product_id, name, description, price, stock}]
@@ -104,7 +104,7 @@ class ChatResumeRequest(BaseModel):
     thread_id: str
     interrupt_id: str
     approved: bool
-    openai_api_key: str
+    openai_api_key: str = ""
 
 
 # ---------------------------------------------------------------------------

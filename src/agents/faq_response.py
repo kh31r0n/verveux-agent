@@ -61,14 +61,14 @@ async def faq_response_node(
 
     gen = trace.generation(
         name="faq_llm",
-        model="gpt-5",
+        model="gpt-5.4-nano",
         input={"messages": messages_payload},
     )
 
     write = get_stream_writer()
 
     stream = await client.chat.completions.create(
-        model="gpt-5",
+        model="gpt-5.4-nano",
         messages=messages_payload,
         stream=True,
         stream_options={"include_usage": True},

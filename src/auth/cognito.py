@@ -4,7 +4,7 @@ from typing import Optional
 
 import httpx
 import structlog
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import Depends, HTTPException, Security, status, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
@@ -12,7 +12,7 @@ from ..config import settings
 
 logger = structlog.get_logger(__name__)
 
-bearer_scheme = HTTPBearer()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 # In-memory JWKS cache: (keys_dict, fetched_at_unix_seconds)
 _jwks_cache: tuple[dict, float] = ({}, 0.0)
@@ -54,8 +54,18 @@ async def get_jwks() -> dict:
 
 
 async def verify_token(
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+    x_system_key: Optional[str] = Header(None, alias="X-System-Key"),
 ) -> dict:
+    if x_system_key and x_system_key == settings.webhook_api_key:
+        return {"sub": "system", "token_use": "access", "is_system": True}
+
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+
     token = credentials.credentials
     try:
         jwks = await get_jwks()

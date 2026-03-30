@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     langfuse_public_key: str = ""
     langfuse_host: str = "http://localhost:3010"
     nestjs_base_url: str = ""
+    webhook_api_key: str = "dev-webhook-secret"
 
 
 settings = Settings()

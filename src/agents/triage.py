@@ -130,6 +130,20 @@ async def triage_node(
 
     logger.info("triage_classified", thread_id=thread_id, intent=intent)
 
+    # Emit create_deal SSE event when classifying as "sales" for the first time
+    deal_created = state.get("deal_created", False)
+    if intent == "sales" and not deal_created and contact_id:
+        write = get_stream_writer()
+        write({
+            "type": "create_deal",
+            "contact_id": contact_id,
+            "conversation_id": state.get("conversation_id", ""),
+            "title": "Pedido de cliente",
+            "source": "WHATSAPP",
+        })
+        logger.info("triage_deal_created", thread_id=thread_id, contact_id=contact_id)
+        return {"intent": intent, "deal_created": True}
+
     # Triage is silent — downstream nodes handle all user-facing messages
     return {"intent": intent}
 

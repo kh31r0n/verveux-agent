@@ -197,6 +197,18 @@ async def sales_collect_node(
             sales_complete = True
             logger.info("sales_collect_complete", thread_id=thread_id)
 
+        # Emit update_deal_stage when advancing from step 0 → 1 (Lead → Prospecto)
+        if sales_step == 0 and new_sales_step == 1:
+            contact_id: str = state.get("contact_id", "")
+            if contact_id:
+                write({
+                    "type": "update_deal_stage",
+                    "contact_id": contact_id,
+                    "conversation_id": state.get("conversation_id", ""),
+                    "stage_position": 1,
+                })
+                logger.info("sales_deal_stage_advanced", thread_id=thread_id, stage_position=1)
+
     # --- Step 5: Generate conversational response ---
     collected_summary = ", ".join(f"{k}={repr(v)}" for k, v in collected_fields.items()) or "ninguno aún"
     missing_summary = ", ".join(missing_fields) if missing_fields else "todos respondidos"

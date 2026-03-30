@@ -27,5 +27,7 @@ class AgentState(TypedDict):
     # Complaint flow
     complaint_data: dict
     complaint_complete: bool
+    # Deals
+    deal_created: bool
     # Execution
     execute_confirmed: bool

@@ -169,6 +169,23 @@ async def _stream_graph(
                         "tag_name": event_data.get("tag_name", ""),
                     })
 
+                elif event_kind == "create_deal":
+                    yield _sse_event({
+                        "type": "create_deal",
+                        "contact_id": event_data.get("contact_id", ""),
+                        "conversation_id": event_data.get("conversation_id", ""),
+                        "title": event_data.get("title", ""),
+                        "source": event_data.get("source", "WHATSAPP"),
+                    })
+
+                elif event_kind == "update_deal_stage":
+                    yield _sse_event({
+                        "type": "update_deal_stage",
+                        "contact_id": event_data.get("contact_id", ""),
+                        "conversation_id": event_data.get("conversation_id", ""),
+                        "stage_position": event_data.get("stage_position", 0),
+                    })
+
             elif chunk_type == "updates":
                 update_data: dict = chunk.get("data", {})
 

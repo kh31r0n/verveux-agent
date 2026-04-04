@@ -14,6 +14,7 @@ class AgentState(TypedDict):
     user_context: dict       # {name, email, phone, address}
     contact_id: str          # NestJS contact UUID
     contact_tags: list       # [{"id", "name", "color"}] from NestJS — current tags on the contact
+    language: str            # Tenant language: "en", "es", "pt"
     # Triage
     intent: str  # "sales" | "tracking" | "complaint" | "faq"
     # Sales flow

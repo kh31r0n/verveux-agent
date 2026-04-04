@@ -6,6 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
+from .utils import language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -22,7 +23,7 @@ Genera un resumen claro y profesional del pedido con las siguientes secciones:
 Después del resumen, pregunta al cliente si desea confirmar:
 "¿El pedido está correcto? Responde **confirmar** para enviarlo, o dime qué necesitas corregir."
 
-Responde en español.
+{language_rule}
 """
 
 _CORRECTION_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp.
@@ -36,7 +37,7 @@ Datos actuales del pedido:
 Reconoce la corrección, confirma lo que actualizaste y presenta un resumen breve actualizado.
 Luego pregunta nuevamente si desea confirmar el pedido.
 
-Responde en español.
+{language_rule}
 """
 
 _CONFIRM_KEYWORDS = {"confirmar", "confirm", "yes", "sí", "si", "ok", "okay", "enviar", "dale", "listo", "perfecto"}
@@ -60,6 +61,7 @@ async def order_summary_node(
     )
 
     write = get_stream_writer()
+    lang_rule = language_instruction(state.get("language", "en"))
     write({"type": "step_progress", "step": 4, "total_steps": 4, "topic": "Resumen del pedido"})
 
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
@@ -102,6 +104,7 @@ async def order_summary_node(
                 "content": _CORRECTION_SYSTEM_PROMPT.format(
                     correction=correction_text,
                     order_data=order_data_str,
+                    language_rule=lang_rule,
                 ),
             }
         ]
@@ -110,7 +113,7 @@ async def order_summary_node(
         intro_messages = [
             {
                 "role": "system",
-                "content": _SUMMARY_SYSTEM_PROMPT,
+                "content": _SUMMARY_SYSTEM_PROMPT.format(language_rule=lang_rule),
             },
             {
                 "role": "user",

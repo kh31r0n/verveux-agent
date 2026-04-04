@@ -9,6 +9,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
+from .utils import language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -27,7 +28,7 @@ Available agents:
   Use this when the user's request has been fully answered and no further action is needed.
 
 Rules:
-- Respond in the same language the user writes in.
+- {language_rule}
 - Your response must be a single JSON object on one line — no markdown code fences, no extra text.
 - JSON schema: {"response": "<natural language message to user>", "next": "<rag|workflow|escalate|end>"}
 - The "response" field is shown to the user. Be helpful and concise.
@@ -57,7 +58,8 @@ async def orchestrator_node(
         input={"messages": [m.content if hasattr(m, "content") else str(m) for m in state["messages"]]},
     )
 
-    messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}]
+    lang_rule = language_instruction(state.get("language", "en"))
+    messages_payload = [{"role": "system", "content": SYSTEM_PROMPT.format(language_rule=lang_rule)}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):
             role = "assistant" if msg.type == "ai" else "user"

@@ -6,7 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context
+from .utils import format_user_context, language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -28,7 +28,7 @@ Capacidades disponibles:
 
 Reglas:
 - Sé amigable y concisa — es una conversación por WhatsApp.
-- Responde en español.
+- {language_rule}
 - Si el usuario saluda, saluda de vuelta y ofrece ayuda.
 - Si la pregunta es sobre algo que no manejas, guía al usuario hacia las capacidades disponibles.
 """
@@ -50,7 +50,8 @@ async def faq_response_node(
         metadata={"thread_id": thread_id, "node": "faq_response"},
     )
 
-    messages_payload = [{"role": "system", "content": _FAQ_SYSTEM_PROMPT + format_user_context(state)}]
+    lang_rule = language_instruction(state.get("language", "en"))
+    messages_payload = [{"role": "system", "content": _FAQ_SYSTEM_PROMPT.format(language_rule=lang_rule) + format_user_context(state)}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):
             role = "assistant" if msg.type == "ai" else "user"

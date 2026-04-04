@@ -7,6 +7,7 @@ from ..db.postgres import get_pool
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
+from .utils import language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -14,7 +15,7 @@ RAG_SYSTEM_PROMPT = """You are a security knowledge retrieval assistant.
 You have been given relevant context documents retrieved from the internal knowledge base.
 Use the provided context to answer the user's question accurately and concisely.
 If the context does not contain enough information to answer, say so clearly.
-Respond in the same language the user writes in.
+{language_rule}
 """
 
 _TOP_K = 5
@@ -81,8 +82,9 @@ async def rag_node(
 
     # Build augmented prompt
     context_block = "\n\n---\n\n".join(context_docs) if context_docs else "No relevant documents found."
+    lang_rule = language_instruction(state.get("language", "en"))
     messages_payload = [
-        {"role": "system", "content": RAG_SYSTEM_PROMPT},
+        {"role": "system", "content": RAG_SYSTEM_PROMPT.format(language_rule=lang_rule)},
         {
             "role": "user",
             "content": (

@@ -9,6 +9,7 @@ from langgraph.types import Command, interrupt
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
+from .utils import language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -33,7 +34,7 @@ If you cannot determine the appropriate workflow, respond:
 
 _REJECTION_PROMPT = """You are a security operations assistant.
 The user declined to trigger a workflow action. Acknowledge this politely and let them know the action was cancelled.
-Respond in the same language the user writes in. Keep your response concise.
+{language_rule} Keep your response concise.
 """
 
 
@@ -148,7 +149,7 @@ async def workflow_node(
         rejection_stream = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": _REJECTION_PROMPT},
+                {"role": "system", "content": _REJECTION_PROMPT.format(language_rule=language_instruction(state.get("language", "en")))},
                 {
                     "role": "user",
                     "content": f"The user declined to trigger: {description}",

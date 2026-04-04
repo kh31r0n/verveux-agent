@@ -8,7 +8,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context
+from .utils import format_user_context, language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -39,7 +39,7 @@ Reglas:
 - Sé empática y comprensiva — el cliente tiene un problema.
 - Si ya tienes toda la información, confirma y dile que vas a procesar su queja.
 - Sé concisa — es WhatsApp.
-- Responde en español.
+- {language_rule}
 - NO devuelvas JSON.
 """
 
@@ -122,6 +122,7 @@ async def complaint_collect_node(
                 "content": _CONVERSATIONAL_SYSTEM_PROMPT.format(
                     collected_fields=collected_summary,
                     missing_fields=missing_summary,
+                    language_rule=language_instruction(state.get("language", "en")),
                 ) + user_ctx_str,
             },
             {

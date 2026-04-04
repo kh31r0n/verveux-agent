@@ -8,7 +8,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context
+from .utils import format_user_context, language_instruction
 
 logger = structlog.get_logger(__name__)
 
@@ -67,7 +67,7 @@ Responde SOLO con el objeto JSON — sin markdown, sin explicación.
 """
 
 _CONVERSATIONAL_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp para una tienda de productos físicos.
-Eres amable, eficiente y siempre respondes en español.
+Eres amable, eficiente. {language_rule}
 
 Estás en el paso {step} de 3 del proceso de pedido, recopilando: {topic}.
 
@@ -260,6 +260,7 @@ async def sales_collect_node(
                     missing_fields=missing_summary,
                     collected_fields=collected_summary,
                     catalog_info=catalog_info,
+                    language_rule=language_instruction(state.get("language", "en")),
                 ) + user_ctx_str,
             },
             {

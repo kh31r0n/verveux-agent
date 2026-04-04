@@ -1,3 +1,16 @@
+_LANGUAGE_NAMES = {
+    "es": "Spanish",
+    "en": "English",
+    "pt": "Portuguese",
+}
+
+
+def language_instruction(lang: str) -> str:
+    """Return an LLM instruction like 'Always respond in Spanish.' for the given language code."""
+    name = _LANGUAGE_NAMES.get(lang, _LANGUAGE_NAMES["en"])
+    return f"Always respond in {name}."
+
+
 def format_user_context(state) -> str:
     """Return a formatted string describing the authenticated user for LLM system prompts.
 

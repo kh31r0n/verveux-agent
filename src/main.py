@@ -98,6 +98,7 @@ class ChatStreamRequest(BaseModel):
     user_context: dict = {}     # {name, email, phone, address}
     contact_id: str = ""        # NestJS contact UUID
     contact_tags: list = []     # [{"id", "name", "color"}] current tags on the contact
+    language: str = "en"        # Tenant language: "en", "es", "pt"
 
 
 class ChatResumeRequest(BaseModel):
@@ -318,6 +319,7 @@ async def chat_stream(
         "user_context": req.user_context,
         "contact_id": req.contact_id,
         "contact_tags": req.contact_tags,
+        "language": req.language,
     }
 
     logger.info(

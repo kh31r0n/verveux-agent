@@ -8,7 +8,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context, language_instruction
+from .utils import format_user_context, language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -66,8 +66,9 @@ async def tracking_collect_node(
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
 
     if has_new_message:
+        tracking_ext_prompt = resolve_prompt(config, "TRACKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT)
         extraction_messages = [
-            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": tracking_ext_prompt},
             {"role": "user", "content": state["messages"][-1].content},
         ]
 
@@ -123,10 +124,11 @@ async def tracking_collect_node(
         ) + user_ctx_str
         conv_messages = [{"role": "system", "content": conv_prompt}]
     else:
+        tracking_conv_prompt = resolve_prompt(config, "TRACKING_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT)
         conv_messages = [
             {
                 "role": "system",
-                "content": _CONVERSATIONAL_SYSTEM_PROMPT.format(
+                "content": tracking_conv_prompt.format(
                     collected_fields=collected_summary,
                     missing_info=", ".join(missing_info),
                     language_rule=language_instruction(state.get("language", "en")),

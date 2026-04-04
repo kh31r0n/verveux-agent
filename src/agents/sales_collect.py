@@ -8,7 +8,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context, language_instruction
+from .utils import format_user_context, language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -135,8 +135,9 @@ async def sales_collect_node(
                 for p in catalog
             )
 
+        sales_extraction_prompt = resolve_prompt(config, "SALES_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT)
         extraction_messages = [
-            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": sales_extraction_prompt},
             {
                 "role": "user",
                 "content": (
@@ -251,10 +252,11 @@ async def sales_collect_node(
         ]
     else:
         # Ask/re-ask questions for current step
+        sales_conv_prompt = resolve_prompt(config, "SALES_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT)
         conv_messages = [
             {
                 "role": "system",
-                "content": _CONVERSATIONAL_SYSTEM_PROMPT.format(
+                "content": sales_conv_prompt.format(
                     step=step_num,
                     topic=topic,
                     missing_fields=missing_summary,

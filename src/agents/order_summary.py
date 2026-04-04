@@ -6,7 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import language_instruction
+from .utils import language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -98,10 +98,11 @@ async def order_summary_node(
     elif has_new_message and not any(kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS):
         # User sent a correction
         correction_text = state["messages"][-1].content or ""
+        correction_prompt = resolve_prompt(config, "ORDER_CORRECTION", _CORRECTION_SYSTEM_PROMPT)
         intro_messages = [
             {
                 "role": "system",
-                "content": _CORRECTION_SYSTEM_PROMPT.format(
+                "content": correction_prompt.format(
                     correction=correction_text,
                     order_data=order_data_str,
                     language_rule=lang_rule,
@@ -110,10 +111,11 @@ async def order_summary_node(
         ]
     else:
         # First visit — generate full summary
+        summary_prompt = resolve_prompt(config, "ORDER_SUMMARY", _SUMMARY_SYSTEM_PROMPT)
         intro_messages = [
             {
                 "role": "system",
-                "content": _SUMMARY_SYSTEM_PROMPT.format(language_rule=lang_rule),
+                "content": summary_prompt.format(language_rule=lang_rule),
             },
             {
                 "role": "user",

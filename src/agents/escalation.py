@@ -6,7 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import language_instruction
+from .utils import language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -45,8 +45,9 @@ async def escalation_node(
         conversation_summary.append(f"{role}: {content}")
 
     lang_rule = language_instruction(state.get("language", "en"))
+    escalation_prompt = resolve_prompt(config, "ESCALATION", _ESCALATION_SYSTEM_PROMPT)
     messages_payload = [
-        {"role": "system", "content": _ESCALATION_SYSTEM_PROMPT.format(language_rule=lang_rule)},
+        {"role": "system", "content": escalation_prompt.format(language_rule=lang_rule)},
         {
             "role": "user",
             "content": "Conversation so far:\n\n" + "\n".join(conversation_summary),

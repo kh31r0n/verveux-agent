@@ -21,11 +21,12 @@ Intenciones disponibles:
 - **sales**: El usuario quiere comprar productos, consultar precios, ver catálogo, o hacer un pedido.
 - **tracking**: El usuario quiere rastrear un pedido existente, consultar el estado de un envío, o verificar una entrega.
 - **complaint**: El usuario tiene una queja, reclamo, problema con un producto recibido, o quiere una devolución.
+- **order_history**: El usuario pregunta por sus pedidos anteriores, historial de compras, o quiere ver qué ha comprado antes.
 - **faq**: El usuario pregunta sobre horarios, ubicación, métodos de pago, envíos, políticas, o cualquier pregunta general.
 
 Reglas:
 - Responde SOLO con un objeto JSON en una línea — sin markdown, sin texto adicional.
-- Esquema JSON: {"intent": "<sales|tracking|complaint|faq>", "suggest_tags": ["NombreTag"]}
+- Esquema JSON: {"intent": "<sales|tracking|complaint|order_history|faq>", "suggest_tags": ["NombreTag"]}
 - "suggest_tags" es opcional. Incluye "Urgente" si el usuario suena muy molesto, frustrado, o tiene un problema serio.
 - Si el mensaje es un saludo o no encaja claramente, clasifica como "faq".
 """
@@ -37,10 +38,14 @@ async def triage_node(
 ) -> dict:
     record_node_invocation("triage")
 
-    # If already mid-sales flow and not yet complete, skip re-classification
+    # If mid-sales data collection (steps not yet complete), skip re-classification
+    # so the agent stays focused on collecting order info.
+    # Once sales_complete=True (at summary/confirmation phase) we DO re-classify
+    # so the user can ask FAQ questions without being treated as making corrections.
     if (
         state.get("intent") == "sales"
         and state.get("sales_step", 0) > 0
+        and not state.get("sales_complete", False)
         and not state.get("execute_confirmed", False)
     ):
         return {}
@@ -111,7 +116,7 @@ async def triage_node(
         parsed = {}
         intent = "faq"
 
-    valid_intents = {"sales", "tracking", "complaint", "faq"}
+    valid_intents = {"sales", "tracking", "complaint", "order_history", "faq"}
     if intent not in valid_intents:
         intent = "faq"
 
@@ -151,7 +156,7 @@ async def triage_node(
 
 def route_from_triage(
     state: AgentState,
-) -> Literal["sales_collect", "order_summary", "tracking_collect", "complaint_collect", "faq_response", "execute"]:
+) -> Literal["sales_collect", "order_summary", "tracking_collect", "complaint_collect", "order_history", "faq_response", "execute"]:
     intent = state.get("intent", "faq")
 
     if intent == "sales":
@@ -178,5 +183,8 @@ def route_from_triage(
         if state.get("complaint_complete", False):
             return "execute"
         return "complaint_collect"
+
+    if intent == "order_history":
+        return "order_history"
 
     return "faq_response"

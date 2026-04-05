@@ -5,6 +5,7 @@ from langgraph.graph import END, START, StateGraph
 from ..agents.complaint_collect import complaint_collect_node
 from ..agents.execute import execute_node
 from ..agents.faq_response import faq_response_node
+from ..agents.order_history import order_history_node
 from ..agents.order_summary import order_summary_node
 from ..agents.sales_collect import sales_collect_node
 from ..agents.tracking_collect import tracking_collect_node
@@ -48,6 +49,7 @@ def build_graph(checkpointer):
     graph.add_node("order_summary", order_summary_node)
     graph.add_node("tracking_collect", tracking_collect_node)
     graph.add_node("complaint_collect", complaint_collect_node)
+    graph.add_node("order_history", order_history_node)
     graph.add_node("faq_response", faq_response_node)
     graph.add_node("execute", execute_node)
 
@@ -61,6 +63,7 @@ def build_graph(checkpointer):
             "order_summary": "order_summary",
             "tracking_collect": "tracking_collect",
             "complaint_collect": "complaint_collect",
+            "order_history": "order_history",
             "faq_response": "faq_response",
             "execute": "execute",
         },
@@ -89,6 +92,7 @@ def build_graph(checkpointer):
     )
 
     graph.add_edge("execute", END)
+    graph.add_edge("order_history", END)
     graph.add_edge("faq_response", END)
 
     return graph.compile(checkpointer=checkpointer)

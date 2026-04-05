@@ -9,6 +9,7 @@ from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
 from .utils import format_user_context, language_instruction, resolve_prompt
+from .backend_client import upsert_cart_item
 
 logger = structlog.get_logger(__name__)
 
@@ -16,6 +17,16 @@ logger = structlog.get_logger(__name__)
 _STEP_CONFIGS = [
     {
         "step": 1,
+        "topic": "Productos del pedido",
+        "fields": ["items"],
+        "questions": (
+            "¿Qué productos te gustaría ordenar?\n"
+            "Puedes indicarme el nombre del producto y la cantidad.\n"
+            "Si necesitas ver nuestro catálogo, con gusto te lo muestro."
+        ),
+    },
+    {
+        "step": 2,
         "topic": "Datos del cliente",
         "fields": ["customer_name", "customer_phone", "customer_email"],
         "questions": (
@@ -23,16 +34,6 @@ _STEP_CONFIGS = [
             "1. ¿Cuál es tu nombre completo?\n"
             "2. ¿Cuál es tu número de teléfono de contacto?\n"
             "3. ¿Tienes un correo electrónico? (opcional)"
-        ),
-    },
-    {
-        "step": 2,
-        "topic": "Productos del pedido",
-        "fields": ["items"],
-        "questions": (
-            "¿Qué productos te gustaría ordenar?\n"
-            "Puedes indicarme el nombre del producto y la cantidad.\n"
-            "Si necesitas ver nuestro catálogo, con gusto te lo muestro."
         ),
     },
     {
@@ -183,6 +184,40 @@ async def sales_collect_node(
         order_data.update({k: v for k, v in extracted_fields.items() if v})
         logger.info("sales_fields_extracted", thread_id=thread_id, step=step_num, fields=list(extracted_fields.keys()))
 
+        # Sync extracted items to backend cart (step 1 — products)
+        if step_num == 1 and "items" in extracted_fields:
+            contact_id: str = state.get("contact_id", "")
+            conversation_id: str = state.get("conversation_id", "")
+            items_to_sync = extracted_fields.get("items") or []
+            if contact_id and isinstance(items_to_sync, list):
+                catalog = state.get("product_catalog") or []
+                catalog_by_name = {p.get("name", "").lower(): p for p in catalog}
+                for item in items_to_sync:
+                    product_name = (item.get("product") or "").lower()
+                    qty = int(item.get("quantity") or 0)
+                    matched = catalog_by_name.get(product_name)
+                    if matched and qty > 0:
+                        try:
+                            await upsert_cart_item(
+                                contact_id=contact_id,
+                                product_id=matched["product_id"],
+                                quantity=qty,
+                                conversation_id=conversation_id or None,
+                            )
+                            logger.info(
+                                "cart_item_synced",
+                                thread_id=thread_id,
+                                product=matched["name"],
+                                qty=qty,
+                            )
+                        except Exception as cart_exc:
+                            logger.warning(
+                                "cart_item_sync_failed",
+                                thread_id=thread_id,
+                                product=product_name,
+                                error=str(cart_exc),
+                            )
+
     # --- Step 3: Determine missing fields for this step ---
     missing_fields = [f for f in fields if not order_data.get(f)]
     collected_fields = {f: order_data[f] for f in fields if order_data.get(f)}
@@ -219,7 +254,7 @@ async def sales_collect_node(
     # Build catalog info for conversational prompt
     catalog = state.get("product_catalog") or []
     catalog_info = ""
-    if catalog and step_num == 2:
+    if catalog and step_num == 1:
         catalog_info = "Catálogo disponible:\n" + "\n".join(
             f"- {p.get('name', 'N/A')}: ${p.get('price', 'N/A')}"
             for p in catalog

@@ -30,5 +30,7 @@ class AgentState(TypedDict):
     complaint_complete: bool
     # Deals
     deal_created: bool
+    # Cart (backend is source of truth; this is a display cache)
+    current_cart: dict        # latest cart snapshot from backend {id, items, grandTotal, ...}
     # Execution
     execute_confirmed: bool

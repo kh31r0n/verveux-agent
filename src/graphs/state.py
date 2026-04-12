@@ -7,30 +7,64 @@ from typing_extensions import TypedDict
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     thread_id: str
-    # Conversation context (stable for the lifetime of the conversation)
-    project_id: str          # project linked to this conversation
-    conversation_id: str     # NestJS conversation UUID (used by execute_workflow SSE event)
-    product_catalog: list    # [{product_id, name, description, price, stock}] from NestJS
+
+    # ── Conversation context (stable per conversation) ─────────────────
+    project_id: str
+    conversation_id: str
+    product_catalog: list    # [{product_id, name, description, price, stock}]
     user_context: dict       # {name, email, phone, address}
-    contact_id: str          # NestJS contact UUID
-    contact_tags: list       # [{"id", "name", "color"}] from NestJS — current tags on the contact
-    language: str            # Tenant language: "en", "es", "pt"
-    # Triage
-    intent: str  # "sales" | "tracking" | "complaint" | "faq"
-    # Sales flow
-    sales_step: int          # 0 = not started, 1-3 = collection steps
-    order_data: dict         # accumulated order fields across all steps
+    contact_id: str
+    contact_tags: list       # [{"id", "name", "color"}]
+    language: str            # "en" | "es" | "pt"
+
+    # ── Triage ─────────────────────────────────────────────────────────
+    intent: str              # "sales" | "tracking" | "complaint" | "faq"
+
+    # ── Sales — explicit phase machine ─────────────────────────────────
+    #
+    # Lifecycle:
+    #   product_selection → product_confirmation → customer_data → payment
+    #
+    # Transitions are set exclusively by node code, never by the LLM.
+    sales_phase: str         # see lifecycle above; default "product_selection"
+
+    # Cart — authoritative state owned by CartService
+    cart: list               # [{product_id, name, qty, price, notes}]
+
+    # Anti-loop counter: incremented each turn in PRODUCT_SELECTION.
+    # When it reaches MAX_PRODUCT_TURNS the phase advances regardless
+    # of whether the user has explicitly said "done".
+    product_selection_turns: int
+
+    # Items the ProductResolver could not map to a catalog product_id.
+    # Cleared on each turn and rebuilt from the latest extraction.
+    pending_unknown_items: list  # [{name, qty, alternatives}]
+
+    # Phase completion flags (set by node code, read by routing edges)
+    product_selection_complete: bool  # True → advance to product_confirmation
+    cart_confirmed: bool              # True → advance to customer_data
+    customer_data_complete: bool      # True → advance to order_summary (payment)
+
+    # Customer / delivery data collected in CUSTOMER_DATA phase
+    # Keys: customer_name, customer_phone, customer_email,
+    #       delivery_address, delivery_date_preference, payment_method
+    order_data: dict
+
+    # Legacy sales fields (kept for backward compat with order_summary + execute)
+    sales_step: int
     sales_complete: bool
-    order_confirmed: bool
-    # Tracking flow
+    order_confirmed: bool   # final confirmation in order_summary
+
+    # ── Tracking flow ──────────────────────────────────────────────────
     tracking_data: dict
     tracking_complete: bool
-    # Complaint flow
+
+    # ── Complaint flow ─────────────────────────────────────────────────
     complaint_data: dict
     complaint_complete: bool
-    # Deals
+
+    # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool
-    # Cart (backend is source of truth; this is a display cache)
-    current_cart: dict        # latest cart snapshot from backend {id, items, grandTotal, ...}
-    # Execution
+
+    # ── Execution ──────────────────────────────────────────────────────
     execute_confirmed: bool

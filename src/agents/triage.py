@@ -9,7 +9,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_contact_tags, format_user_context, resolve_prompt
+from .utils import format_contact_tags, format_user_context
 
 logger = structlog.get_logger(__name__)
 
@@ -21,12 +21,11 @@ Intenciones disponibles:
 - **sales**: El usuario quiere comprar productos, consultar precios, ver catálogo, o hacer un pedido.
 - **tracking**: El usuario quiere rastrear un pedido existente, consultar el estado de un envío, o verificar una entrega.
 - **complaint**: El usuario tiene una queja, reclamo, problema con un producto recibido, o quiere una devolución.
-- **order_history**: El usuario pregunta por sus pedidos anteriores, historial de compras, o quiere ver qué ha comprado antes.
 - **faq**: El usuario pregunta sobre horarios, ubicación, métodos de pago, envíos, políticas, o cualquier pregunta general.
 
 Reglas:
 - Responde SOLO con un objeto JSON en una línea — sin markdown, sin texto adicional.
-- Esquema JSON: {"intent": "<sales|tracking|complaint|order_history|faq>", "suggest_tags": ["NombreTag"]}
+- Esquema JSON: {"intent": "<sales|tracking|complaint|faq>", "suggest_tags": ["NombreTag"]}
 - "suggest_tags" es opcional. Incluye "Urgente" si el usuario suena muy molesto, frustrado, o tiene un problema serio.
 - Si el mensaje es un saludo o no encaja claramente, clasifica como "faq".
 """
@@ -38,24 +37,29 @@ async def triage_node(
 ) -> dict:
     record_node_invocation("triage")
 
-    # If mid-sales data collection (steps not yet complete), skip re-classification
-    # so the agent stays focused on collecting order info.
-    # Once sales_complete=True (at summary/confirmation phase) we DO re-classify
-    # so the user can ask FAQ questions without being treated as making corrections.
+    # ── Skip re-classification for in-progress flows ──────────────────────────
     if (
         state.get("intent") == "sales"
-        and state.get("sales_step", 0) > 0
-        and not state.get("sales_complete", False)
         and not state.get("execute_confirmed", False)
+        and (
+            state.get("cart")                      # cart has items
+            or state.get("product_selection_turns", 0) > 0  # at least one turn done
+        )
     ):
         return {}
 
-    # If already mid-tracking flow and not yet complete, skip re-classification
-    if state.get("intent") == "tracking" and not state.get("execute_confirmed", False) and state.get("tracking_data"):
+    if (
+        state.get("intent") == "tracking"
+        and not state.get("execute_confirmed", False)
+        and state.get("tracking_data")
+    ):
         return {}
 
-    # If already mid-complaint flow and not yet complete, skip re-classification
-    if state.get("intent") == "complaint" and not state.get("execute_confirmed", False) and state.get("complaint_data"):
+    if (
+        state.get("intent") == "complaint"
+        and not state.get("execute_confirmed", False)
+        and state.get("complaint_data")
+    ):
         return {}
 
     api_key: str = resolve_api_key(config)
@@ -68,13 +72,16 @@ async def triage_node(
         metadata={"thread_id": thread_id, "node": "triage"},
     )
 
-    triage_prompt = resolve_prompt(config, "TRIAGE", _TRIAGE_SYSTEM_PROMPT)
-    messages_payload = [{"role": "system", "content": triage_prompt + format_user_context(state) + format_contact_tags(state)}]
+    messages_payload = [
+        {
+            "role": "system",
+            "content": _TRIAGE_SYSTEM_PROMPT
+            + format_user_context(state)
+            + format_contact_tags(state),
+        }
+    ]
     for msg in state["messages"]:
-        if hasattr(msg, "type"):
-            role = "assistant" if msg.type == "ai" else "user"
-        else:
-            role = "user"
+        role = "assistant" if getattr(msg, "type", "") == "ai" else "user"
         content = msg.content if hasattr(msg, "content") else str(msg)
         messages_payload.append({"role": role, "content": content})
 
@@ -116,7 +123,7 @@ async def triage_node(
         parsed = {}
         intent = "faq"
 
-    valid_intents = {"sales", "tracking", "complaint", "order_history", "faq"}
+    valid_intents = {"sales", "tracking", "complaint", "faq"}
     if intent not in valid_intents:
         intent = "faq"
 
@@ -150,26 +157,50 @@ async def triage_node(
         logger.info("triage_deal_created", thread_id=thread_id, contact_id=contact_id)
         return {"intent": intent, "deal_created": True}
 
-    # Triage is silent — downstream nodes handle all user-facing messages
     return {"intent": intent}
 
 
 def route_from_triage(
     state: AgentState,
-) -> Literal["sales_collect", "order_summary", "tracking_collect", "complaint_collect", "order_history", "faq_response", "execute"]:
+) -> Literal[
+    "sales_collect",
+    "sales_confirm",
+    "customer_data_collect",
+    "order_summary",
+    "tracking_collect",
+    "complaint_collect",
+    "faq_response",
+    "execute",
+]:
     intent = state.get("intent", "faq")
 
+    # ── Sales — route to the correct phase ────────────────────────────────────
     if intent == "sales":
-        # Once execution is confirmed, treat as faq so the user can start fresh
         if state.get("execute_confirmed", False):
+            # Order already executed; treat new messages as FAQ
             return "faq_response"
 
+        # Final confirmation happened → trigger execution
         if state.get("order_confirmed", False):
             return "execute"
-        if state.get("sales_complete", False):
+
+        # Explicit phase field drives routing when mid-flow
+        phase = state.get("sales_phase", "product_selection")
+
+        if phase == "payment":
+            # Customer data collected, show final summary
             return "order_summary"
+
+        if phase == "customer_data":
+            return "customer_data_collect"
+
+        if phase == "product_confirmation":
+            return "sales_confirm"
+
+        # Default / product_selection phase
         return "sales_collect"
 
+    # ── Tracking ──────────────────────────────────────────────────────────────
     if intent == "tracking":
         if state.get("execute_confirmed", False):
             return "faq_response"
@@ -177,14 +208,12 @@ def route_from_triage(
             return "execute"
         return "tracking_collect"
 
+    # ── Complaint ─────────────────────────────────────────────────────────────
     if intent == "complaint":
         if state.get("execute_confirmed", False):
             return "faq_response"
         if state.get("complaint_complete", False):
             return "execute"
         return "complaint_collect"
-
-    if intent == "order_history":
-        return "order_history"
 
     return "faq_response"

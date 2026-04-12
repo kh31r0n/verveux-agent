@@ -1,3 +1,5 @@
+from langchain_core.runnables import RunnableConfig
+
 _LANGUAGE_NAMES = {
     "es": "Spanish",
     "en": "English",
@@ -46,3 +48,18 @@ def format_contact_tags(state) -> str:
     if not tag_names:
         return ""
     return "\n\nEtiquetas actuales del contacto: " + ", ".join(tag_names)
+
+
+def resolve_prompt(config: RunnableConfig, prompt_type: str, fallback: str) -> str:
+    """Return tenant prompt content from config, or fallback to hardcoded default."""
+    prompts = config.get("configurable", {}).get("prompts", {})
+    payload = prompts.get(prompt_type, {})
+    content = payload.get("content", "") if isinstance(payload, dict) else ""
+    return content if content else fallback
+
+
+def resolve_model_config(config: RunnableConfig, prompt_type: str) -> dict:
+    """Return model config overrides from tenant prompt."""
+    prompts = config.get("configurable", {}).get("prompts", {})
+    payload = prompts.get(prompt_type, {})
+    return payload.get("model_config_data", {}) if isinstance(payload, dict) else {}

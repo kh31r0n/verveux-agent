@@ -6,19 +6,18 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import language_instruction
+from .utils import language_instruction, resolve_prompt
+from .backend_client import get_or_create_cart
 
 logger = structlog.get_logger(__name__)
 
 _SUMMARY_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp.
 
-Has recopilado toda la información del pedido del cliente.
-Genera un resumen claro y profesional del pedido con las siguientes secciones:
+El backend ha calculado el resumen del carrito del cliente.
+Presenta el resumen de forma clara y amigable con:
 
-- **Datos del cliente** (nombre, teléfono, email)
-- **Productos** (lista de items con cantidad y notas)
-- **Entrega** (dirección, fecha preferida, método de pago)
-- **Total estimado** (si tienes precios del catálogo, calcula el total)
+- **Productos** (lista de items con cantidad y precio unitario)
+- **Total** (usa exactamente el grandTotal que se te proporciona — nunca recalcules)
 
 Después del resumen, pregunta al cliente si desea confirmar:
 "¿El pedido está correcto? Responde **confirmar** para enviarlo, o dime qué necesitas corregir."
@@ -28,19 +27,28 @@ Después del resumen, pregunta al cliente si desea confirmar:
 
 _CORRECTION_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp.
 
-El cliente quiere corregir algo en su pedido. Su solicitud de corrección es:
+El cliente quiere corregir algo en su pedido. Su solicitud es:
 "{correction}"
 
-Datos actuales del pedido:
-{order_data}
+Datos actuales del carrito:
+{cart_summary}
 
-Reconoce la corrección, confirma lo que actualizaste y presenta un resumen breve actualizado.
-Luego pregunta nuevamente si desea confirmar el pedido.
+Reconoce la corrección y dile que actualizarás el carrito. Luego pide confirmación nuevamente.
 
 {language_rule}
 """
 
 _CONFIRM_KEYWORDS = {"confirmar", "confirm", "yes", "sí", "si", "ok", "okay", "enviar", "dale", "listo", "perfecto"}
+
+
+def _format_cart_for_llm(cart: dict) -> str:
+    lines = []
+    for item in cart.get("items", []):
+        lines.append(
+            f"- {item['productName']} x{item['quantity']} — ${item['unitPrice']:.2f} c/u = ${item['lineTotal']:.2f}"
+        )
+    lines.append(f"\n**Total: ${cart.get('grandTotal', 0):.2f} {cart.get('currency', 'USD')}**")
+    return "\n".join(lines)
 
 
 async def order_summary_node(
@@ -52,7 +60,8 @@ async def order_summary_node(
     api_key: str = resolve_api_key(config)
     client = get_openai_client(api_key)
     thread_id: str = state.get("thread_id", "unknown")
-    order_data: dict = dict(state.get("order_data") or {})
+    contact_id: str = state.get("contact_id", "")
+    conversation_id: str = state.get("conversation_id", "")
 
     langfuse = get_langfuse()
     trace = langfuse.trace(
@@ -64,6 +73,17 @@ async def order_summary_node(
     lang_rule = language_instruction(state.get("language", "en"))
     write({"type": "step_progress", "step": 4, "total_steps": 4, "topic": "Resumen del pedido"})
 
+    # Fetch backend cart (source of truth for totals)
+    cart: dict = {}
+    if contact_id:
+        try:
+            cart = await get_or_create_cart(
+                contact_id=contact_id,
+                conversation_id=conversation_id or None,
+            )
+        except Exception as exc:
+            logger.warning("order_summary_cart_fetch_failed", thread_id=thread_id, error=str(exc))
+
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
     order_confirmed = False
 
@@ -73,19 +93,10 @@ async def order_summary_node(
             order_confirmed = True
             logger.info("order_confirmed_by_user", thread_id=thread_id)
 
-    order_data_str = "\n".join(f"- **{k}**: {v}" for k, v in order_data.items())
-
-    # Include catalog for price calculation
-    catalog = state.get("product_catalog") or []
-    catalog_str = ""
-    if catalog:
-        catalog_str = "\n\nCatálogo de precios:\n" + "\n".join(
-            f"- {p.get('name', 'N/A')}: ${p.get('price', 'N/A')}"
-            for p in catalog
-        )
+    cart_summary_str = _format_cart_for_llm(cart) if cart else "(carrito no disponible)"
 
     if order_confirmed:
-        intro_messages = [
+        messages_payload = [
             {
                 "role": "system",
                 "content": (
@@ -95,41 +106,43 @@ async def order_summary_node(
                 ),
             }
         ]
-    elif has_new_message and not any(kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS):
-        # User sent a correction
+    elif has_new_message and not any(
+        kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS
+    ):
         correction_text = state["messages"][-1].content or ""
-        intro_messages = [
+        correction_prompt = resolve_prompt(config, "ORDER_CORRECTION", _CORRECTION_SYSTEM_PROMPT)
+        messages_payload = [
             {
                 "role": "system",
-                "content": _CORRECTION_SYSTEM_PROMPT.format(
+                "content": correction_prompt.format(
                     correction=correction_text,
-                    order_data=order_data_str,
+                    cart_summary=cart_summary_str,
                     language_rule=lang_rule,
                 ),
             }
         ]
     else:
-        # First visit — generate full summary
-        intro_messages = [
+        summary_prompt = resolve_prompt(config, "ORDER_SUMMARY", _SUMMARY_SYSTEM_PROMPT)
+        messages_payload = [
             {
                 "role": "system",
-                "content": _SUMMARY_SYSTEM_PROMPT.format(language_rule=lang_rule),
+                "content": summary_prompt.format(language_rule=lang_rule),
             },
             {
                 "role": "user",
-                "content": f"Datos del pedido:\n\n{order_data_str}{catalog_str}",
+                "content": f"Carrito actual:\n\n{cart_summary_str}",
             },
         ]
 
     gen = trace.generation(
         name="order_summary_llm",
         model="gpt-5.4-nano",
-        input={"messages": intro_messages},
+        input={"messages": messages_payload},
     )
 
     stream = await client.chat.completions.create(
         model="gpt-5.4-nano",
-        messages=intro_messages,
+        messages=messages_payload,
         stream=True,
         stream_options={"include_usage": True},
     )
@@ -151,6 +164,6 @@ async def order_summary_node(
 
     return {
         "messages": [AIMessage(content=full_response)],
-        "order_data": order_data,
+        "current_cart": cart,
         "order_confirmed": order_confirmed,
     }

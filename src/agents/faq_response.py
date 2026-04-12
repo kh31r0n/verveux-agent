@@ -6,7 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import format_user_context, language_instruction
+from .utils import format_user_context, language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -51,7 +51,20 @@ async def faq_response_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    messages_payload = [{"role": "system", "content": _FAQ_SYSTEM_PROMPT.format(language_rule=lang_rule) + format_user_context(state)}]
+    faq_prompt = resolve_prompt(config, "FAQ", _FAQ_SYSTEM_PROMPT)
+
+    # Inject product catalog so the LLM can answer product-specific questions
+    catalog = state.get("product_catalog") or []
+    catalog_block = ""
+    if catalog:
+        lines = ["\n\nCatálogo de productos disponibles:"]
+        for p in catalog:
+            line = f"- **{p.get('name', 'N/A')}**: {p.get('description', '')} — ${p.get('price', 'N/A')} (stock: {p.get('stock', 'N/A')})"
+            lines.append(line)
+        catalog_block = "\n".join(lines)
+
+    system_content = faq_prompt.format(language_rule=lang_rule) + catalog_block + format_user_context(state)
+    messages_payload = [{"role": "system", "content": system_content}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):
             role = "assistant" if msg.type == "ai" else "user"

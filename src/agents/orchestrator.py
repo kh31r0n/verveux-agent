@@ -9,7 +9,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from .utils import language_instruction
+from .utils import language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -59,7 +59,8 @@ async def orchestrator_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    messages_payload = [{"role": "system", "content": SYSTEM_PROMPT.format(language_rule=lang_rule)}]
+    orchestrator_prompt = resolve_prompt(config, "ORCHESTRATOR", SYSTEM_PROMPT)
+    messages_payload = [{"role": "system", "content": orchestrator_prompt.format(language_rule=lang_rule)}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):
             role = "assistant" if msg.type == "ai" else "user"

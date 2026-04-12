@@ -1,3 +1,23 @@
+"""
+sales_collect — PRODUCT_SELECTION phase.
+
+Responsibility:
+  Collect product items from the user and build a consistent cart.
+
+Design rules enforced here:
+  - The LLM extracts *intent* only (items + signals). It never writes to cart.
+  - CartService applies all mutations and returns a new cart list.
+  - ProductResolver maps free text → product_id (fuzzy → LLM fallback).
+  - The backend (this node code) decides when the phase ends, NOT the LLM.
+  - MAX_PRODUCT_TURNS prevents infinite loops even for indecisive users.
+
+Phase transition:
+  Sets sales_phase = "product_confirmation" and product_selection_complete = True
+  when EITHER:
+    (a) user_done_signal is True AND cart is not empty, OR
+    (b) product_selection_turns >= MAX_PRODUCT_TURNS AND cart is not empty.
+"""
+
 import json
 
 import structlog
@@ -8,150 +28,112 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
+from ..services.cart import CartService
+from ..services.product_resolver import ProductResolver
 from .utils import format_user_context, language_instruction
 
 logger = structlog.get_logger(__name__)
 
-# Each step covers a group of order fields.
-_STEP_CONFIGS = [
-    {
-        "step": 1,
-        "topic": "Datos del cliente",
-        "fields": ["customer_name", "customer_phone", "customer_email"],
-        "questions": (
-            "Para procesar tu pedido necesito algunos datos:\n"
-            "1. ¿Cuál es tu nombre completo?\n"
-            "2. ¿Cuál es tu número de teléfono de contacto?\n"
-            "3. ¿Tienes un correo electrónico? (opcional)"
-        ),
-    },
-    {
-        "step": 2,
-        "topic": "Productos del pedido",
-        "fields": ["items"],
-        "questions": (
-            "¿Qué productos te gustaría ordenar?\n"
-            "Puedes indicarme el nombre del producto y la cantidad.\n"
-            "Si necesitas ver nuestro catálogo, con gusto te lo muestro."
-        ),
-    },
-    {
-        "step": 3,
-        "topic": "Entrega y pago",
-        "fields": ["delivery_address", "delivery_date_preference", "payment_method"],
-        "questions": (
-            "Para finalizar el pedido:\n"
-            "1. ¿Cuál es la dirección de entrega?\n"
-            "2. ¿Tienes preferencia de fecha de entrega?\n"
-            "3. ¿Cuál será el método de pago? (efectivo, transferencia, tarjeta)"
-        ),
-    },
-]
+MAX_PRODUCT_TURNS = 3
 
-_EXTRACTION_SYSTEM_PROMPT = """Eres un asistente de extracción de datos de pedidos.
+# ── Extraction prompt ────────────────────────────────────────────────────────
+# The LLM is responsible for understanding the user's intent and converting it
+# into a structured list.  ALL business logic lives in the node code below.
 
-Se te dará:
-1. Las preguntas que se hicieron al usuario en este paso
-2. Los campos ya recopilados
-3. El mensaje más reciente del usuario
-4. El catálogo de productos disponibles (si aplica)
+_EXTRACTION_SYSTEM_PROMPT = """Eres un extractor de intención de compra.
 
-Tu tarea: extraer las respuestas del usuario y mapearlas a los nombres de campo correctos.
-Devuelve un objeto JSON con los nombres de campo como claves y las respuestas del usuario como valores.
-Si un campo no fue respondido, omítelo del JSON.
+Analiza el mensaje del usuario y devuelve un JSON con:
+- "items": lista de productos mencionados, cada uno con:
+    - "name":           nombre del producto tal como lo dijo el usuario (string)
+    - "quantity":       cantidad numérica (int, default 1)
+    - "operation":      "add" | "remove" | "update_quantity" | "replace"
+    - "old_product_id": solo si operation="replace", el nombre del producto a reemplazar (string o null)
+    - "notes":          nota adicional del usuario sobre este ítem (string o "")
+- "user_done_signal":  true si el usuario indica que terminó de agregar productos
+    (frases como "eso es todo", "nada más", "listo", "ya está", "es todo")
 
-Para el campo "items", devuelve una lista de objetos: [{"product": "nombre", "quantity": número, "notes": "notas opcionales"}]
-Si el usuario menciona un producto del catálogo, usa el nombre exacto del catálogo.
-
-Responde SOLO con el objeto JSON — sin markdown, sin explicación.
+Responde SOLO con el objeto JSON. Sin markdown, sin explicación.
+Ejemplo:
+{
+  "items": [
+    {"name": "Arroz integral", "quantity": 2, "operation": "add", "old_product_id": null, "notes": ""}
+  ],
+  "user_done_signal": false
+}
 """
 
-_CONVERSATIONAL_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp para una tienda de productos físicos.
-Eres amable, eficiente. {language_rule}
+# ── Conversational prompt ─────────────────────────────────────────────────────
 
-Estás en el paso {step} de 3 del proceso de pedido, recopilando: {topic}.
+_CONV_SYSTEM_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. Eres amable y concisa.
+{language_rule}
 
-Tu tarea:
-1. Hacer las preguntas de este paso de forma amigable y conversacional.
-2. Si el usuario ya proporcionó algunas respuestas, reconócelas y pregunta solo por las faltantes.
-3. Si todas las respuestas del paso están completas, confirma y avisa que pasarás al siguiente paso.
+Estás ayudando al usuario a armar su carrito de compras.
 
-Campos faltantes: {missing_fields}
-Campos recopilados: {collected_fields}
+Estado actual del carrito:
+{cart_summary}
 
-{catalog_info}
+{unresolved_block}
+
+{catalog_block}
+
+Instrucción:
+{instruction}
 
 Reglas:
-- Sé concisa y amigable — es una conversación por WhatsApp.
-- NO preguntes por campos de otros pasos.
-- NO devuelvas JSON — esta es una respuesta en lenguaje natural.
+- Sé muy breve — es WhatsApp.
+- Si hay productos no encontrados, muestra las alternativas disponibles numeradas para que el usuario elija.
+- NO devuelvas JSON.
+- NO confirmes el pedido en este paso; eso se hace por separado.
 """
 
 
-async def sales_collect_node(
-    state: AgentState,
-    config: RunnableConfig,
-) -> dict:
+async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("sales_collect")
 
-    api_key: str = resolve_api_key(config)
+    api_key = resolve_api_key(config)
     client = get_openai_client(api_key)
-    thread_id: str = state.get("thread_id", "unknown")
-    order_data: dict = dict(state.get("order_data") or {})
-    sales_step: int = state.get("sales_step", 0)
-
-    # Determine current step config (1-3)
-    current_step_idx = max(0, min(sales_step, 2))  # clamp to 0-2 for indexing
-    step_config = _STEP_CONFIGS[current_step_idx]
-    step_num = step_config["step"]
-    fields = step_config["fields"]
-    topic = step_config["topic"]
+    thread_id = state.get("thread_id", "unknown")
 
     langfuse = get_langfuse()
     trace = langfuse.trace(
         name="sales_collect",
-        metadata={"thread_id": thread_id, "node": "sales_collect", "step": step_num},
+        metadata={"thread_id": thread_id, "node": "sales_collect"},
     )
 
     write = get_stream_writer()
+    write({"type": "step_progress", "step": 1, "total_steps": 1, "topic": "Selección de productos"})
 
-    # --- Step 1: Emit progress event ---
-    write({"type": "step_progress", "step": step_num, "total_steps": 3, "topic": topic})
-
-    # --- Step 2: Extract answers from latest user message ---
+    # ── Load current state ────────────────────────────────────────────────────
+    cart: list = list(state.get("cart") or [])
+    turns: int = int(state.get("product_selection_turns") or 0)
+    catalog: list = state.get("product_catalog") or []
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
-    extracted_fields: dict = {}
 
+    resolved_items: list[dict] = []
+    unresolved_items: list[dict] = []
+    user_done_signal = False
+
+    # ── Step 1: Extract intent from user message ──────────────────────────────
     if has_new_message:
-        already_collected = {k: order_data[k] for k in fields if order_data.get(k)}
-        still_missing = [f for f in fields if not order_data.get(f)]
-
-        # Build catalog context for extraction
-        catalog = state.get("product_catalog") or []
-        catalog_str = ""
-        if catalog:
-            catalog_str = "\n\nCatálogo de productos:\n" + "\n".join(
-                f"- {p.get('name', 'N/A')}: {p.get('description', '')} — ${p.get('price', 'N/A')} (stock: {p.get('stock', 'N/A')})"
-                for p in catalog
-            )
+        turns += 1
+        catalog_str = "\n".join(
+            f"- {p.get('name', 'N/A')}: ${p.get('price', 0):.2f} (stock: {p.get('stock', 'N/A')})"
+            for p in catalog
+        ) or "Sin catálogo disponible."
 
         extraction_messages = [
             {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    f"Paso {step_num} — {topic}\n\n"
-                    f"Preguntas hechas al usuario:\n{step_config['questions']}\n\n"
-                    f"Campos ya recopilados (no repetir): {list(already_collected.keys())}\n"
-                    f"Campos faltantes: {still_missing}\n\n"
+                    f"Catálogo disponible:\n{catalog_str}\n\n"
                     f"Mensaje del usuario:\n{state['messages'][-1].content}"
-                    f"{catalog_str}"
                 ),
             },
         ]
 
         extraction_gen = trace.generation(
-            name="sales_extraction_llm",
+            name="product_extraction_llm",
             model="gpt-5.4-nano",
             input={"messages": extraction_messages},
         )
@@ -161,120 +143,151 @@ async def sales_collect_node(
             messages=extraction_messages,
             stream=True,
         )
-
         extraction_raw = ""
         async for chunk in extraction_stream:
             delta = chunk.choices[0].delta.content if chunk.choices else ""
             if delta:
                 extraction_raw += delta
-
         extraction_gen.end(output=extraction_raw)
 
         try:
-            extracted_fields = json.loads(extraction_raw.strip())
-            if not isinstance(extracted_fields, dict):
-                extracted_fields = {}
+            parsed = json.loads(extraction_raw.strip())
+            extracted_items: list[dict] = parsed.get("items") or []
+            user_done_signal = bool(parsed.get("user_done_signal", False))
         except (json.JSONDecodeError, ValueError):
-            logger.warning("sales_extraction_parse_failed", step=step_num, raw=extraction_raw[:200])
-            extracted_fields = {}
+            logger.warning("sales_collect_extraction_parse_failed", raw=extraction_raw[:200])
+            extracted_items = []
 
-        # Merge into order_data
-        order_data.update({k: v for k, v in extracted_fields.items() if v})
-        logger.info("sales_fields_extracted", thread_id=thread_id, step=step_num, fields=list(extracted_fields.keys()))
+        # ── Step 2: Resolve product names → catalog ids ───────────────────────
+        if extracted_items:
+            resolver = ProductResolver(catalog)
+            resolved_items, unresolved_items = await resolver.resolve_many(
+                extracted_items, client=client
+            )
+            logger.info(
+                "product_resolution_done",
+                thread_id=thread_id,
+                resolved=len(resolved_items),
+                unresolved=len(unresolved_items),
+            )
 
-    # --- Step 3: Determine missing fields for this step ---
-    missing_fields = [f for f in fields if not order_data.get(f)]
-    collected_fields = {f: order_data[f] for f in fields if order_data.get(f)}
+        # ── Step 3: Apply CartService operations ──────────────────────────────
+        for item in resolved_items:
+            cart = CartService.apply_operation(
+                cart=cart,
+                operation=item["operation"],
+                product_id=item["product_id"],
+                name=item["name"],
+                qty=item["qty"],
+                price=item["price"],
+                old_product_id=item.get("old_product_id"),
+                notes=item.get("notes", ""),
+            )
+            logger.info(
+                "cart_operation_applied",
+                thread_id=thread_id,
+                operation=item["operation"],
+                product_id=item["product_id"],
+                qty=item["qty"],
+            )
 
-    # --- Step 4: If all fields for this step are collected, advance ---
-    step_complete = len(missing_fields) == 0
-    new_sales_step = sales_step
-    sales_complete = state.get("sales_complete", False)
+    # ── Step 4: Decide phase transition ───────────────────────────────────────
+    cart_has_items = not CartService.is_empty(cart)
+    turn_limit_reached = turns >= MAX_PRODUCT_TURNS
+    advance = cart_has_items and (user_done_signal or turn_limit_reached)
 
-    if step_complete and has_new_message:
-        new_sales_step = min(sales_step + 1, 3)
-        if new_sales_step >= 3:
-            sales_complete = True
-            logger.info("sales_collect_complete", thread_id=thread_id)
+    if turn_limit_reached and not cart_has_items:
+        # Edge case: user burned all turns without adding anything valid
+        advance = False
+        logger.warning("sales_collect_turn_limit_no_items", thread_id=thread_id)
 
-        # Emit update_deal_stage when advancing from step 0 → 1 (Lead → Prospecto)
-        if sales_step == 0 and new_sales_step == 1:
-            contact_id: str = state.get("contact_id", "")
-            if contact_id:
-                write({
-                    "type": "update_deal_stage",
-                    "contact_id": contact_id,
-                    "conversation_id": state.get("conversation_id", ""),
-                    "stage_position": 1,
-                })
-                logger.info("sales_deal_stage_advanced", thread_id=thread_id, stage_position=1)
+    product_selection_complete = advance
+    sales_phase = "product_confirmation" if advance else "product_selection"
 
-    # --- Step 5: Generate conversational response ---
-    collected_summary = ", ".join(f"{k}={repr(v)}" for k, v in collected_fields.items()) or "ninguno aún"
-    missing_summary = ", ".join(missing_fields) if missing_fields else "todos respondidos"
+    # ── Step 5: Build conversational response ──────────────────────────────────
+    cart_summary = CartService.format_cart(cart)
 
-    user_ctx_str = format_user_context(state)
+    # Unresolved block
+    unresolved_block = ""
+    if unresolved_items:
+        parts = []
+        for u in unresolved_items:
+            if u["alternatives"]:
+                alt_str = "\n".join(
+                    f"  {i + 1}. {a['name']} — ${a['price']:.2f}"
+                    for i, a in enumerate(u["alternatives"])
+                )
+                parts.append(f"❓ No encontré *{u['name']}*. ¿Quisiste decir alguno de estos?\n{alt_str}")
+            else:
+                parts.append(f"❓ No encontré *{u['name']}* en el catálogo.")
+        unresolved_block = "\n\n".join(parts)
 
-    # Build catalog info for conversational prompt
-    catalog = state.get("product_catalog") or []
-    catalog_info = ""
-    if catalog and step_num == 2:
-        catalog_info = "Catálogo disponible:\n" + "\n".join(
-            f"- {p.get('name', 'N/A')}: ${p.get('price', 'N/A')}"
-            for p in catalog
+    # Catalog block (only show when cart is empty or has few items to help the user)
+    catalog_block = ""
+    if not cart_has_items and catalog:
+        catalog_lines = "\n".join(
+            f"- {p.get('name', 'N/A')} — ${p.get('price', 0):.2f}"
+            for p in catalog[:10]
+        )
+        catalog_block = f"📦 *Catálogo disponible:*\n{catalog_lines}"
+
+    # Instruction for the conversational LLM
+    if advance and not unresolved_items:
+        instruction = (
+            "El usuario terminó de seleccionar productos. "
+            "Resume brevemente el carrito y dile que a continuación revisaremos el resumen para confirmar. "
+            "No pidas confirmación todavía."
+        )
+    elif advance and unresolved_items:
+        instruction = (
+            "Se acabaron los intentos para agregar productos. "
+            "Informa al usuario que pasaremos a confirmar con los productos que ya están en el carrito, "
+            "y que los productos no encontrados no serán incluidos. Sé empático."
+        )
+    elif not cart_has_items:
+        instruction = (
+            "El carrito está vacío. Saluda al usuario, indica que estás listo para tomar su pedido "
+            "y pregunta qué productos desea. "
+            + (f"Hay {turns} de {MAX_PRODUCT_TURNS} turnos utilizados." if turns > 0 else "")
+        )
+    elif unresolved_items:
+        instruction = (
+            "Algunos productos no fueron encontrados (mostrados en 'unresolved_block'). "
+            "Muestra las alternativas disponibles y pregunta si el usuario quiere alguna de ellas "
+            "o si desea continuar sin esos productos."
+        )
+    else:
+        turns_left = MAX_PRODUCT_TURNS - turns
+        instruction = (
+            f"Se agregaron productos al carrito exitosamente. "
+            f"Confirma lo que se agregó y pregunta si quiere algo más. "
+            f"Menciona que puede decir 'listo' o 'eso es todo' cuando termine. "
+            f"({'último turno disponible' if turns_left <= 1 else f'{turns_left} turnos restantes'})"
         )
 
-    if step_complete and sales_complete:
-        # Transition message to order summary
-        conv_prompt = (
-            "Has terminado de recopilar toda la información del pedido en 3 pasos. "
-            "Dile al usuario que has completado la recopilación y que ahora le presentarás "
-            "un resumen del pedido para su confirmación. "
-            "Sé breve y positiva."
-        ) + user_ctx_str
-        conv_messages = [
-            {"role": "system", "content": conv_prompt},
-        ]
-    elif step_complete and has_new_message:
-        # Step complete, moving to next step
-        next_step_config = _STEP_CONFIGS[new_sales_step] if new_sales_step < 3 else None
-        next_topic = next_step_config["topic"] if next_step_config else ""
-        conv_prompt = (
-            f"Has recopilado todos los datos del paso {step_num} ({topic}). "
-            f"Confirma brevemente lo recopilado y pasa al paso {new_sales_step + 1}: {next_topic}. "
-            f"Luego haz las preguntas del siguiente paso."
-        ) + user_ctx_str
-        next_questions = _STEP_CONFIGS[new_sales_step]["questions"] if new_sales_step < 3 else ""
-        conv_messages = [
-            {"role": "system", "content": conv_prompt},
-            {"role": "assistant", "content": f"Preguntas del siguiente paso:\n{next_questions}"},
-        ]
-    else:
-        # Ask/re-ask questions for current step
-        conv_messages = [
-            {
-                "role": "system",
-                "content": _CONVERSATIONAL_SYSTEM_PROMPT.format(
-                    step=step_num,
-                    topic=topic,
-                    missing_fields=missing_summary,
-                    collected_fields=collected_summary,
-                    catalog_info=catalog_info,
-                    language_rule=language_instruction(state.get("language", "en")),
-                ) + user_ctx_str,
-            },
-            {
-                "role": "user",
-                "content": (
-                    state["messages"][-1].content
-                    if has_new_message
-                    else f"Iniciar paso {step_num}: {_STEP_CONFIGS[current_step_idx]['questions']}"
-                ),
-            },
-        ]
+    conv_messages = [
+        {
+            "role": "system",
+            "content": _CONV_SYSTEM_PROMPT.format(
+                language_rule=language_instruction(state.get("language", "es")),
+                cart_summary=cart_summary,
+                unresolved_block=unresolved_block,
+                catalog_block=catalog_block,
+                instruction=instruction,
+            ) + format_user_context(state),
+        },
+        {
+            "role": "user",
+            "content": (
+                state["messages"][-1].content
+                if has_new_message
+                else "Hola, quiero hacer un pedido."
+            ),
+        },
+    ]
 
     conv_gen = trace.generation(
-        name="sales_conversational_llm",
+        name="sales_collect_conv_llm",
         model="gpt-5.4-nano",
         input={"messages": conv_messages},
     )
@@ -299,14 +312,22 @@ async def sales_collect_node(
             prompt_tokens = chunk.usage.prompt_tokens
             completion_tokens = chunk.usage.completion_tokens
 
-    conv_gen.end(
-        output=full_response,
-        usage={"input": prompt_tokens, "output": completion_tokens},
+    conv_gen.end(output=full_response, usage={"input": prompt_tokens, "output": completion_tokens})
+
+    logger.info(
+        "sales_collect_turn_done",
+        thread_id=thread_id,
+        turns=turns,
+        cart_size=len(cart),
+        advance=advance,
+        sales_phase=sales_phase,
     )
 
     return {
         "messages": [AIMessage(content=full_response)],
-        "order_data": order_data,
-        "sales_step": new_sales_step,
-        "sales_complete": sales_complete,
+        "cart": cart,
+        "product_selection_turns": turns,
+        "pending_unknown_items": unresolved_items,
+        "product_selection_complete": product_selection_complete,
+        "sales_phase": sales_phase,
     }

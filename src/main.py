@@ -88,6 +88,15 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 
+class PromptPayload(BaseModel):
+    content: str = ""
+    version: int = 0
+    model_config_data: dict = {}
+    is_default: bool = True
+
+    model_config = {"populate_by_name": True}
+
+
 class ChatStreamRequest(BaseModel):
     thread_id: str
     message: str
@@ -99,6 +108,7 @@ class ChatStreamRequest(BaseModel):
     contact_id: str = ""        # NestJS contact UUID
     contact_tags: list = []     # [{"id", "name", "color"}] current tags on the contact
     language: str = "en"        # Tenant language: "en", "es", "pt"
+    prompts: dict[str, PromptPayload] = {}  # Per-tenant prompt overrides
 
 
 class ChatResumeRequest(BaseModel):
@@ -303,10 +313,14 @@ async def chat_stream(
     thread_id = scoped_thread_id(user_sub, req.thread_id)
     agent_requests_total.inc()
 
+    # Serialize prompts to plain dicts for config (avoids Pydantic in checkpointer)
+    prompts_dict = {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
+
     config: dict = {
         "configurable": {
             "thread_id": thread_id,
             "openai_api_key": req.openai_api_key,
+            "prompts": prompts_dict,
         }
     }
 

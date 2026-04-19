@@ -31,6 +31,7 @@ from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService
 from ..services.product_resolver import ProductResolver
 from .utils import format_user_context, language_instruction
+from .backend_client import upsert_cart_item
 
 logger = structlog.get_logger(__name__)
 
@@ -183,6 +184,26 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
                 old_product_id=item.get("old_product_id"),
                 notes=item.get("notes", ""),
             )
+            
+            # Sync with the backend
+            contact_id = state.get("contact_id")
+            conversation_id = state.get("conversation_id")
+            if contact_id:
+                try:
+                    if item["operation"] == "remove":
+                        await upsert_cart_item(contact_id, item["product_id"], 0, conversation_id)
+                    elif item["operation"] == "replace" and item.get("old_product_id"):
+                        await upsert_cart_item(contact_id, item.get("old_product_id"), 0, conversation_id)
+                        new_item = CartService.find_item(cart, item["product_id"])
+                        if new_item:
+                            await upsert_cart_item(contact_id, item["product_id"], new_item["qty"], conversation_id)
+                    else:
+                        new_item = CartService.find_item(cart, item["product_id"])
+                        qty_to_sync = new_item["qty"] if new_item else 0
+                        await upsert_cart_item(contact_id, item["product_id"], qty_to_sync, conversation_id)
+                except Exception as e:
+                    logger.error("backend_cart_sync_error", error=str(e), product_id=item["product_id"])
+
             logger.info(
                 "cart_operation_applied",
                 thread_id=thread_id,

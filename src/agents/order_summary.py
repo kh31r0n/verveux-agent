@@ -1,4 +1,3 @@
-
 import structlog
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -8,7 +7,7 @@ from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction, resolve_prompt
-from ..services.command_bus import command_bus_client, CommandResult
+from .backend_client import get_or_create_cart
 
 logger = structlog.get_logger(__name__)
 
@@ -46,10 +45,33 @@ def _format_cart_for_llm(cart: dict) -> str:
     lines = []
     for item in cart.get("items", []):
         lines.append(
-            f"- {item['productNameSnapshot']} x{item['quantity']} — ${item['unitPriceSnapshot']:.2f} c/u = ${item['lineTotal']:.2f}"
+            f"- {item['productName']} x{item['quantity']} — ${item['unitPrice']:.2f} c/u = ${item['lineTotal']:.2f}"
         )
     lines.append(f"\n**Total: ${cart.get('grandTotal', 0):.2f} {cart.get('currency', 'USD')}**")
     return "\n".join(lines)
+
+
+def _build_cart_from_state(state_cart: list) -> dict:
+    """
+    Convert the AgentState cart list into the same dict shape that the
+    backend returns, so _format_cart_for_llm works identically for both.
+    """
+    items = [
+        {
+            "productName": item["name"],
+            "quantity": item["qty"],
+            "unitPrice": float(item["price"]),
+            "lineTotal": round(item["qty"] * float(item["price"]), 2),
+        }
+        for item in state_cart
+        if isinstance(item, dict)
+    ]
+    grand_total = round(sum(i["lineTotal"] for i in items), 2)
+    return {
+        "items": items,
+        "grandTotal": grand_total,
+        "currency": "USD",
+    }
 
 
 async def order_summary_node(
@@ -61,6 +83,8 @@ async def order_summary_node(
     api_key: str = resolve_api_key(config)
     client = get_openai_client(api_key)
     thread_id: str = state.get("thread_id", "unknown")
+    contact_id: str = state.get("contact_id", "")
+    conversation_id: str = state.get("conversation_id", "")
 
     langfuse = get_langfuse()
     trace = langfuse.trace(
@@ -72,8 +96,57 @@ async def order_summary_node(
     lang_rule = language_instruction(state.get("language", "en"))
     write({"type": "step_progress", "step": 4, "total_steps": 4, "topic": "Resumen del pedido"})
 
-    cart = state.get("cart") or {}
+    # ── Fetch backend cart (source of truth for totals) ───────────────────────
+    cart: dict = {}
+    backend_fetch_ok = False
 
+    if contact_id:
+        try:
+            cart = await get_or_create_cart(
+                contact_id=contact_id,
+                conversation_id=conversation_id or None,
+            )
+            backend_fetch_ok = True
+            logger.info(
+                "order_summary_cart_fetched",
+                thread_id=thread_id,
+                item_count=len(cart.get("items", [])),
+                grand_total=cart.get("grandTotal"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "order_summary_cart_fetch_failed",
+                thread_id=thread_id,
+                error=str(exc),
+            )
+
+    # ── Fallback: use in-memory state cart when backend is empty or failed ────
+    #
+    # This handles the case where backend sync silently failed in sales_collect
+    # (upsert_cart_item threw but was swallowed), leaving the backend with an
+    # empty cart while AgentState.cart has the correct items.
+    #
+    if not cart.get("items"):
+        state_cart: list = state.get("cart") or []
+        if state_cart:
+            cart = _build_cart_from_state(state_cart)
+            logger.warning(
+                "order_summary_state_cart_fallback",
+                thread_id=thread_id,
+                item_count=len(state_cart),
+                grand_total=cart.get("grandTotal"),
+                backend_fetch_ok=backend_fetch_ok,
+                reason="backend_cart_empty",
+            )
+        else:
+            # Both backend and state are empty — nothing to summarise.
+            logger.error(
+                "order_summary_no_cart_anywhere",
+                thread_id=thread_id,
+                backend_fetch_ok=backend_fetch_ok,
+            )
+
+    # ── Determine user intent ──────────────────────────────────────────────────
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
     order_confirmed = False
 
@@ -83,50 +156,20 @@ async def order_summary_node(
             order_confirmed = True
             logger.info("order_confirmed_by_user", thread_id=thread_id)
 
-    cart_summary_str = _format_cart_for_llm(cart) if cart else "(carrito no disponible)"
+    cart_summary_str = _format_cart_for_llm(cart) if cart.get("items") else "(carrito no disponible)"
 
+    # ── Build LLM prompt ──────────────────────────────────────────────────────
     if order_confirmed:
-        checkout_payload = state.get("order_data", {})
-        result = await command_bus_client.send_command(
-            command="checkout",
-            tenant_id=state["tenant_id"],
-            contact_id=state["contact_id"],
-            conversation_id=state["conversation_id"],
-            payload=checkout_payload
-        )
-
-        if result.success:
-            messages_payload = [
-                {
-                    "role": "system",
-                    "content": (
-                        "El cliente ha confirmado su pedido. "
-                        "Agradece brevemente y dile que estás procesando su pedido. "
-                        "Incluye el ID de la orden en el mensaje."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"ID de la orden: {result.data.get('id')}",
-                }
-            ]
-            return {
-                "messages": [AIMessage(content="")],
-                "order_confirmed": True,
-                "execute_confirmed": True,
-                "order_data": result.data,
+        messages_payload = [
+            {
+                "role": "system",
+                "content": (
+                    "El cliente ha confirmado su pedido. "
+                    "Agradece brevemente y dile que estás procesando su pedido. "
+                    "Sé concisa."
+                ),
             }
-        else:
-            messages_payload = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Hubo un problema al procesar el pedido. "
-                        f"Error: {result.error['message']}. "
-                        "Informa al usuario del problema y pregunta si quiere intentar de nuevo."
-                    ),
-                }
-            ]
+        ]
     elif has_new_message and not any(
         kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS
     ):

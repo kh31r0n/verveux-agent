@@ -1,5 +1,6 @@
 import json
 import logging
+import traceback
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -62,7 +63,7 @@ async def lifespan(app: FastAPI):
     pool = await init_pool()
     await run_migrations(pool)
 
-    # Initialise LangGraph checkpointer and compile graph
+    # Initialise LangGraph checkpointer and compile graph.
     async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
         await checkpointer.setup()
         compiled_graph = build_graph(checkpointer)
@@ -285,7 +286,7 @@ async def _stream_graph(
         yield _sse_event({"type": "done"})
 
     except Exception as exc:
-        logger.error("stream_error", error=str(exc))
+        logger.error("stream_error", error=str(exc), traceback=traceback.format_exc())
         record_tool_error("graph_stream")
         yield _sse_event({"type": "error", "message": str(exc)})
 

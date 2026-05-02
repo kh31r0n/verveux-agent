@@ -154,6 +154,8 @@ class CartService:
 
         lines = ["🛒 *Tu carrito:*"]
         for i, item in enumerate(cart, 1):
+            if not isinstance(item, dict):
+                continue
             subtotal = item["qty"] * item["price"]
             notes_part = f" _{item['notes']}_" if item.get("notes") else ""
             lines.append(

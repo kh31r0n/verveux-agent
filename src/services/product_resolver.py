@@ -67,7 +67,7 @@ class ResolutionResult:
 
 class ProductResolver:
     def __init__(self, catalog: list[dict]) -> None:
-        self.catalog: list[dict] = catalog or []
+        self.catalog: list[dict] = [p for p in (catalog or []) if isinstance(p, dict)]
         # Pre-build lower-cased name index for O(1) exact lookup
         self._by_name: dict[str, dict] = {
             p.get("name", "").lower().strip(): p for p in self.catalog

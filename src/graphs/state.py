@@ -34,7 +34,7 @@ class AgentState(TypedDict):
     sales_phase: str         # see lifecycle above; default "product_selection"
 
     # Cart — authoritative state owned by CartService
-    cart: Optional[dict] = None # Mirror of the backend cart
+    cart: Optional[list] = None # Mirror of the backend cart
     cart_confirmed: bool = False
 
     # Anti-loop counter: incremented each turn in PRODUCT_SELECTION.

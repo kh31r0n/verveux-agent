@@ -166,8 +166,16 @@ def route_from_triage(
     "execute",
 ]:
     structured_intent = state.get("structured_intent")
-    if structured_intent:
-        intent = structured_intent.intent
+    if structured_intent is not None:
+        # structured_intent may come back from checkpoint deserialization as a
+        # plain dict (if the Pydantic model could not be fully reconstructed).
+        # Fall back to the string intent field in that case.
+        if hasattr(structured_intent, "intent"):
+            intent = structured_intent.intent
+        elif isinstance(structured_intent, dict):
+            intent = structured_intent.get("intent", state.get("intent", "faq"))
+        else:
+            intent = state.get("intent", "faq")
     else:
         intent = state.get("intent", "faq")
 

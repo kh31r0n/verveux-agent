@@ -124,6 +124,8 @@ def get_current_user(payload: dict = Depends(verify_token)) -> str:
     return sub
 
 
-def scoped_thread_id(user_sub: str, client_thread_id: str) -> str:
-    """Construct a thread_id scoped to the authenticated user."""
-    return f"{user_sub}:{client_thread_id}"
+
+def scoped_thread_id(tenant_id: str, user_sub: str, conversation_id: str) -> str:
+    """Construct a thread_id scoped to the tenant, user, and conversation."""
+    return f"{tenant_id}:{user_sub}:{conversation_id}"
+

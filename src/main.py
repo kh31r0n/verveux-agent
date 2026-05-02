@@ -101,7 +101,7 @@ class ChatStreamRequest(BaseModel):
     thread_id: str
     message: str
     openai_api_key: str = ""
-    project_id: str = ""
+    tenant_id: str = ""
     conversation_id: str = ""
     product_catalog: list = []  # [{product_id, name, description, price, stock}]
     user_context: dict = {}     # {name, email, phone, address}
@@ -109,6 +109,10 @@ class ChatStreamRequest(BaseModel):
     contact_tags: list = []     # [{"id", "name", "color"}] current tags on the contact
     language: str = "en"        # Tenant language: "en", "es", "pt"
     prompts: dict[str, PromptPayload] = {}  # Per-tenant prompt overrides
+    knowledge: list = []
+    rawFaqs: list = []
+    rawCatalog: list = []
+
 
 
 class ChatResumeRequest(BaseModel):
@@ -310,7 +314,7 @@ async def chat_stream(
     if compiled_graph is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Agent graph not initialised")
 
-    thread_id = scoped_thread_id(user_sub, req.thread_id)
+    thread_id = scoped_thread_id(req.tenant_id, user_sub, req.conversation_id)
     agent_requests_total.inc()
 
     # Serialize prompts to plain dicts for config (avoids Pydantic in checkpointer)
@@ -327,20 +331,21 @@ async def chat_stream(
     inputs: dict = {
         "messages": [HumanMessage(content=req.message)],
         "thread_id": thread_id,
-        "project_id": req.project_id,
+        "tenant_id": req.tenant_id,
         "conversation_id": req.conversation_id,
         "product_catalog": req.product_catalog,
         "user_context": req.user_context,
         "contact_id": req.contact_id,
         "contact_tags": req.contact_tags,
         "language": req.language,
+        "knowledge": req.knowledge,
     }
 
     logger.info(
         "chat_stream_start",
         thread_id=thread_id,
         user_sub=user_sub,
-        project_id=req.project_id,
+        tenant_id=req.tenant_id,
         catalog_count=len(req.product_catalog),
     )
 

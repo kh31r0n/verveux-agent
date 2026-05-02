@@ -1,7 +1,10 @@
-from typing import Annotated
+
+from typing import Annotated, List, Optional
 
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
+
+from ..schemas.intent import StructuredIntent
 
 
 class AgentState(TypedDict):
@@ -9,9 +12,10 @@ class AgentState(TypedDict):
     thread_id: str
 
     # ── Conversation context (stable per conversation) ─────────────────
-    project_id: str
+    tenant_id: str
     conversation_id: str
     product_catalog: list    # [{product_id, name, description, price, stock}]
+    knowledge: Optional[List[dict]] = None # Unified knowledge payload
     user_context: dict       # {name, email, phone, address}
     contact_id: str
     contact_tags: list       # [{"id", "name", "color"}]
@@ -19,6 +23,7 @@ class AgentState(TypedDict):
 
     # ── Triage ─────────────────────────────────────────────────────────
     intent: str              # "sales" | "tracking" | "complaint" | "faq"
+    structured_intent: Optional[StructuredIntent] = None
 
     # ── Sales — explicit phase machine ─────────────────────────────────
     #
@@ -29,7 +34,8 @@ class AgentState(TypedDict):
     sales_phase: str         # see lifecycle above; default "product_selection"
 
     # Cart — authoritative state owned by CartService
-    cart: list               # [{product_id, name, qty, price, notes}]
+    cart: Optional[dict] = None # Mirror of the backend cart
+    cart_confirmed: bool = False
 
     # Anti-loop counter: incremented each turn in PRODUCT_SELECTION.
     # When it reaches MAX_PRODUCT_TURNS the phase advances regardless
@@ -42,7 +48,6 @@ class AgentState(TypedDict):
 
     # Phase completion flags (set by node code, read by routing edges)
     product_selection_complete: bool  # True → advance to product_confirmation
-    cart_confirmed: bool              # True → advance to customer_data
     customer_data_complete: bool      # True → advance to order_summary (payment)
 
     # Customer / delivery data collected in CUSTOMER_DATA phase
@@ -51,8 +56,6 @@ class AgentState(TypedDict):
     order_data: dict
 
     # Legacy sales fields (kept for backward compat with order_summary + execute)
-    sales_step: int
-    sales_complete: bool
     order_confirmed: bool   # final confirmation in order_summary
 
     # ── Tracking flow ──────────────────────────────────────────────────
@@ -65,6 +68,10 @@ class AgentState(TypedDict):
 
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool
+
+    # ── Observability ──────────────────────────────────────────────────
+    faq_used: Optional[List[dict]] = None
+    last_command_key: Optional[str] = None
 
     # ── Execution ──────────────────────────────────────────────────────
     execute_confirmed: bool

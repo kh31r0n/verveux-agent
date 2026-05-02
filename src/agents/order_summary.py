@@ -1,3 +1,4 @@
+
 import structlog
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -7,7 +8,7 @@ from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction, resolve_prompt
-from .backend_client import get_or_create_cart
+from ..services.command_bus import command_bus_client, CommandResult
 
 logger = structlog.get_logger(__name__)
 
@@ -45,7 +46,7 @@ def _format_cart_for_llm(cart: dict) -> str:
     lines = []
     for item in cart.get("items", []):
         lines.append(
-            f"- {item['productName']} x{item['quantity']} — ${item['unitPrice']:.2f} c/u = ${item['lineTotal']:.2f}"
+            f"- {item['productNameSnapshot']} x{item['quantity']} — ${item['unitPriceSnapshot']:.2f} c/u = ${item['lineTotal']:.2f}"
         )
     lines.append(f"\n**Total: ${cart.get('grandTotal', 0):.2f} {cart.get('currency', 'USD')}**")
     return "\n".join(lines)
@@ -60,8 +61,6 @@ async def order_summary_node(
     api_key: str = resolve_api_key(config)
     client = get_openai_client(api_key)
     thread_id: str = state.get("thread_id", "unknown")
-    contact_id: str = state.get("contact_id", "")
-    conversation_id: str = state.get("conversation_id", "")
 
     langfuse = get_langfuse()
     trace = langfuse.trace(
@@ -73,16 +72,7 @@ async def order_summary_node(
     lang_rule = language_instruction(state.get("language", "en"))
     write({"type": "step_progress", "step": 4, "total_steps": 4, "topic": "Resumen del pedido"})
 
-    # Fetch backend cart (source of truth for totals)
-    cart: dict = {}
-    if contact_id:
-        try:
-            cart = await get_or_create_cart(
-                contact_id=contact_id,
-                conversation_id=conversation_id or None,
-            )
-        except Exception as exc:
-            logger.warning("order_summary_cart_fetch_failed", thread_id=thread_id, error=str(exc))
+    cart = state.get("cart") or {}
 
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
     order_confirmed = False
@@ -96,16 +86,47 @@ async def order_summary_node(
     cart_summary_str = _format_cart_for_llm(cart) if cart else "(carrito no disponible)"
 
     if order_confirmed:
-        messages_payload = [
-            {
-                "role": "system",
-                "content": (
-                    "El cliente ha confirmado su pedido. "
-                    "Agradece brevemente y dile que estás procesando su pedido. "
-                    "Sé concisa."
-                ),
+        checkout_payload = state.get("order_data", {})
+        result = await command_bus_client.send_command(
+            command="checkout",
+            tenant_id=state["tenant_id"],
+            contact_id=state["contact_id"],
+            conversation_id=state["conversation_id"],
+            payload=checkout_payload
+        )
+
+        if result.success:
+            messages_payload = [
+                {
+                    "role": "system",
+                    "content": (
+                        "El cliente ha confirmado su pedido. "
+                        "Agradece brevemente y dile que estás procesando su pedido. "
+                        "Incluye el ID de la orden en el mensaje."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"ID de la orden: {result.data.get('id')}",
+                }
+            ]
+            return {
+                "messages": [AIMessage(content="")],
+                "order_confirmed": True,
+                "execute_confirmed": True,
+                "order_data": result.data,
             }
-        ]
+        else:
+            messages_payload = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Hubo un problema al procesar el pedido. "
+                        f"Error: {result.error['message']}. "
+                        "Informa al usuario del problema y pregunta si quiere intentar de nuevo."
+                    ),
+                }
+            ]
     elif has_new_message and not any(
         kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS
     ):

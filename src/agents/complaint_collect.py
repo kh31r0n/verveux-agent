@@ -1,3 +1,4 @@
+
 import json
 
 import structlog
@@ -9,6 +10,7 @@ from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
 from .utils import format_user_context, language_instruction, resolve_prompt
+from ..services.command_bus import command_bus_client, CommandResult
 
 logger = structlog.get_logger(__name__)
 
@@ -37,7 +39,7 @@ Campos faltantes: {missing_fields}
 
 Reglas:
 - Sé empática y comprensiva — el cliente tiene un problema.
-- Si ya tienes toda la información, confirma y dile que vas a procesar su queja.
+- Si ya tienes toda la información, confirma y dile que vas a registrar y procesar su queja.
 - Sé concisa — es WhatsApp.
 - {language_rule}
 - NO devuelvas JSON.
@@ -110,12 +112,35 @@ async def complaint_collect_node(
     user_ctx_str = format_user_context(state)
 
     if complaint_complete:
-        conv_prompt = (
-            "Tienes toda la información necesaria para procesar la queja del cliente. "
-            "Confirma los datos empáticamente y dile que vas a registrar y procesar su queja. "
-            "Sé breve y comprensiva."
-        ) + user_ctx_str
-        conv_messages = [{"role": "system", "content": conv_prompt}]
+        result = await command_bus_client.send_command(
+            command="create_ticket",
+            tenant_id=state["tenant_id"],
+            contact_id=state["contact_id"],
+            conversation_id=state["conversation_id"],
+            payload=complaint_data
+        )
+
+        if result.success:
+            conv_prompt = (
+                "Tienes toda la información necesaria para procesar la queja del cliente. "
+                "Confirma los datos empáticamente y dile que vas a registrar y procesar su queja. "
+                f"Incluye el ID del ticket en el mensaje: {result.data.get('id')}."
+                "Sé breve y comprensiva."
+            ) + user_ctx_str
+            conv_messages = [{"role": "system", "content": conv_prompt}]
+            return {
+                "messages": [AIMessage(content="")],
+                "complaint_complete": True,
+                "execute_confirmed": True,
+                "complaint_data": result.data,
+            }
+        else:
+            conv_prompt = (
+                "Hubo un problema al registrar la queja. "
+                f"Error: {result.error['message']}. "
+                "Informa al usuario del problema y pregunta si quiere intentar de nuevo."
+            ) + user_ctx_str
+            conv_messages = [{"role": "system", "content": conv_prompt}]
     else:
         complaint_conv_prompt = resolve_prompt(config, "COMPLAINT_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT)
         conv_messages = [
@@ -170,3 +195,4 @@ async def complaint_collect_node(
         "complaint_data": complaint_data,
         "complaint_complete": complaint_complete,
     }
+

@@ -1,14 +1,17 @@
+
 import json
 from typing import Literal
 
 import structlog
 from langchain_core.runnables import RunnableConfig
+from pydantic import ValidationError
 
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
+from ..schemas.intent import StructuredIntent, IntentType
 from .utils import format_contact_tags, format_user_context
 
 logger = structlog.get_logger(__name__)
@@ -19,15 +22,15 @@ Tu trabajo es clasificar la intención del usuario y devolver SOLO un objeto JSO
 
 Intenciones disponibles:
 - **sales**: El usuario quiere comprar productos, consultar precios, ver catálogo, o hacer un pedido.
+- **faq**: El usuario pregunta sobre horarios, ubicación, métodos de pago, envíos, políticas, o cualquier pregunta general.
 - **tracking**: El usuario quiere rastrear un pedido existente, consultar el estado de un envío, o verificar una entrega.
 - **complaint**: El usuario tiene una queja, reclamo, problema con un producto recibido, o quiere una devolución.
-- **faq**: El usuario pregunta sobre horarios, ubicación, métodos de pago, envíos, políticas, o cualquier pregunta general.
+- **greeting**: El usuario envía un saludo.
 
 Reglas:
 - Responde SOLO con un objeto JSON en una línea — sin markdown, sin texto adicional.
-- Esquema JSON: {"intent": "<sales|tracking|complaint|faq>", "suggest_tags": ["NombreTag"]}
-- "suggest_tags" es opcional. Incluye "Urgente" si el usuario suena muy molesto, frustrado, o tiene un problema serio.
-- Si el mensaje es un saludo o no encaja claramente, clasifica como "faq".
+- Esquema JSON: {"intent": "<sales|faq|tracking|complaint|greeting>", "confidence": 0.0-1.0, "entities": {"items": [{"product_identifier": "...", "quantity": 1, "notes": "..."}], "order_id": "...", "subject": "...", "description": "..."}, "raw_text": "..."}
+- Si el mensaje es un saludo o no encaja claramente, clasifica como "greeting".
 """
 
 
@@ -42,7 +45,7 @@ async def triage_node(
         state.get("intent") == "sales"
         and not state.get("execute_confirmed", False)
         and (
-            state.get("cart")                      # cart has items
+            state.get("cart")  # cart has items
             or state.get("product_selection_turns", 0) > 0  # at least one turn done
         )
     ):
@@ -116,37 +119,27 @@ async def triage_node(
     )
 
     try:
-        parsed = json.loads(full_response.strip())
-        intent: str = parsed.get("intent", "faq")
-    except (json.JSONDecodeError, AttributeError):
-        logger.warning("triage_json_parse_failed", raw=full_response[:200])
-        parsed = {}
-        intent = "faq"
+        parsed_json = json.loads(full_response.strip())
+        structured_intent = StructuredIntent.model_validate(parsed_json)
+        intent = structured_intent.intent
+    except (ValidationError, json.JSONDecodeError) as e:
+        logger.warning("triage_parse_failed", error=str(e), raw=full_response)
+        structured_intent = StructuredIntent(intent=IntentType.UNKNOWN, confidence=0.0, raw_text=full_response)
+        intent = IntentType.UNKNOWN
 
-    valid_intents = {"sales", "tracking", "complaint", "faq"}
-    if intent not in valid_intents:
-        intent = "faq"
+    write = get_stream_writer()
+    write({
+        "type": "intent_classified",
+        "intent": intent.value,
+        "confidence": structured_intent.confidence,
+    })
 
-    # Emit tag_contact SSE events for suggested tags
-    suggested_tags: list = parsed.get("suggest_tags", []) if isinstance(parsed, dict) else []
-    contact_id: str = state.get("contact_id", "")
-    if suggested_tags and contact_id:
-        write = get_stream_writer()
-        for tag_name in suggested_tags:
-            if isinstance(tag_name, str) and tag_name.strip():
-                write({
-                    "type": "tag_contact",
-                    "contact_id": contact_id,
-                    "tag_name": tag_name.strip(),
-                })
-                logger.info("triage_suggest_tag", thread_id=thread_id, tag=tag_name)
-
-    logger.info("triage_classified", thread_id=thread_id, intent=intent)
+    logger.info("triage_classified", thread_id=thread_id, intent=intent.value)
 
     # Emit create_deal SSE event when classifying as "sales" for the first time
     deal_created = state.get("deal_created", False)
-    if intent == "sales" and not deal_created and contact_id:
-        write = get_stream_writer()
+    contact_id: str = state.get("contact_id", "")
+    if intent == IntentType.SALES and not deal_created and contact_id:
         write({
             "type": "create_deal",
             "contact_id": contact_id,
@@ -155,9 +148,9 @@ async def triage_node(
             "source": "WHATSAPP",
         })
         logger.info("triage_deal_created", thread_id=thread_id, contact_id=contact_id)
-        return {"intent": intent, "deal_created": True}
+        return {"intent": intent.value, "structured_intent": structured_intent, "deal_created": True}
 
-    return {"intent": intent}
+    return {"intent": intent.value, "structured_intent": structured_intent}
 
 
 def route_from_triage(
@@ -172,10 +165,14 @@ def route_from_triage(
     "faq_response",
     "execute",
 ]:
-    intent = state.get("intent", "faq")
+    structured_intent = state.get("structured_intent")
+    if structured_intent:
+        intent = structured_intent.intent
+    else:
+        intent = state.get("intent", "faq")
 
     # ── Sales — route to the correct phase ────────────────────────────────────
-    if intent == "sales":
+    if intent == IntentType.SALES:
         if state.get("execute_confirmed", False):
             # Order already executed; treat new messages as FAQ
             return "faq_response"
@@ -201,7 +198,7 @@ def route_from_triage(
         return "sales_collect"
 
     # ── Tracking ──────────────────────────────────────────────────────────────
-    if intent == "tracking":
+    if intent == IntentType.TRACKING:
         if state.get("execute_confirmed", False):
             return "faq_response"
         if state.get("tracking_complete", False):
@@ -209,7 +206,7 @@ def route_from_triage(
         return "tracking_collect"
 
     # ── Complaint ─────────────────────────────────────────────────────────────
-    if intent == "complaint":
+    if intent == IntentType.COMPLAINT:
         if state.get("execute_confirmed", False):
             return "faq_response"
         if state.get("complaint_complete", False):
@@ -217,3 +214,4 @@ def route_from_triage(
         return "complaint_collect"
 
     return "faq_response"
+

@@ -1,22 +1,3 @@
-"""
-sales_collect — PRODUCT_SELECTION phase.
-
-Responsibility:
-  Collect product items from the user and build a consistent cart.
-
-Design rules enforced here:
-  - The LLM extracts *intent* only (items + signals). It never writes to cart.
-  - CartService applies all mutations and returns a new cart list.
-  - ProductResolver maps free text → product_id (fuzzy → LLM fallback).
-  - The backend (this node code) decides when the phase ends, NOT the LLM.
-  - MAX_PRODUCT_TURNS prevents infinite loops even for indecisive users.
-
-Phase transition:
-  Sets sales_phase = "product_confirmation" and product_selection_complete = True
-  when EITHER:
-    (a) user_done_signal is True AND cart is not empty, OR
-    (b) product_selection_turns >= MAX_PRODUCT_TURNS AND cart is not empty.
-"""
 
 import json
 
@@ -28,10 +9,9 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from ..services.cart import CartService
 from ..services.product_resolver import ProductResolver
+from ..services.command_bus import command_bus_client, CommandResult
 from .utils import format_user_context, language_instruction
-from .backend_client import upsert_cart_item
 
 logger = structlog.get_logger(__name__)
 
@@ -105,7 +85,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     write({"type": "step_progress", "step": 1, "total_steps": 1, "topic": "Selección de productos"})
 
     # ── Load current state ────────────────────────────────────────────────────
-    cart: list = list(state.get("cart") or [])
+    cart = state.get("cart") or {}
     turns: int = int(state.get("product_selection_turns") or 0)
     catalog: list = state.get("product_catalog") or []
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
@@ -172,48 +152,61 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
                 unresolved=len(unresolved_items),
             )
 
-        # ── Step 3: Apply CartService operations ──────────────────────────────
+        # ── Step 3: Send commands to the backend ─────────────────────────────
         for item in resolved_items:
-            cart = CartService.apply_operation(
-                cart=cart,
-                operation=item["operation"],
-                product_id=item["product_id"],
-                name=item["name"],
-                qty=item["qty"],
-                price=item["price"],
-                old_product_id=item.get("old_product_id"),
-                notes=item.get("notes", ""),
-            )
-            
-            # Sync with the backend
-            contact_id = state.get("contact_id")
-            conversation_id = state.get("conversation_id")
-            if contact_id:
-                try:
-                    if item["operation"] == "remove":
-                        await upsert_cart_item(contact_id, item["product_id"], 0, conversation_id)
-                    elif item["operation"] == "replace" and item.get("old_product_id"):
-                        await upsert_cart_item(contact_id, item.get("old_product_id"), 0, conversation_id)
-                        new_item = CartService.find_item(cart, item["product_id"])
-                        if new_item:
-                            await upsert_cart_item(contact_id, item["product_id"], new_item["qty"], conversation_id)
-                    else:
-                        new_item = CartService.find_item(cart, item["product_id"])
-                        qty_to_sync = new_item["qty"] if new_item else 0
-                        await upsert_cart_item(contact_id, item["product_id"], qty_to_sync, conversation_id)
-                except Exception as e:
-                    logger.error("backend_cart_sync_error", error=str(e), product_id=item["product_id"])
+            command_type = ""
+            payload = {}
 
-            logger.info(
-                "cart_operation_applied",
-                thread_id=thread_id,
-                operation=item["operation"],
-                product_id=item["product_id"],
-                qty=item["qty"],
-            )
+            if item["operation"] == "add":
+                command_type = "add_to_cart"
+                payload = {"productId": item["product_id"], "quantity": item["qty"], "notes": item.get("notes", "")}
+            elif item["operation"] == "update_quantity":
+                command_type = "update_cart_qty"
+                payload = {"productId": item["product_id"], "quantity": item["qty"]}
+            elif item["operation"] == "remove":
+                command_type = "remove_from_cart"
+                payload = {"productId": item["product_id"]}
+            elif item["operation"] == "replace" and item.get("old_product_id"):
+                # First remove the old item
+                remove_result = await command_bus_client.send_command(
+                    command="remove_from_cart",
+                    tenant_id=state["tenant_id"],
+                    contact_id=state["contact_id"],
+                    conversation_id=state["conversation_id"],
+                    payload={"productId": item["old_product_id"]}
+                )
+                if not remove_result.success:
+                    # TODO: Handle this error more gracefully
+                    logger.error("backend_cart_sync_error", error=remove_result.error, product_id=item["old_product_id"])
+                    continue
+                # Then add the new item
+                command_type = "add_to_cart"
+                payload = {"productId": item["product_id"], "quantity": item["qty"], "notes": item.get("notes", "")}
+
+            if command_type:
+                result = await command_bus_client.send_command(
+                    command=command_type,
+                    tenant_id=state["tenant_id"],
+                    contact_id=state["contact_id"],
+                    conversation_id=state["conversation_id"],
+                    payload=payload
+                )
+
+                if result.success:
+                    cart = result.data
+                    logger.info(
+                        "cart_operation_applied",
+                        thread_id=thread_id,
+                        operation=item["operation"],
+                        product_id=item["product_id"],
+                        qty=item["qty"],
+                    )
+                else:
+                    # TODO: Handle this error more gracefully
+                    logger.error("backend_cart_sync_error", error=result.error, product_id=item["product_id"])
 
     # ── Step 4: Decide phase transition ───────────────────────────────────────
-    cart_has_items = not CartService.is_empty(cart)
+    cart_has_items = cart and cart.get("items")
     turn_limit_reached = turns >= MAX_PRODUCT_TURNS
     advance = cart_has_items and (user_done_signal or turn_limit_reached)
 
@@ -226,7 +219,12 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     sales_phase = "product_confirmation" if advance else "product_selection"
 
     # ── Step 5: Build conversational response ──────────────────────────────────
-    cart_summary = CartService.format_cart(cart)
+    cart_summary = ""
+    if cart and cart.get("items"):
+        cart_summary = "\n".join(
+            f"- {item.get('productNameSnapshot')}: {item.get('quantity')} x ${item.get('unitPriceSnapshot'):.2f} = ${item.get('lineTotal'):.2f}"
+            for item in cart["items"]
+        ) + f"\nTotal: ${cart.get('grandTotal'):.2f}"
 
     # Unresolved block
     unresolved_block = ""
@@ -339,7 +337,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         "sales_collect_turn_done",
         thread_id=thread_id,
         turns=turns,
-        cart_size=len(cart),
+        cart_size=len(cart.get("items", [])),
         advance=advance,
         sales_phase=sales_phase,
     )

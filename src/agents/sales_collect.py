@@ -37,7 +37,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from ..services.cart import CartService
+from ..services.cart import CartService, normalize_cart
 from ..services.product_resolver import ProductResolver
 from .utils import format_user_context, language_instruction
 from .backend_client import upsert_cart_item
@@ -182,7 +182,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     write({"type": "step_progress", "step": 1, "total_steps": 1, "topic": "Selección de productos"})
 
     # ── Load current state ────────────────────────────────────────────────────
-    cart: list = list(state.get("cart") or [])
+    cart: list = normalize_cart(state.get("cart"))
     turns: int = int(state.get("product_selection_turns") or 0)
     catalog: list = state.get("product_catalog") or []
     contact_id: str = state.get("contact_id", "")

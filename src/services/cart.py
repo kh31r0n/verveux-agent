@@ -133,8 +133,17 @@ class CartService:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def total(cart: list[dict]) -> float:
-        return sum(item["qty"] * item["price"] for item in (cart or []))
+    def total(cart: list[dict] | None) -> float:
+        if not isinstance(cart, list):
+            return 0.0
+        amount = 0.0
+        for item in cart:
+            if not isinstance(item, dict):
+                continue
+            qty = item.get("qty") or 0
+            price = item.get("price") or 0
+            amount += float(qty) * float(price)
+        return amount
 
     @staticmethod
     def is_empty(cart: list[dict]) -> bool:
@@ -147,21 +156,43 @@ class CartService:
         )
 
     @staticmethod
-    def format_cart(cart: list[dict], currency: str = "$") -> str:
+    def format_cart(cart: list[dict] | None, currency: str = "$") -> str:
         """Return a WhatsApp-safe Markdown cart summary."""
-        if not cart:
+        if not isinstance(cart, list) or not cart:
             return "🛒 El carrito está vacío."
 
         lines = ["🛒 *Tu carrito:*"]
         for i, item in enumerate(cart, 1):
             if not isinstance(item, dict):
                 continue
-            subtotal = item["qty"] * item["price"]
-            notes_part = f" _{item['notes']}_" if item.get("notes") else ""
+            
+            qty = item.get("qty", 0)
+            price = item.get("price", 0)
+            name = item.get("name", "Producto")
+            notes = item.get("notes")
+
+            subtotal = qty * price
+            notes_part = f" _{notes}_" if notes else ""
             lines.append(
-                f"{i}. {item['name']} × {item['qty']} — "
-                f"{currency}{item['price']:.2f} c/u = *{currency}{subtotal:.2f}*"
+                f"{i}. {name} × {qty} — "
+                f"{currency}{price:.2f} c/u = *{currency}{subtotal:.2f}*"
                 f"{notes_part}"
             )
+        
+        if len(lines) == 1: # Only title, no valid items
+             return "🛒 El carrito está vacío."
+
         lines.append(f"\n💰 *Total estimado: {currency}{CartService.total(cart):.2f}*")
         return "\n".join(lines)
+
+def normalize_cart(raw_cart: object) -> list[dict]:
+    if raw_cart is None:
+        return []
+    if isinstance(raw_cart, list):
+        return [item for item in raw_cart if isinstance(item, dict)]
+    if isinstance(raw_cart, dict):
+        items = raw_cart.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    return []
+

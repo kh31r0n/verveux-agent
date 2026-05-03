@@ -22,7 +22,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..llm import get_openai_client, resolve_api_key
 from ..observability import get_langfuse, record_node_invocation
-from ..services.cart import CartService
+from ..services.cart import CartService, normalize_cart
 from .utils import language_instruction
 
 logger = structlog.get_logger(__name__)
@@ -88,7 +88,24 @@ Sé muy breve.
 """
 
 
+
+def _get_cart_list(state: AgentState) -> list:
+    """
+    Safely extract the cart item list from state.
+    Handles both the canonical list format and the legacy/backend dict format.
+    """
+    raw = state.get("cart")
+    if not raw:
+        return []
+    if isinstance(raw, dict):
+        return list(raw.get("items", []))
+    if isinstance(raw, list):
+        return list(raw)
+    return []
+
+
 async def sales_confirm_node(state: AgentState, config: RunnableConfig) -> dict:
+
     record_node_invocation("sales_confirm")
 
     api_key = resolve_api_key(config)
@@ -103,7 +120,7 @@ async def sales_confirm_node(state: AgentState, config: RunnableConfig) -> dict:
     )
 
     write = get_stream_writer()
-    cart: list = list(state.get("cart") or [])
+    cart: list = normalize_cart(state.get("cart"))
     cart_summary = CartService.format_cart(cart)
 
     has_new_message = (

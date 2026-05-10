@@ -1,4 +1,3 @@
-
 from typing import Annotated, List, Optional
 
 from langgraph.graph.message import add_messages
@@ -15,15 +14,22 @@ class AgentState(TypedDict):
     tenant_id: str
     conversation_id: str
     product_catalog: list    # [{product_id, name, description, price, stock}]
-    knowledge: Optional[List[dict]] = None # Unified knowledge payload
+    knowledge: Optional[List[dict]]  # Unified knowledge payload
     user_context: dict       # {name, email, phone, address}
     contact_id: str
     contact_tags: list       # [{"id", "name", "color"}]
     language: str            # "en" | "es" | "pt"
 
+    # ── FAQs — injected per-request, NOT persisted across turns ────────
+    # Schema: [{question: str, answer: str, category: str, priority: int}]
+    # Populated from rawFaqs in the NestJS request; used by triage and
+    # faq_response in the current turn only. Intentionally overwritten
+    # on every request so stale FAQ data never leaks between turns.
+    faqs: list
+
     # ── Triage ─────────────────────────────────────────────────────────
     intent: str              # "sales" | "tracking" | "complaint" | "faq"
-    structured_intent: Optional[StructuredIntent] = None
+    structured_intent: Optional[StructuredIntent]
 
     # ── Sales — explicit phase machine ─────────────────────────────────
     #
@@ -34,8 +40,13 @@ class AgentState(TypedDict):
     sales_phase: str         # see lifecycle above; default "product_selection"
 
     # Cart — authoritative state owned by CartService
-    cart: Optional[list[dict]] = None # Mirror of the backend cart
-    cart_confirmed: bool = False
+    cart: Optional[list]     # Mirror of the backend cart
+    cart_confirmed: bool
+
+    # backend_cart_sync_failed: set by sales_collect when the full-cart
+    # sync to the backend fails after retries. order_summary uses this
+    # flag to fall back to the state cart instead of fetching from the backend.
+    backend_cart_sync_failed: bool
 
     # Anti-loop counter: incremented each turn in PRODUCT_SELECTION.
     # When it reaches MAX_PRODUCT_TURNS the phase advances regardless
@@ -70,8 +81,8 @@ class AgentState(TypedDict):
     deal_created: bool
 
     # ── Observability ──────────────────────────────────────────────────
-    faq_used: Optional[List[dict]] = None
-    last_command_key: Optional[str] = None
+    faq_used: Optional[List[dict]]
+    last_command_key: Optional[str]
 
     # ── Execution ──────────────────────────────────────────────────────
     execute_confirmed: bool

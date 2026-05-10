@@ -16,6 +16,17 @@ Phase transition:
   Sets customer_data_complete = True and sales_phase = "payment" once all
   required fields are confirmed.  Uses user_context to pre-populate fields
   the NestJS backend already knows about, reducing unnecessary questions.
+
+Double-response guard:
+  When routing auto-chains from sales_confirm → customer_data_collect in the
+  same streaming turn, the last message in history is already an AI message
+  (sales_confirm's response). In that case we must NOT emit another response
+  or the user sees two AI messages in a single turn. The guard checks:
+    - last message is AI
+    - cart_confirmed == True
+    - customer_data_complete == False (we haven't finished yet)
+  If all three hold, return {} immediately and let the next user turn trigger
+  the actual data collection.
 """
 
 import json
@@ -74,6 +85,7 @@ Sin markdown, sin explicación.
 _CONV_SYSTEM_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. {language_rule}
 
 El cliente ya confirmó su carrito y ahora necesitas sus datos de entrega.
+Ve directo al punto — no saludes ni uses frases de transición como "¡Perfecto!" o "¡Genial!".
 
 Carrito confirmado:
 {cart_summary}
@@ -84,7 +96,8 @@ Campos faltantes: {missing}
 Instrucción: {instruction}
 
 Reglas:
-- Sé amigable y muy concisa — es WhatsApp.
+- Sé directo y muy conciso — es WhatsApp.
+- NO repitas el saludo ni la confirmación del carrito.
 - Si ya tienes todos los campos requeridos, confirma y dile que presentarás el resumen final.
 - Pregunta máximo 2 campos por mensaje.
 - NO devuelvas JSON.
@@ -94,9 +107,37 @@ Reglas:
 async def customer_data_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("customer_data_collect")
 
+    thread_id = state.get("thread_id", "unknown")
+
+    # ── Double-response guard ─────────────────────────────────────────────────
+    #
+    # When sales_confirm confirms the cart (cart_confirmed=True) and routes
+    # here in the same streaming turn, the last message is already an AI
+    # message from sales_confirm. Emitting another response here would produce
+    # two AI messages in a single turn, confusing the user.
+    #
+    # We detect this by checking:
+    #   1. last message is an AI message (sales_confirm already responded)
+    #   2. cart was just confirmed (we're entering this node for the first time)
+    #   3. customer data is not yet complete (we still need to collect it)
+    #
+    # In this case we return {} to skip the response. The next user message
+    # will re-enter this node with has_new_message=True and respond normally.
+    last_msg = state["messages"][-1] if state.get("messages") else None
+    last_is_ai = last_msg is not None and getattr(last_msg, "type", "") == "ai"
+    cart_just_confirmed = state.get("cart_confirmed", False)
+    already_collecting = state.get("customer_data_complete", False)
+
+    if last_is_ai and cart_just_confirmed and not already_collecting:
+        logger.info(
+            "customer_data_collect_guard_skipped",
+            thread_id=thread_id,
+            reason="auto_chain_from_sales_confirm",
+        )
+        return {}
+
     api_key = resolve_api_key(config)
     client = get_openai_client(api_key)
-    thread_id = state.get("thread_id", "unknown")
     lang = state.get("language", "es")
 
     langfuse = get_langfuse()
@@ -187,9 +228,9 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         )
     elif not has_new_message:
         instruction = (
-            "Primera vez en este paso. Saluda al usuario por su nombre si lo tienes "
-            "y pide amablemente los datos de entrega que faltan. "
-            "Empieza por el nombre y la dirección si no los tienes."
+            "Primera vez en este paso. Pide directamente los datos de entrega "
+            "que faltan. Empieza por el nombre y la dirección si no los tienes. "
+            "No uses frases de bienvenida ni transición."
         )
     else:
         next_missing = missing_required[:2] if missing_required else missing_all[:2]

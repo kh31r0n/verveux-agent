@@ -340,6 +340,19 @@ async def chat_stream(
         "contact_tags": req.contact_tags,
         "language": req.language,
         "knowledge": req.knowledge,
+        # FAQs are injected per-request and must NOT persist across turns.
+        # They are overwritten on every request so triage and faq_response
+        # always see the current turn's relevant FAQs only.
+        "faqs": [
+            {
+                "question": f.get("question", ""),
+                "answer": f.get("answer", ""),
+                "category": f.get("category", ""),
+                "priority": f.get("priority", 0),
+            }
+            for f in (req.rawFaqs or [])
+            if isinstance(f, dict)
+        ],
     }
 
     logger.info(
@@ -348,6 +361,7 @@ async def chat_stream(
         user_sub=user_sub,
         tenant_id=req.tenant_id,
         catalog_count=len(req.product_catalog),
+        faq_count=len(req.rawFaqs or []),
     )
 
     return StreamingResponse(

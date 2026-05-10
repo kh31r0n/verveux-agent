@@ -1,0 +1,67 @@
+# ─── PATCH: src/main.py ───────────────────────────────────────────────────────
+#
+# Two changes required. Apply with str_replace or copy the diff below.
+#
+# ── Change 1: inputs dict in chat_stream() ────────────────────────────────────
+#
+# OLD (around line 265):
+#     inputs: dict = {
+#         "messages": [HumanMessage(content=req.message)],
+#         "thread_id": thread_id,
+#         "tenant_id": req.tenant_id,
+#         "conversation_id": req.conversation_id,
+#         "product_catalog": req.product_catalog,
+#         "user_context": req.user_context,
+#         "contact_id": req.contact_id,
+#         "contact_tags": req.contact_tags,
+#         "language": req.language,
+#         "knowledge": req.knowledge,
+#     }
+#
+# NEW:
+#     inputs: dict = {
+#         "messages": [HumanMessage(content=req.message)],
+#         "thread_id": thread_id,
+#         "tenant_id": req.tenant_id,
+#         "conversation_id": req.conversation_id,
+#         "product_catalog": req.product_catalog,
+#         "user_context": req.user_context,
+#         "contact_id": req.contact_id,
+#         "contact_tags": req.contact_tags,
+#         "language": req.language,
+#         "knowledge": req.knowledge,
+#         # FAQs are injected per-request and must NOT persist across turns.
+#         # They are overwritten on every request so triage and faq_response
+#         # always see the current turn's relevant FAQs only.
+#         "faqs": [
+#             {
+#                 "question": f.get("question", ""),
+#                 "answer": f.get("answer", ""),
+#                 "category": f.get("category", ""),
+#                 "priority": f.get("priority", 0),
+#             }
+#             for f in (req.rawFaqs or [])
+#             if isinstance(f, dict)
+#         ],
+#     }
+#
+# ── Change 2: logger.info call in chat_stream() ───────────────────────────────
+#
+# OLD:
+#     logger.info(
+#         "chat_stream_start",
+#         thread_id=thread_id,
+#         user_sub=user_sub,
+#         tenant_id=req.tenant_id,
+#         catalog_count=len(req.product_catalog),
+#     )
+#
+# NEW:
+#     logger.info(
+#         "chat_stream_start",
+#         thread_id=thread_id,
+#         user_sub=user_sub,
+#         tenant_id=req.tenant_id,
+#         catalog_count=len(req.product_catalog),
+#         faq_count=len(req.rawFaqs or []),
+#     )

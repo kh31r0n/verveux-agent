@@ -1,4 +1,3 @@
-
 import json
 from typing import Literal
 
@@ -27,11 +26,37 @@ Intenciones disponibles:
 - **complaint**: El usuario tiene una queja, reclamo, problema con un producto recibido, o quiere una devolución.
 - **greeting**: El usuario envía un saludo.
 
-Reglas:
+Reglas de clasificación estrictas:
+- Preguntas sobre PROMOCIONES, DESCUENTOS, PRECIOS, OFERTAS → clasifica como **faq** (NO como sales).
+- Preguntas sobre horarios, ubicación, métodos de pago, envíos, políticas → **faq**.
+- Intención clara de COMPRA ("quiero comprar", "pedir", "agregar al carrito") → **sales**.
+- Un saludo o mensaje sin intención clara → **greeting**.
 - Responde SOLO con un objeto JSON en una línea — sin markdown, sin texto adicional.
-- Esquema JSON: {"intent": "<sales|faq|tracking|complaint|greeting>", "confidence": 0.0-1.0, "entities": {"items": [{"product_identifier": "...", "quantity": 1, "notes": "..."}], "order_id": "...", "subject": "...", "description": "..."}, "raw_text": "..."}
-- Si el mensaje es un saludo o no encaja claramente, clasifica como "greeting".
+- Esquema JSON: {{"intent": "<sales|faq|tracking|complaint|greeting>", "confidence": 0.0-1.0, "entities": {{"items": [{{"product_identifier": "...", "quantity": 1, "notes": "..."}}], "order_id": "...", "subject": "...", "description": "..."}}, "raw_text": "..."}}
 """
+
+_FAQ_HINTS_BLOCK = """
+Preguntas frecuentes disponibles (si el usuario pregunta algo similar, clasifica como **faq**):
+{faq_lines}
+
+IMPORTANTE: Si la pregunta del usuario coincide o es similar a alguna de las preguntas frecuentes anteriores, SIEMPRE clasifica como **faq**, incluso si menciona precios o productos.
+"""
+
+
+def _build_faq_hints(faqs: list) -> str:
+    """Format FAQs as hint block for the triage classifier."""
+    if not faqs:
+        return ""
+    lines = []
+    for faq in faqs:
+        q = faq.get("question", "").strip()
+        cat = faq.get("category", "")
+        if q:
+            suffix = f" [{cat}]" if cat else ""
+            lines.append(f"- {q}{suffix}")
+    if not lines:
+        return ""
+    return _FAQ_HINTS_BLOCK.format(faq_lines="\n".join(lines))
 
 
 async def triage_node(
@@ -41,13 +66,21 @@ async def triage_node(
     record_node_invocation("triage")
 
     # ── Skip re-classification for in-progress flows ──────────────────────────
+    #
+    # Guard conditions must be CONSERVATIVE: only skip when there is clear
+    # evidence the user is mid-flow, not just because state has stale values.
+    #
+    # IMPORTANT: `product_selection_turns > 0` alone is NOT a safe signal.
+    # A previous abandoned sales conversation leaves turns > 0 in the
+    # checkpoint even after the user moves on to an unrelated question.
+    # Using it here caused stale `intent=sales` to suppress re-classification
+    # and send FAQ queries (e.g. "¿Qué promocion tienen?") into sales_collect.
+    #
+    # Rule: skip only when the cart actually contains items (real in-progress order).
     if (
         state.get("intent") == "sales"
         and not state.get("execute_confirmed", False)
-        and (
-            state.get("cart")  # cart has items
-            or state.get("product_selection_turns", 0) > 0  # at least one turn done
-        )
+        and bool(state.get("cart"))  # must have actual cart items, not just stale turns
     ):
         return {}
 
@@ -75,14 +108,18 @@ async def triage_node(
         metadata={"thread_id": thread_id, "node": "triage"},
     )
 
-    messages_payload = [
-        {
-            "role": "system",
-            "content": _TRIAGE_SYSTEM_PROMPT
-            + format_user_context(state)
-            + format_contact_tags(state),
-        }
-    ]
+    # ── Build system prompt with optional FAQ hints ───────────────────────────
+    faqs: list = state.get("faqs") or []
+    faq_hints = _build_faq_hints(faqs)
+
+    system_content = (
+        _TRIAGE_SYSTEM_PROMPT
+        + faq_hints
+        + format_user_context(state)
+        + format_contact_tags(state)
+    )
+
+    messages_payload = [{"role": "system", "content": system_content}]
     for msg in state["messages"]:
         role = "assistant" if getattr(msg, "type", "") == "ai" else "user"
         content = msg.content if hasattr(msg, "content") else str(msg)
@@ -134,7 +171,12 @@ async def triage_node(
         "confidence": structured_intent.confidence,
     })
 
-    logger.info("triage_classified", thread_id=thread_id, intent=intent.value)
+    logger.info(
+        "triage_classified",
+        thread_id=thread_id,
+        intent=intent.value,
+        faq_hints_injected=len(faqs),
+    )
 
     # Emit create_deal SSE event when classifying as "sales" for the first time
     deal_created = state.get("deal_created", False)
@@ -222,4 +264,3 @@ def route_from_triage(
         return "complaint_collect"
 
     return "faq_response"
-

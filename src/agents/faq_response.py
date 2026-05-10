@@ -33,6 +33,32 @@ Reglas:
 - Si la pregunta es sobre algo que no manejas, guía al usuario hacia las capacidades disponibles.
 """
 
+_FAQ_KNOWLEDGE_BLOCK = """
+Preguntas frecuentes de la tienda (PRIORIZA estas respuestas si el usuario pregunta algo similar):
+{faq_lines}
+
+INSTRUCCIÓN IMPORTANTE: Si la pregunta del usuario coincide con alguna de las preguntas frecuentes anteriores, usa exactamente la respuesta provista. No inventes información adicional.
+"""
+
+
+def _format_faqs_for_prompt(faqs: list) -> str:
+    """Format FAQ list as a structured Q&A block for the LLM system prompt."""
+    if not faqs:
+        return ""
+    lines = []
+    # Sort by priority descending so most important FAQs appear first
+    sorted_faqs = sorted(faqs, key=lambda f: f.get("priority", 0), reverse=True)
+    for faq in sorted_faqs:
+        q = faq.get("question", "").strip()
+        a = faq.get("answer", "").strip()
+        cat = faq.get("category", "")
+        if q and a:
+            cat_prefix = f"[{cat}] " if cat else ""
+            lines.append(f"P: {cat_prefix}{q}\nR: {a}")
+    if not lines:
+        return ""
+    return _FAQ_KNOWLEDGE_BLOCK.format(faq_lines="\n\n".join(lines))
+
 
 async def faq_response_node(
     state: AgentState,
@@ -53,17 +79,30 @@ async def faq_response_node(
     lang_rule = language_instruction(state.get("language", "en"))
     faq_prompt = resolve_prompt(config, "FAQ", _FAQ_SYSTEM_PROMPT)
 
-    # Inject product catalog so the LLM can answer product-specific questions
+    # ── Inject FAQ knowledge from per-request FAQs ────────────────────────────
+    faqs: list = state.get("faqs") or []
+    faq_knowledge_block = _format_faqs_for_prompt(faqs)
+
+    # ── Inject product catalog so the LLM can answer product-specific questions
     catalog = state.get("product_catalog") or []
     catalog_block = ""
     if catalog:
         lines = ["\n\nCatálogo de productos disponibles:"]
         for p in catalog:
-            line = f"- **{p.get('name', 'N/A')}**: {p.get('description', '')} — ${p.get('price', 'N/A')} (stock: {p.get('stock', 'N/A')})"
+            line = (
+                f"- **{p.get('name', 'N/A')}**: {p.get('description', '')} "
+                f"— ${p.get('price', 'N/A')} (stock: {p.get('stock', 'N/A')})"
+            )
             lines.append(line)
         catalog_block = "\n".join(lines)
 
-    system_content = faq_prompt.format(language_rule=lang_rule) + catalog_block + format_user_context(state)
+    system_content = (
+        faq_prompt.format(language_rule=lang_rule)
+        + faq_knowledge_block
+        + catalog_block
+        + format_user_context(state)
+    )
+
     messages_payload = [{"role": "system", "content": system_content}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):
@@ -102,7 +141,12 @@ async def faq_response_node(
             completion_tokens = chunk.usage.completion_tokens
 
     gen.end(output=full_response, usage={"input": prompt_tokens, "output": completion_tokens})
-    logger.info("faq_response_sent", thread_id=thread_id, intent=state.get("intent", "faq"))
+    logger.info(
+        "faq_response_sent",
+        thread_id=thread_id,
+        intent=state.get("intent", "faq"),
+        faqs_injected=len(faqs),
+    )
 
     return {
         "messages": [AIMessage(content=full_response)],

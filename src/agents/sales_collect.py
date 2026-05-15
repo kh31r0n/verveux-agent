@@ -35,7 +35,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
-from ..llm import get_openai_client, resolve_api_key
+from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
 from ..services.product_resolver import ProductResolver
@@ -168,8 +168,8 @@ async def _sync_full_cart_to_backend(
 async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("sales_collect")
 
-    api_key = resolve_api_key(config)
-    client = get_openai_client(api_key)
+    provider = get_provider(config)
+    model = resolve_model(config)
     thread_id = state.get("thread_id", "unknown")
 
     langfuse = get_langfuse()
@@ -215,20 +215,17 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
 
         extraction_gen = trace.generation(
             name="product_extraction_llm",
-            model="gpt-5.4-nano",
+            model=model,
             input={"messages": extraction_messages},
         )
 
-        extraction_stream = await client.chat.completions.create(
-            model="gpt-5.4-nano",
+        extraction_stream = provider.stream_chat(
+            model=model,
             messages=extraction_messages,
-            stream=True,
         )
         extraction_raw = ""
         async for chunk in extraction_stream:
-            delta = chunk.choices[0].delta.content if chunk.choices else ""
-            if delta:
-                extraction_raw += delta
+            extraction_raw += chunk
         extraction_gen.end(output=extraction_raw)
 
         try:
@@ -243,7 +240,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         if extracted_items:
             resolver = ProductResolver(catalog)
             resolved_items, unresolved_items = await resolver.resolve_many(
-                extracted_items, client=client
+                extracted_items, provider=provider, model=model
             )
             logger.info(
                 "product_resolution_done",
@@ -385,31 +382,22 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
 
     conv_gen = trace.generation(
         name="sales_collect_conv_llm",
-        model="gpt-5.4-nano",
+        model=model,
         input={"messages": conv_messages},
     )
 
-    conv_stream = await client.chat.completions.create(
-        model="gpt-5.4-nano",
+    conv_stream = provider.stream_chat(
+        model=model,
         messages=conv_messages,
-        stream=True,
-        stream_options={"include_usage": True},
     )
 
     full_response = ""
-    prompt_tokens = 0
-    completion_tokens = 0
 
     async for chunk in conv_stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else ""
-        if delta:
-            write({"type": "token", "content": delta})
-            full_response += delta
-        if chunk.usage:
-            prompt_tokens = chunk.usage.prompt_tokens
-            completion_tokens = chunk.usage.completion_tokens
+        write({"type": "token", "content": chunk})
+        full_response += chunk
 
-    conv_gen.end(output=full_response, usage={"input": prompt_tokens, "output": completion_tokens})
+    conv_gen.end(output=full_response)
 
     logger.info(
         "sales_collect_turn_done",

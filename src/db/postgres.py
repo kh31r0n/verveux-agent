@@ -36,6 +36,7 @@ async def close_pool() -> None:
 
 
 async def run_migrations(pool: asyncpg.Pool) -> None:
+    logger.info("Running migrations...")
     """Apply init.sql migrations for application tables.
 
     Statements are executed individually so that a failure in one

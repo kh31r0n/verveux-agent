@@ -104,15 +104,21 @@ class ChatStreamRequest(BaseModel):
     openai_api_key: str = ""
     tenant_id: str = ""
     conversation_id: str = ""
-    product_catalog: list = []  # [{product_id, name, description, price, stock}]
-    user_context: dict = {}     # {name, email, phone, address}
-    contact_id: str = ""        # NestJS contact UUID
-    contact_tags: list = []     # [{"id", "name", "color"}] current tags on the contact
-    language: str = "en"        # Tenant language: "en", "es", "pt"
-    prompts: dict[str, PromptPayload] = {}  # Per-tenant prompt overrides
+    product_catalog: list = []
+    user_context: dict = {}
+    contact_id: str = ""
+    contact_tags: list = []
+    language: str = "en"
+    prompts: dict[str, PromptPayload] = {}
     knowledge: list = []
     rawFaqs: list = []
     rawCatalog: list = []
+    llm_provider: str = "openai"
+    llm_model: str = ""
+    anthropic_api_key: str = ""
+    vertex_credentials: dict = {}
+    vertex_project_id: str = ""
+    vertex_location: str = ""
 
 
 
@@ -126,6 +132,15 @@ class ChatResumeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
+
+
+_SECRET_KEYS = {
+    "openai_api_key",
+    "anthropic_api_key",
+    "vertex_credentials",
+    "vertex_service_account_json",
+    "llm_credentials",
+}
 
 
 def _sse_event(data: dict) -> str:
@@ -272,7 +287,7 @@ async def _stream_graph(
                                         }
                                         for m in v
                                     ] if isinstance(v, list) else []
-                                elif k != "openai_api_key":
+                                if k not in _SECRET_KEYS:
                                     try:
                                         json.dumps(v)  # verify serialisable
                                         safe_data[k] = v
@@ -297,6 +312,7 @@ async def _stream_graph(
 
 
 @app.get("/health")
+@app.get("/healthz")
 async def health() -> dict:
     return {"status": "ok"}
 
@@ -324,7 +340,13 @@ async def chat_stream(
     config: dict = {
         "configurable": {
             "thread_id": thread_id,
+            "llm_provider": req.llm_provider,
+            "llm_model": req.llm_model,
             "openai_api_key": req.openai_api_key,
+            "anthropic_api_key": req.anthropic_api_key,
+            "vertex_credentials": req.vertex_credentials,
+            "vertex_project_id": req.vertex_project_id,
+            "vertex_location": req.vertex_location,
             "prompts": prompts_dict,
         }
     }

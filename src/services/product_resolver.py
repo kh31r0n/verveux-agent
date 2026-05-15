@@ -125,7 +125,7 @@ class ProductResolver:
     async def resolve_with_llm_fallback(
         self,
         name: str,
-        client,               # AsyncOpenAI — typed loosely to avoid import cycle
+        provider, # ChatProvider
         model: str = "gpt-5.4-nano",
     ) -> ResolutionResult:
         result = self.resolve(name)
@@ -146,13 +146,12 @@ class ProductResolver:
         )
         prompt = _LLM_PROMPT.format(catalog_json=catalog_json, query=name)
         try:
-            resp = await client.chat.completions.create(
+            raw = await provider.chat(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=80,
             )
-            raw = (resp.choices[0].message.content or "").strip()
-            parsed = json.loads(raw)
+            parsed = json.loads(raw.strip())
             pid: Optional[str] = parsed.get("product_id")
             if pid:
                 p = next((x for x in self.catalog if x["product_id"] == pid), None)
@@ -174,7 +173,7 @@ class ProductResolver:
     async def resolve_many(
         self,
         items: list[dict],
-        client=None,
+        provider=None, # ChatProvider
         model: str = "gpt-5.4-nano",
     ) -> tuple[list[dict], list[dict]]:
         """
@@ -203,8 +202,8 @@ class ProductResolver:
             if not query_name:
                 continue
 
-            if client:
-                result = await self.resolve_with_llm_fallback(query_name, client, model)
+            if provider:
+                result = await self.resolve_with_llm_fallback(query_name, provider, model)
             else:
                 result = self.resolve(query_name)
 

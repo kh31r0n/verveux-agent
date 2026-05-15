@@ -11,6 +11,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.graphs.main_graph import build_graph
 
 
+async def mock_stream_chat(*args, **kwargs):
+    yield "response"
+
 class TestSalesFlow:
     @pytest.mark.asyncio
     async def test_sales_collect_invoked_for_sales_intent(self):
@@ -103,9 +106,23 @@ class TestSalesFlow:
         mock_sales = AsyncMock(
             return_value={
                 "messages": [AIMessage(content="Datos completos.")],
-                "sales_step": 3,
-                "sales_complete": True,
+                "sales_phase": "product_confirmation",
+                "product_selection_complete": True,
                 "order_data": {"customer_name": "Juan", "items": [{"product": "Camiseta", "quantity": 2}]},
+            }
+        )
+        mock_sales_confirm = AsyncMock(
+            return_value={
+                "messages": [AIMessage(content="Datos de entrega.")],
+                "cart_confirmed": True,
+                "sales_phase": "customer_data",
+            }
+        )
+        mock_customer_data = AsyncMock(
+            return_value={
+                "messages": [AIMessage(content="Resumen final.")],
+                "customer_data_complete": True,
+                "sales_phase": "payment",
             }
         )
         mock_summary = AsyncMock(
@@ -121,9 +138,13 @@ class TestSalesFlow:
         with (
             patch("src.graphs.main_graph.triage_node", new=mock_triage),
             patch("src.graphs.main_graph.sales_collect_node", new=mock_sales),
+            patch("src.graphs.main_graph.sales_confirm_node", new=mock_sales_confirm),
+            patch("src.graphs.main_graph.customer_data_collect_node", new=mock_customer_data),
             patch("src.graphs.main_graph.order_summary_node", new=mock_summary),
             patch("src.graphs.main_graph.execute_node", new=mock_execute),
-        ):
+            patch("src.providers.openai.OpenAIProvider.stream_chat", new=mock_stream_chat),
+            patch("src.providers.anthropic.AnthropicProvider.stream_chat", new=mock_stream_chat),
+            patch("src.providers.vertex.VertexProvider.stream_chat", new=mock_stream_chat),        ):
             graph = build_graph(MemorySaver())
             chunks = []
             async for chunk in graph.astream(
@@ -138,6 +159,8 @@ class TestSalesFlow:
 
         node_names = [list(c.keys())[0] for c in chunks if isinstance(c, dict)]
         assert "sales_collect" in node_names
+        assert "sales_confirm" in node_names
+        assert "customer_data_collect" in node_names
         assert "order_summary" in node_names
         assert "execute" in node_names
 

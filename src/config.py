@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     cognito_region: str
     cognito_app_client_id: str = ""
     openai_api_key: str = ""
+    anthropic_api_key: str = ""
+    vertex_service_account_json: str = ""
+    vertex_project_id: str = ""
+    vertex_location: str = ""
     langfuse_secret_key: str = ""
     langfuse_public_key: str = ""
     langfuse_host: str = "http://localhost:3010"

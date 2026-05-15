@@ -7,7 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, interrupt
 
 from ..graphs.state import AgentState
-from ..llm import get_openai_client, resolve_api_key
+from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction
 
@@ -44,8 +44,8 @@ async def workflow_node(
 ) -> Command[Literal["orchestrator"]]:
     record_node_invocation("workflow")
 
-    api_key: str = resolve_api_key(config)
-    client = get_openai_client(api_key)
+    provider = get_provider(config)
+    model = resolve_model(config)
     thread_id: str = state.get("thread_id", "unknown")
 
     langfuse = get_langfuse()
@@ -66,30 +66,21 @@ async def workflow_node(
 
     generation = trace.generation(
         name="workflow_decision_llm",
-        model="gpt-4o",
+        model=model,
         input={"messages": messages_payload},
     )
 
-    stream = await client.chat.completions.create(
-        model="gpt-4o",
+    stream = provider.stream_chat(
+        model=model,
         messages=messages_payload,
-        stream=True,
     )
 
     full_response = ""
-    prompt_tokens = 0
-    completion_tokens = 0
-
     async for chunk in stream:
-        delta = chunk.choices[0].delta.content or ""
-        full_response += delta
-        if chunk.usage:
-            prompt_tokens = chunk.usage.prompt_tokens
-            completion_tokens = chunk.usage.completion_tokens
+        full_response += chunk
 
     generation.end(
         output=full_response,
-        usage={"input": prompt_tokens, "output": completion_tokens},
     )
 
     try:
@@ -145,9 +136,8 @@ async def workflow_node(
         )
         return Command(goto="orchestrator", update={"messages": [confirmation_msg]})
     else:
-        # Inform user of cancellation via LLM
-        rejection_stream = await client.chat.completions.create(
-            model="gpt-4o",
+        rejection_text = await provider.chat(
+            model=model,
             messages=[
                 {"role": "system", "content": _REJECTION_PROMPT.format(language_rule=language_instruction(state.get("language", "en")))},
                 {
@@ -155,12 +145,7 @@ async def workflow_node(
                     "content": f"The user declined to trigger: {description}",
                 },
             ],
-            stream=True,
         )
-
-        rejection_text = ""
-        async for chunk in rejection_stream:
-            rejection_text += chunk.choices[0].delta.content or ""
 
         rejection_msg = AIMessage(content=rejection_text)
         return Command(goto="orchestrator", update={"messages": [rejection_msg]})

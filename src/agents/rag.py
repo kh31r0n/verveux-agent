@@ -5,7 +5,9 @@ from langgraph.config import get_stream_writer
 
 from ..db.postgres import get_pool
 from ..graphs.state import AgentState
-from ..llm import get_openai_client, resolve_api_key
+from ..llm import resolve_api_key
+from ..providers.openai import OpenAIProvider
+from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction
 
@@ -27,8 +29,11 @@ async def rag_node(
 ) -> dict:
     record_node_invocation("rag")
 
-    api_key: str = resolve_api_key(config)
-    client = get_openai_client(api_key)
+    # RAG always uses OpenAI for embeddings, for now.
+    # The main provider is used for the chat completion.
+    openai_provider = OpenAIProvider(config)
+    provider = get_provider(config)
+    model = resolve_model(config)
     thread_id: str = state.get("thread_id", "unknown")
 
     langfuse = get_langfuse()
@@ -53,14 +58,12 @@ async def rag_node(
         model="text-embedding-3-small",
         input={"text": user_question},
     )
-    embedding_response = await client.embeddings.create(
+    embedding_response = await openai_provider.embed(
+        texts=[user_question],
         model="text-embedding-3-small",
-        input=user_question,
     )
-    embedding_vector: list[float] = embedding_response.data[0].embedding
-    embedding_gen.end(
-        usage={"input": embedding_response.usage.prompt_tokens, "output": 0},
-    )
+    embedding_vector: list[float] = embedding_response[0]
+    embedding_gen.end()
 
     # Query pgvector for top-K similar documents
     pool = await get_pool()
@@ -96,35 +99,24 @@ async def rag_node(
 
     generation = trace.generation(
         name="rag_llm",
-        model="gpt-4o",
+        model=model,
         input={"messages": messages_payload},
     )
 
     write = get_stream_writer()
 
-    stream = await client.chat.completions.create(
-        model="gpt-5.4-nano",
+    stream = provider.stream_chat(
+        model=model,
         messages=messages_payload,
-        stream=True,
-        stream_options={"include_usage": True},
     )
 
     full_response = ""
-    prompt_tokens = 0
-    completion_tokens = 0
-
     async for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else ""
-        if delta:
-            write({"type": "token", "content": delta})
-            full_response += delta
-        if chunk.usage:
-            prompt_tokens = chunk.usage.prompt_tokens
-            completion_tokens = chunk.usage.completion_tokens
+        write({"type": "token", "content": chunk})
+        full_response += chunk
 
     generation.end(
         output=full_response,
-        usage={"input": prompt_tokens, "output": completion_tokens},
     )
 
     return {

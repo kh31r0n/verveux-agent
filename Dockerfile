@@ -38,6 +38,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN addgroup --system --gid 1001 appgroup && \
     adduser --system --uid 1001 --ingroup appgroup appuser
 
+# Install curl for health checks
+RUN apt-get update && \
+    apt-get install -y curl && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy the virtualenv and source from the builder stage

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from starlette.responses import Response
 
 from .auth.cognito import get_current_user, scoped_thread_id
+from .agents.backend_client import fetch_agent_credentials
 from .config import settings
 from .db.postgres import close_pool, get_pool, init_pool, run_migrations
 from .graphs.main_graph import build_graph
@@ -329,25 +330,65 @@ async def chat_stream(
     user_sub: Annotated[str, Depends(get_current_user)],
 ) -> StreamingResponse:
     if compiled_graph is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Agent graph not initialised")
+        raise HTTPException(status_code=503, detail="Agent graph not initialised")
 
     thread_id = scoped_thread_id(req.tenant_id, user_sub, req.conversation_id)
     agent_requests_total.inc()
 
-    # Serialize prompts to plain dicts for config (avoids Pydantic in checkpointer)
-    prompts_dict = {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
+    # ── Resolve credentials from NestJS ──────────────────────────────────────
+    # We fetch once per request. The result is injected into configurable and
+    # never logged or emitted via SSE (stripped by _SECRET_KEYS).
+    llm_provider = req.llm_provider or "openai"
+    llm_model = req.llm_model or ""
+    provider_config: dict = {}
 
-    config: dict = {
-        "configurable": {
-            "thread_id": thread_id,
-            "llm_provider": req.llm_provider,
-            "llm_model": req.llm_model,
+    if req.tenant_id:
+        try:
+            creds = await fetch_agent_credentials(req.tenant_id)
+            llm_provider = creds.get("provider", "OPENAI").lower()
+            llm_model = creds.get("model") or llm_model
+
+            if llm_provider == "openai":
+                provider_config["openai_api_key"] = creds.get("apiKey", "")
+            elif llm_provider == "anthropic":
+                provider_config["anthropic_api_key"] = creds.get("apiKey", "")
+            elif llm_provider == "vertex":
+                provider_config["vertex_credentials"] = creds.get("vertexCredentials", {})
+                provider_config["vertex_project_id"] = creds.get("vertexProjectId", "")
+                provider_config["vertex_location"] = creds.get("vertexLocation", "")
+        except Exception as exc:
+            logger.warning(
+                "agent_credentials_fetch_failed",
+                tenant_id=req.tenant_id,
+                error=str(exc),
+            )
+            # Fall back to per-request keys sent by the frontend (legacy path)
+            provider_config = {
+                "openai_api_key": req.openai_api_key,
+                "anthropic_api_key": req.anthropic_api_key,
+                "vertex_credentials": req.vertex_credentials,
+                "vertex_project_id": req.vertex_project_id,
+                "vertex_location": req.vertex_location,
+            }
+    else:
+        # No tenantId — use legacy per-request keys
+        provider_config = {
             "openai_api_key": req.openai_api_key,
             "anthropic_api_key": req.anthropic_api_key,
             "vertex_credentials": req.vertex_credentials,
             "vertex_project_id": req.vertex_project_id,
             "vertex_location": req.vertex_location,
+        }
+
+    prompts_dict = {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
+
+    config: dict = {
+        "configurable": {
+            "thread_id": thread_id,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
             "prompts": prompts_dict,
+            **provider_config,   # injects the right keys for the resolved provider
         }
     }
 
@@ -362,9 +403,6 @@ async def chat_stream(
         "contact_tags": req.contact_tags,
         "language": req.language,
         "knowledge": req.knowledge,
-        # FAQs are injected per-request and must NOT persist across turns.
-        # They are overwritten on every request so triage and faq_response
-        # always see the current turn's relevant FAQs only.
         "faqs": [
             {
                 "question": f.get("question", ""),
@@ -382,6 +420,8 @@ async def chat_stream(
         thread_id=thread_id,
         user_sub=user_sub,
         tenant_id=req.tenant_id,
+        provider=llm_provider,
+        model=llm_model,
         catalog_count=len(req.product_catalog),
         faq_count=len(req.rawFaqs or []),
     )
@@ -389,10 +429,7 @@ async def chat_stream(
     return StreamingResponse(
         _stream_graph(inputs, config),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

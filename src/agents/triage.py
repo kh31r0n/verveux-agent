@@ -59,6 +59,20 @@ def _build_faq_hints(faqs: list) -> str:
     return _FAQ_HINTS_BLOCK.format(faq_lines="\n".join(lines))
 
 
+def _strip_json_fences(raw: str) -> str:
+    """Remove markdown code fences that Gemini adds around JSON responses.
+
+    Handles both ```json ... ``` and ``` ... ``` variants.
+    """
+    s = raw.strip()
+    if s.startswith("```"):
+        # Drop the opening fence line (```json or ```)
+        s = s.split("\n", 1)[-1]
+        # Drop the closing fence
+        s = s.rsplit("```", 1)[0]
+    return s.strip()
+
+
 async def triage_node(
     state: AgentState,
     config: RunnableConfig,
@@ -146,7 +160,8 @@ async def triage_node(
     )
 
     try:
-        parsed_json = json.loads(full_response.strip())
+        # Strip markdown code fences that Gemini adds despite being told not to.
+        parsed_json = json.loads(_strip_json_fences(full_response))
         structured_intent = StructuredIntent.model_validate(parsed_json)
         intent = structured_intent.intent
     except (ValidationError, json.JSONDecodeError) as e:

@@ -21,6 +21,7 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "anthropic>=1.0",
     "google-cloud-aiplatform>=1.60",
+    "google-generativeai>=0.8",
 ]
 
 [project.optional-dependencies]

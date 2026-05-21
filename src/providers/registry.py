@@ -6,7 +6,7 @@ from .vertex import VertexProvider
 
 _DEFAULT_MODELS = {
     "openai": "gpt-4o",
-    "anthropic": "claude-3-sonnet-20240229",
+    "anthropic": "claude-sonnet-4-5",
     "vertex": "gemini-1.5-flash",
 }
 

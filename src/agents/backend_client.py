@@ -56,6 +56,20 @@ async def checkout_cart(contact_id: str, conversation_id: str | None = None) -> 
     return await _post("/api/v1/internal/orders/checkout", json=body)
 
 
+async def fetch_agent_credentials(tenant_id: str) -> dict:
+    """
+    GET /api/v1/internal/agent/credentials?tenantId=...
+    Returns the decrypted runtime credentials for the tenant's effective LLM provider.
+    Response shape:
+      { provider, model, apiKey? } for OpenAI/Anthropic
+      { provider, model, vertexCredentials, vertexProjectId, vertexLocation } for Vertex
+    """
+    return await _get(
+        "/api/v1/internal/agent/credentials",
+        params={"tenantId": tenant_id},
+    )
+
+
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 

@@ -10,6 +10,11 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     thread_id: str
 
+    # ── Multi-agent identity ──────────────────────────────────────────
+    agent_type: str              # "sales" | "school" | "restaurant" | "appointments"
+    capabilities: dict           # capability contract from NestJS (read-only)
+    domain_state: dict           # generic bag for domain-specific data (prevents state pollution)
+
     # ── Conversation context (stable per conversation) ─────────────────
     tenant_id: str
     conversation_id: str

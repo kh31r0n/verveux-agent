@@ -7,7 +7,7 @@ from .vertex import VertexProvider
 _DEFAULT_MODELS = {
     "openai": "gpt-4o",
     "anthropic": "claude-sonnet-4-5",
-    "vertex": "gemini-1.5-flash",
+    "vertex": "gemini-2.5-flash",
 }
 
 def get_provider(config: RunnableConfig) -> ChatProvider:

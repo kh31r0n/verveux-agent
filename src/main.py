@@ -20,7 +20,7 @@ from .auth.cognito import get_current_user, scoped_thread_id
 from .agents.backend_client import fetch_agent_credentials
 from .config import settings
 from .db.postgres import close_pool, get_pool, init_pool, run_migrations
-from .graphs.main_graph import build_graph
+from .graphs.registry import compile_all_graphs, get_agent_graph
 from .observability import (
     agent_interrupt_events_total,
     agent_requests_total,
@@ -46,28 +46,20 @@ structlog.configure(
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Global compiled graph (initialised in lifespan)
-# ---------------------------------------------------------------------------
-
-compiled_graph = None
-
-# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global compiled_graph
-
     # Initialise application DB pool and run migrations
     pool = await init_pool()
     await run_migrations(pool)
 
-    # Initialise LangGraph checkpointer and compile graph.
+    # Initialise LangGraph checkpointer and compile all agent graphs.
     async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
         await checkpointer.setup()
-        compiled_graph = build_graph(checkpointer)
+        compile_all_graphs(checkpointer)
         logger.info("langgraph_ready")
         yield
 
@@ -120,6 +112,8 @@ class ChatStreamRequest(BaseModel):
     vertex_credentials: dict = {}
     vertex_project_id: str = ""
     vertex_location: str = ""
+    agent_type: str = "sales"
+    capabilities: list = []
 
 
 
@@ -128,6 +122,7 @@ class ChatResumeRequest(BaseModel):
     interrupt_id: str
     approved: bool
     openai_api_key: str = ""
+    agent_type: str = "sales"
 
 
 # ---------------------------------------------------------------------------
@@ -151,14 +146,15 @@ def _sse_event(data: dict) -> str:
 async def _stream_graph(
     inputs: dict | Command,
     config: dict,
+    graph=None,
 ) -> AsyncGenerator[str, None]:
     """Consume a graph.astream() and yield SSE-formatted strings."""
-    if compiled_graph is None:
+    if graph is None:
         yield _sse_event({"type": "error", "message": "Agent graph not initialised"})
         return
 
     try:
-        async for chunk in compiled_graph.astream(
+        async for chunk in graph.astream(
             inputs,
             config=config,
             stream_mode=["updates", "custom"],
@@ -329,7 +325,9 @@ async def chat_stream(
     req: ChatStreamRequest,
     user_sub: Annotated[str, Depends(get_current_user)],
 ) -> StreamingResponse:
-    if compiled_graph is None:
+    agent_type = (req.agent_type or "sales").lower()
+    graph = get_agent_graph(agent_type)
+    if graph is None:
         raise HTTPException(status_code=503, detail="Agent graph not initialised")
 
     thread_id = scoped_thread_id(req.tenant_id, user_sub, req.conversation_id)
@@ -397,6 +395,9 @@ async def chat_stream(
         "thread_id": thread_id,
         "tenant_id": req.tenant_id,
         "conversation_id": req.conversation_id,
+        "agent_type": agent_type,
+        "capabilities": {"agent_type": agent_type, "capabilities": req.capabilities},
+        "domain_state": {},
         "product_catalog": req.product_catalog,
         "user_context": req.user_context,
         "contact_id": req.contact_id,
@@ -420,6 +421,7 @@ async def chat_stream(
         thread_id=thread_id,
         user_sub=user_sub,
         tenant_id=req.tenant_id,
+        agent_type=agent_type,
         provider=llm_provider,
         model=llm_model,
         catalog_count=len(req.product_catalog),
@@ -427,7 +429,7 @@ async def chat_stream(
     )
 
     return StreamingResponse(
-        _stream_graph(inputs, config),
+        _stream_graph(inputs, config, graph=graph),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -438,7 +440,9 @@ async def chat_resume(
     req: ChatResumeRequest,
     user_sub: Annotated[str, Depends(get_current_user)],
 ) -> StreamingResponse:
-    if compiled_graph is None:
+    agent_type = (req.agent_type or "sales").lower()
+    graph = get_agent_graph(agent_type)
+    if graph is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Agent graph not initialised")
 
     thread_id = scoped_thread_id(user_sub, req.thread_id)
@@ -508,7 +512,7 @@ async def chat_resume(
     )
 
     return StreamingResponse(
-        _stream_graph(Command(resume=req.approved), config),
+        _stream_graph(Command(resume=req.approved), config, graph=graph),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

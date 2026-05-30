@@ -1,6 +1,8 @@
 from typing import AsyncIterator
-import asyncio
 import json
+
+from google.genai import Client, types
+from google.oauth2 import service_account
 
 from .base import ChatProvider
 from langgraph.types import RunnableConfig
@@ -47,15 +49,15 @@ class VertexProvider(ChatProvider):
 
         api_key = _has_api_key(self.credentials_dict)
         if api_key:
-            # --- API key mode: use google-generativeai SDK (Gemini API) ---
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            self._use_genai = True
+            # API key mode: use Vertex AI with API key (project/location
+            # are mutually exclusive with api_key in the client initializer,
+            # the SDK infers them from the key)
+            self._client = Client(
+                vertexai=True,
+                api_key=api_key,
+            )
         else:
-            # --- Service account / authorized_user mode: use vertexai SDK ---
-            import vertexai
-            from google.oauth2 import service_account
-
+            # Service account / authorized_user mode: use Vertex AI backend
             cred_type = self.credentials_dict.get("type")
             if cred_type == "service_account":
                 credentials = service_account.Credentials.from_service_account_info(
@@ -71,12 +73,12 @@ class VertexProvider(ChatProvider):
             else:
                 raise ValueError(f"Unsupported credentials type: {cred_type}")
 
-            vertexai.init(
+            self._client = Client(
+                vertexai=True,
                 project=self.project_id,
                 location=self.location,
                 credentials=credentials,
             )
-            self._use_genai = False
 
     def _build_contents(self, messages: list[dict]) -> tuple[list, str | None]:
         """Convert OpenAI-style messages to Gemini content format."""
@@ -89,9 +91,15 @@ class VertexProvider(ChatProvider):
             if role == "system":
                 system_instruction = content
             elif role == "assistant":
-                contents.append({"role": "model", "parts": [{"text": content}]})
+                contents.append(types.Content(
+                    role="model",
+                    parts=[types.Part(text=content)],
+                ))
             else:
-                contents.append({"role": "user", "parts": [{"text": content}]})
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part(text=content)],
+                ))
 
         return contents, system_instruction
 
@@ -102,31 +110,16 @@ class VertexProvider(ChatProvider):
         **kwargs,
     ) -> AsyncIterator[str]:
         contents, system_instruction = self._build_contents(messages)
-        loop = asyncio.get_event_loop()
 
-        if self._use_genai:
-            # --- google-generativeai SDK (API key) ---
-            import google.generativeai as genai
-            gemini_model = genai.GenerativeModel(
-                model or "gemini-2.0-flash",
-                system_instruction=system_instruction,
-            )
-            responses = await loop.run_in_executor(
-                None,
-                lambda: list(gemini_model.generate_content(contents, stream=True)),
-            )
-        else:
-            # --- vertexai SDK (service account) ---
-            from vertexai.generative_models import GenerativeModel
-            gemini_model = GenerativeModel(
-                model or "gemini-2.0-flash",
-                system_instruction=system_instruction,
-            )
-            responses = await loop.run_in_executor(
-                None,
-                lambda: list(gemini_model.generate_content(contents, stream=True)),
-            )
+        config = types.GenerateContentConfig(
+            systemInstruction=system_instruction,
+        ) if system_instruction else None
 
-        for response in responses:
+        stream = await self._client.aio.models.generate_content_stream(
+            model=model or "gemini-2.5-flash",
+            contents=contents,
+            config=config,
+        )
+        async for response in stream:
             if response.text:
                 yield response.text

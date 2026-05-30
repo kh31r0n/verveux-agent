@@ -1,185 +1,175 @@
-# helena-agent
-# sek
+# verveux-agent
 
-LangGraph multi-agent service for Helena security operations. Receives chat messages from the NestJS backend via HTTP, runs a stateful agent graph, and streams responses back as Server-Sent Events (SSE).
+LangGraph multi-agent service for the Verveux/RockyBot platform. Receives chat messages from the NestJS backend via HTTP, routes them to domain-specific agent graphs, and streams responses back as Server-Sent Events (SSE).
 
 ## Overview
 
 ```
 NestJS backend
-      │  POST /chat/stream
-      │  Bearer <Keycloak JWT>
-      ▼
-┌─────────────────────────────────────────────────┐
-│  FastAPI  (uvicorn, port 8000)                  │
-│                                                 │
-│  JWT validation ──► LangGraph graph             │
-│                          │                      │
-│                    PostgreSQL                   │
-│                    checkpointer                 │
-│                    (state per thread)           │
-└────────────┬────────────────────────────────────┘
-             │  SSE stream
-             │  token | rfc_step_progress | closed_questions
-             │  execute_workflow | interrupt_detected | done
-             ▼
-      NestJS backend
+      |  POST /chat/stream { agent_type: "sales", ... }
+      |  Bearer <Cognito JWT>
+      v
++--------------------------------------------------+
+|  FastAPI  (uvicorn, port 8000)                   |
+|                                                  |
+|  JWT validation --> Graph Registry               |
+|                       |                          |
+|                  resolve agent_type               |
+|                       |                          |
+|             +---------+---------+                |
+|             |    |    |    |                     |
+|           SALES SCHOOL REST APPT                 |
+|             |                                    |
+|        PostgreSQL checkpointer                   |
+|        (state per thread)                        |
++------------------+-------------------------------+
+                   |  SSE stream
+                   |  token | execute_workflow | node_update | done
+                   v
+            NestJS backend
 ```
 
-The graph is compiled once at startup and reused across requests. State is persisted per `thread_id` in PostgreSQL so conversations survive process restarts.
+## Multi-Agent Architecture
 
----
+### Graph Registry Pattern
 
-## Agent graph
+Each agent domain (SALES, SCHOOL, RESTAURANT, APPOINTMENTS) has its own fully isolated, pre-compiled LangGraph graph. At startup, all graphs are compiled once and cached. At request time, the `agent_type` field in the request body selects which graph handles the conversation.
+
+```
+src/graphs/
+  registry.py            # AGENT_REGISTRY + get_agent_graph() dispatcher
+  state.py               # Shared AgentState TypedDict
+  sales_graph.py         # Full sales pipeline (triage -> sales/tracking/complaint/faq -> execute)
+  school_graph.py        # Stub: triage -> faq_response
+  restaurant_graph.py    # Stub: triage -> faq_response
+  appointments_graph.py  # Stub: triage -> faq_response
+  main_graph.py          # Backward-compat shim (delegates to sales_graph)
+  studio_graph.py        # LangGraph Studio entrypoint
+```
+
+### AgentState
+
+The `AgentState` TypedDict includes multi-agent identity fields:
+
+```python
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    thread_id: str
+
+    # Multi-agent identity
+    agent_type: str        # "sales" | "school" | "restaurant" | "appointments"
+    capabilities: dict     # Capability contract from NestJS (read-only)
+    domain_state: dict     # Generic bag for domain-specific data
+
+    # Conversation context
+    tenant_id: str
+    conversation_id: str
+    product_catalog: list
+    knowledge: list
+    user_context: dict
+    contact_id: str
+    contact_tags: list
+    language: str
+    faqs: list
+
+    # Triage
+    intent: str
+    structured_intent: Optional[StructuredIntent]
+
+    # Sales-specific fields (only used by sales graph)
+    sales_phase: str
+    cart: Optional[list]
+    cart_confirmed: bool
+    # ... additional sales, tracking, complaint fields
+```
+
+The `domain_state: dict` field is a generic bag that prevents domain-specific data from polluting shared state across agent types.
+
+### Graph Dispatch
+
+Unknown `agent_type` values safely fall back to SALES with a warning log.
+
+```python
+# Request: { "agent_type": "school", ... }
+graph = get_agent_graph("school")  # Returns compiled school graph
+# Request: { "agent_type": "unknown", ... }
+graph = get_agent_graph("unknown")  # Falls back to SALES
+```
+
+### Sales Graph (Full Pipeline)
 
 ```
 START
-  │
-  ▼
-triage ──────────────────────────────────► fallback_response ──► END
-  │                                              ▲
-  │ intent = "rfc"                               │ (unknown intent /
-  ▼                                              │  rfc fully complete)
-rfc_open_questions
-  │ rfc_open_complete = True (auto-chain)
-  ▼
-rfc_closed_questions
-  │ rfc_closed_complete = True (auto-chain)
-  ▼
-rfc_summary_confirm
-  │ rfc_confirmed = True (user says "confirm")
-  ▼
-rfc_execute ──────────────────────────────────────────────────► END
+  |
+  v
+triage -----> sales_collect --> sales_confirm --> customer_data_collect --> order_summary --> execute --> END
+  |                                                                                           ^
+  |---------> tracking_collect ----------------------------------------------------------------|
+  |---------> complaint_collect ---------------------------------------------------------------|
+  |---------> faq_response --> END
 ```
 
-Auto-chain edges advance the graph to the next phase within the **same turn** — the user doesn't need to send an extra message for the transition.
+Auto-chain edges advance the graph to the next phase within the same turn.
 
-### Nodes
+### Stub Graphs (School, Restaurant, Appointments)
 
-| Node | Purpose |
-|---|---|
-| `triage` | Classifies intent (rfc / incident / knowledge / escalation / unknown). Silent — emits no tokens. |
-| `rfc_open_questions` | Collects open-ended RFC fields across 5 conversational steps. |
-| `rfc_closed_questions` | Collects 8 structured single-select answers, rendered as a form in the frontend. |
-| `rfc_summary_confirm` | Presents a formatted RFC summary and waits for user confirmation or corrections. |
-| `rfc_execute` | Emits an `execute_workflow` SSE event; NestJS handles webhook invocation and result formatting. |
-| `fallback_response` | Responds to unknown intents and explains available capabilities. |
+Minimal `triage -> faq_response -> END` pipeline. Domain-specific nodes will be added as each agent is fleshed out.
 
-#### `rfc_open_questions` — 5 steps
-
-| Step | Fields collected |
-|---|---|
-| 1 | title, description, change type, category |
-| 2 | business justification, affected systems/users, impact level |
-| 3 | implementation steps, rollback plan, dependencies, resources |
-| 4 | start/end dates, environment, change window |
-| 5 | risk level, mitigation, testing plan, approvers |
-
-Each step uses two LLM calls: one to **extract** field values from the user's free-text answer (JSON output), and one to **compose** the conversational reply asking for any missing fields or announcing the next step.
-
-#### `rfc_closed_questions` — 8 structured questions
-
-| Field | Options |
-|---|---|
-| `change_type` | Estándar / Normal / Emergencia / Mayor |
-| `service_impact` | Sin impacto / Mínimo / Parcial / Total |
-| `monitoring_loss` | No / Parcialmente / Totalmente / N/A |
-| `remote_access_loss` | No / Temporalmente / Totalmente / N/A |
-| `backup_status` | Sí validado / Sí no validado / No / N/A |
-| `rollback_available` | Sí completamente / Sí parcialmente / No / N/A |
-| `risk_level` | Bajo / Medio / Alto / Crítico |
-| `execution_location` | Remoto / En sitio / Híbrido / N/A |
-
-Emits a `closed_questions` SSE event with the question schema so the frontend can render a form component instead of free text.
-
-#### `rfc_execute`
-
-Emits an `execute_workflow` SSE event and returns `rfc_execute_confirmed: True`. The agent never holds webhook URLs — the NestJS backend resolves them, POSTs to N8N, and emits the formatted result as a new chat bubble.
-
----
-
-## SSE event types
+## SSE Event Types
 
 Events are emitted as `data: <json>\n\n` lines on the `/chat/stream` response.
 
 | `type` | Payload fields | Description |
 |---|---|---|
 | `token` | `content: str` | One LLM delta token |
-| `rfc_step_progress` | `step`, `total_open_steps`, `topic` | RFC collection step indicator |
-| `closed_questions` | `questions: list` | Question schema for frontend form |
-| `execute_workflow` | `conversation_id`, `workflows`, `rfc_data` | Signals NestJS to trigger N8N webhooks |
+| `step_progress` | `step`, `total_steps`, `topic` | Collection step indicator |
+| `execute_workflow` | `conversation_id`, `intent`, `order_data`, `tracking_data`, `complaint_data` | Signals NestJS to trigger backend workflows |
+| `tag_contact` | `contact_id`, `tag_name` | Tag a contact |
+| `create_deal` | `contact_id`, `conversation_id`, `title`, `source` | Create a CRM deal |
+| `update_deal_stage` | `contact_id`, `conversation_id`, `stage_position` | Move deal stage |
 | `node_update` | `node`, `data` | Graph node state (sensitive fields stripped) |
 | `interrupt_detected` | `interrupt_id`, `payload` | Human approval required |
-| `done` | — | Stream finished |
+| `done` | -- | Stream finished |
 | `error` | `message: str` | Agent-level error |
-
----
-
-## State
-
-`AgentState` is the TypedDict that LangGraph persists per thread.
-
-```python
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]   # Full conversation history
-    thread_id: str                             # User-scoped ID
-    project_id: str                            # NestJS project UUID
-    conversation_id: str                       # NestJS conversation UUID
-    project_workflows: list                    # [{workflow_id, name, description}]
-    intent: str                                # triage output
-    rfc_step: int                              # 0–7
-    rfc_data: dict                             # Accumulated RFC fields
-    rfc_open_complete: bool
-    rfc_closed_complete: bool
-    rfc_confirmed: bool
-    rfc_execute_confirmed: bool                # Prevents re-execution
-```
-
-Thread IDs are namespaced per user: `{keycloak_sub}:{client_thread_id}`. This ensures one user cannot read another user's graph state.
-
----
 
 ## HTTP API
 
 ### `POST /chat/stream`
 
-Stream a user message through the graph.
+Stream a user message through the appropriate agent graph.
 
-**Headers:** `Authorization: Bearer <keycloak_token>`
+**Headers:** `Authorization: Bearer <cognito_token>`
 
 **Request body:**
 ```json
 {
   "thread_id": "conv-uuid",
-  "message": "Quiero crear un RFC",
-  "openai_api_key": "sk-...",
-  "project_id": "proj-uuid",
+  "message": "Quiero hacer un pedido",
+  "agent_type": "sales",
+  "capabilities": ["crm_pipeline", "catalog", "order_management"],
+  "tenant_id": "tenant-uuid",
   "conversation_id": "conv-uuid",
-  "project_steps": [
-    {
-      "type": "WORKFLOW",
-      "order": 1,
-      "workflows": [
-        {
-          "workflowId": "wf-uuid",
-          "workflowName": "Abrir ticket ServiceNow",
-          "description": "Crea un ticket en ServiceNow"
-        }
-      ]
-    }
-  ]
+  "product_catalog": [],
+  "user_context": {},
+  "contact_id": "contact-uuid",
+  "contact_tags": [],
+  "language": "es",
+  "rawFaqs": [],
+  "prompts": {},
+  "llm_provider": "openai",
+  "llm_model": "gpt-4o"
 }
 ```
 
-**Response:** `text/event-stream` — sequence of `data: <json>` lines.
+Key fields:
+- `agent_type` (default: `"sales"`) -- selects which compiled graph handles the request
+- `capabilities` -- capability contract from NestJS, injected into state as read-only context
 
-`project_steps` is provided by the NestJS backend on every request. WORKFLOW-type steps populate `project_workflows` in the graph state, making the workflows available to `rfc_execute`.
+**Response:** `text/event-stream` -- sequence of `data: <json>` lines.
 
 ### `POST /chat/resume`
 
-Resume a graph paused at a `interrupt()` call.
-
-**Headers:** `Authorization: Bearer <keycloak_token>`
+Resume a graph paused at an `interrupt()` call.
 
 **Request body:**
 ```json
@@ -187,21 +177,17 @@ Resume a graph paused at a `interrupt()` call.
   "thread_id": "conv-uuid",
   "interrupt_id": "uuid",
   "approved": true,
-  "openai_api_key": "sk-..."
+  "agent_type": "sales"
 }
 ```
 
-**Response:** same SSE stream format as `/chat/stream`.
+### `GET /health` / `GET /healthz`
 
-### `GET /health`
-
-Returns `{"status": "ok"}`. Used as Docker healthcheck.
+Returns `{"status": "ok"}`.
 
 ### `GET /metrics`
 
 Prometheus metrics endpoint.
-
----
 
 ## Configuration
 
@@ -209,113 +195,52 @@ All settings are loaded from environment variables (or a `.env` file).
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string. Used for LangGraph checkpoints, approval_requests, and RAG embeddings. |
-| `KEYCLOAK_ISSUER` | Yes | — | Full issuer URL, e.g. `https://keycloak.example.com/realms/my-realm` |
-| `KEYCLOAK_JWKS_URL` | Yes | — | JWKS endpoint for RS256 token validation |
-| `KEYCLOAK_TLS_VERIFY` | No | `true` | Set to `false` for self-signed certificates |
-| `OPENAI_API_KEY` | No | — | Fallback API key. NestJS passes a per-request key in the request body; this is used only if none is provided. |
-| `LANGFUSE_SECRET_KEY` | No | — | Langfuse secret. Tracing is disabled if left empty. |
-| `LANGFUSE_PUBLIC_KEY` | No | — | Langfuse public key. |
-| `LANGFUSE_HOST` | No | `http://localhost:3010` | Langfuse server URL. |
-| `NESTJS_BASE_URL` | No | — | Backend base URL (reserved for future agent→backend calls). |
+| `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
+| `COGNITO_ISSUER` | Yes | -- | Cognito issuer URL |
+| `COGNITO_JWKS_URL` | Yes | -- | JWKS endpoint for token validation |
+| `NESTJS_BASE_URL` | No | -- | Backend base URL for credential fetching |
 
-**Example `.env`:**
-```env
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ticket_support
-KEYCLOAK_ISSUER=https://keycloak.example.com/realms/my-realm
-KEYCLOAK_JWKS_URL=https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs
+## Running Locally
 
-# Optional
-LANGFUSE_SECRET_KEY=
-LANGFUSE_PUBLIC_KEY=
-LANGFUSE_HOST=http://localhost:3010
-```
-
----
-
-## Running locally
-
-### With Docker Compose (recommended)
-
-From the repo root:
+### With Docker Compose
 
 ```bash
 docker compose up agent --build
 ```
-
-The agent starts at `http://localhost:8000`. Hot reload is enabled via `--reload`.
 
 ### Without Docker
 
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-cd helena-agent
-
-# Install dependencies
 uv sync
-
-# Copy and edit environment
-cp .env.example .env
-
-# Start the server
 uv run uvicorn src.main:app --reload --port 8000
 ```
 
 On startup the service:
-1. Creates an asyncpg connection pool
-2. Runs `migrations/init.sql` (idempotent)
-3. Compiles the LangGraph graph with an `AsyncPostgresSaver` checkpointer
+1. Creates an asyncpg connection pool and runs migrations
+2. Compiles all agent graphs (sales, school, restaurant, appointments) with an `AsyncPostgresSaver` checkpointer
 
 ### LangGraph Studio
-
-For visual graph inspection and interactive testing:
 
 ```bash
 docker compose up langgraph-studio --build
 # Open http://localhost:2024
 ```
 
-The Studio build uses `Dockerfile.studio` and mounts `langgraph.json` which points to `src/graphs/studio_graph.py:graph`. Studio manages its own in-memory checkpointer so a live database is not required.
-
----
+Studio compiles the sales graph with no checkpointer for visualization.
 
 ## Testing
 
 Tests use `MemorySaver` (in-memory checkpointer) so no database is needed.
 
 ```bash
-cd helena-agent
-uv run pytest src/tests/ -v
+uv run pytest tests/ -v
 ```
-
-| Test file | What it covers |
-|---|---|
-| `tests/test_graph.py` | Graph routing, API key never leaks into state, LLM output is natural language |
-| `tests/test_interrupt.py` | Interrupt emitted correctly, resume with approval/rejection, API key never leaks into interrupt payload |
-
----
-
-## Database schema
-
-Managed by `migrations/init.sql`, run automatically at startup.
-
-| Table | Purpose |
-|---|---|
-| `documents` | RAG knowledge base — pgvector embeddings (1536-dim), IVFFlat index |
-| `approval_requests` | Interrupt audit log — `thread_id`, `payload` (JSONB), `status` (pending / approved / rejected), timestamps |
-| `checkpoints` | LangGraph state snapshots |
-| `checkpoint_blobs` | Large binary state data |
-| `checkpoint_writes` | Task-level write log |
-| `checkpoint_migrations` | LangGraph schema versioning |
-
----
 
 ## Observability
 
-### Prometheus metrics
-
-Available at `GET /metrics`.
+### Prometheus Metrics (GET /metrics)
 
 | Metric | Type | Description |
 |---|---|---|
@@ -323,52 +248,39 @@ Available at `GET /metrics`.
 | `agent_interrupt_events_total` | Counter | Total interrupts triggered |
 | `agent_node_invocations_total` | Counter | Per-node invocations (label: `node`) |
 | `agent_tool_errors_total` | Counter | Per-tool errors (label: `tool`) |
-| `rfc_chains_started_total` | Counter | RFC flows started |
-| `rfc_chains_submitted_total` | Counter | RFC flows completed (workflow triggered) |
-| `rfc_chains_rejected_total` | Counter | RFC flows cancelled by user |
 
-### Langfuse tracing
-
-Each LLM call within a node creates a Langfuse generation with model name, input messages, output, and token usage. Tracing is opt-in — the service runs normally without Langfuse credentials.
-
----
-
-## Project layout
+## Project Layout
 
 ```
-helena-agent/
-├── src/
-│   ├── main.py                # FastAPI app, lifespan, endpoints, SSE streaming
-│   ├── config.py              # Pydantic settings
-│   ├── llm.py                 # AsyncOpenAI client + API key resolution
-│   ├── observability.py       # Prometheus counters + Langfuse integration
-│   ├── auth/
-│   │   └── keycloak.py        # JWKS validation, get_current_user, scoped_thread_id
-│   ├── db/
-│   │   └── postgres.py        # asyncpg pool init/close + migration runner
-│   ├── agents/
-│   │   ├── triage.py          # Intent classification
-│   │   ├── rfc_open.py        # Open-ended RFC questions (5 steps)
-│   │   ├── rfc_closed.py      # Structured RFC questions (8 fields)
-│   │   ├── rfc_summary.py     # Summary presentation + confirmation
-│   │   ├── rfc_execute.py     # Workflow execution trigger
-│   │   ├── fallback.py        # Unknown intent handler
-│   │   ├── escalation.py      # (placeholder)
-│   │   ├── orchestrator.py    # (placeholder)
-│   │   ├── rag.py             # (placeholder)
-│   │   └── workflow.py        # (placeholder)
-│   └── graphs/
-│       ├── state.py           # AgentState TypedDict
-│       ├── main_graph.py      # Graph definition + conditional edges
-│       └── studio_graph.py    # LangGraph Studio entrypoint
-├── migrations/
-│   └── init.sql               # Schema (idempotent)
-├── tests/
-│   ├── test_graph.py
-│   └── test_interrupt.py
-├── pyproject.toml
-├── uv.lock
-├── langgraph.json             # Studio config
-├── Dockerfile                 # Production (non-root, two-stage)
-└── Dockerfile.studio          # LangGraph Studio dev build
+src/
+  main.py                # FastAPI app, lifespan, endpoints, SSE streaming
+  config.py              # Pydantic settings
+  observability.py       # Prometheus counters
+  auth/
+    cognito.py           # JWT validation, get_current_user, scoped_thread_id
+  db/
+    postgres.py          # asyncpg pool init/close + migration runner
+  agents/
+    triage.py            # Intent classification
+    sales_collect.py     # Product selection + cart management
+    sales_confirm.py     # Cart confirmation
+    customer_data_collect.py  # Delivery/customer data collection
+    order_summary.py     # Final order summary
+    execute.py           # Workflow execution trigger
+    tracking_collect.py  # Order tracking flow
+    complaint_collect.py # Complaint handling flow
+    faq_response.py      # FAQ-based responses
+    backend_client.py    # NestJS API client (credentials, etc.)
+    ...
+  graphs/
+    registry.py          # Graph registry + dispatcher
+    state.py             # AgentState TypedDict
+    sales_graph.py       # Sales pipeline graph
+    school_graph.py      # School agent stub
+    restaurant_graph.py  # Restaurant agent stub
+    appointments_graph.py # Appointments agent stub
+    main_graph.py        # Backward-compat shim
+    studio_graph.py      # LangGraph Studio entrypoint
+  schemas/
+    intent.py            # StructuredIntent model
 ```

@@ -1,14 +1,15 @@
 """LangGraph Studio entrypoint — used by `langgraph dev` only.
 
-Compiles the main graph with an in-memory checkpointer so LangGraph Studio
-can visualise and interactively run the graph without requiring Postgres
-checkpointing.  The DB pool IS initialised so agent nodes that query
-Postgres (RAG, audit log) work normally when DATABASE_URL is provided.
+Compiles the sales graph (default) with an in-memory checkpointer so
+LangGraph Studio can visualise and interactively run the graph without
+requiring Postgres checkpointing.  The DB pool IS initialised so agent
+nodes that query Postgres (RAG, audit log) work normally when DATABASE_URL
+is provided.
 """
 
 import asyncio
 
-from src.graphs.main_graph import build_graph
+from src.graphs.sales_graph import build_sales_graph
 from src.db.postgres import init_pool, run_migrations
 
 
@@ -30,4 +31,4 @@ def _boot_db() -> None:
 _boot_db()
 
 # LangGraph API manages its own persistence — do NOT pass a checkpointer here.
-graph = build_graph(None)  # type: ignore[arg-type]
+graph = build_sales_graph(None)  # type: ignore[arg-type]

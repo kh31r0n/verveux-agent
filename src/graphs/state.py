@@ -82,6 +82,19 @@ class AgentState(TypedDict):
     complaint_data: dict
     complaint_complete: bool
 
+    # ── School flow ───────────────────────────────────────────────────
+    admissions_data: dict
+    admissions_complete: bool
+
+    # ── Restaurant flow ───────────────────────────────────────────────
+    restaurant_order_data: dict
+    restaurant_order_complete: bool
+
+    # ── Appointments flow ─────────────────────────────────────────────
+    booking_data: dict
+    booking_complete: bool
+    booking_confirmed: bool
+
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool
 

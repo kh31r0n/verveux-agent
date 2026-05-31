@@ -9,7 +9,21 @@ class IntentType(str, Enum):
     TRACKING = "tracking"
     COMPLAINT = "complaint"
     GREETING = "greeting"
+    ESCALATION = "escalation"
     UNKNOWN = "unknown"
+
+    # School-specific
+    ADMISSIONS = "admissions"
+    COURSE_INQUIRY = "course_inquiry"
+    SCHEDULE_INQUIRY = "schedule_inquiry"
+
+    # Restaurant-specific
+    MENU_INQUIRY = "menu_inquiry"
+    ORDER = "order"
+
+    # Appointments-specific
+    AVAILABILITY = "availability"
+    BOOKING = "booking"
 
 class CartItemIntent(BaseModel):
     product_identifier: str

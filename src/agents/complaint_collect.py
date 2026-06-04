@@ -68,8 +68,12 @@ async def complaint_collect_node(
 
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
 
+    agent_type = (state.get("agent_type") or "sales").upper()
+    complaint_ext_key = f"RESTAURANT_COMPLAINT_EXTRACTION" if agent_type == "RESTAURANT" else "COMPLAINT_EXTRACTION"
+    complaint_conv_key = f"RESTAURANT_COMPLAINT_CONVERSATIONAL" if agent_type == "RESTAURANT" else "COMPLAINT_CONVERSATIONAL"
+
     if has_new_message:
-        complaint_ext_prompt = resolve_prompt(config, "COMPLAINT_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT)
+        complaint_ext_prompt = resolve_prompt(config, complaint_ext_key, _EXTRACTION_SYSTEM_PROMPT)
         extraction_messages = [
             {"role": "system", "content": complaint_ext_prompt},
             {"role": "user", "content": state["messages"][-1].content},
@@ -139,7 +143,7 @@ async def complaint_collect_node(
             ) + user_ctx_str
             conv_messages = [{"role": "system", "content": conv_prompt}]
     else:
-        complaint_conv_prompt = resolve_prompt(config, "COMPLAINT_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT)
+        complaint_conv_prompt = resolve_prompt(config, complaint_conv_key, _CONVERSATIONAL_SYSTEM_PROMPT)
         conv_messages = [
             {
                 "role": "system",

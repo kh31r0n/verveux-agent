@@ -11,7 +11,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..schemas.intent import StructuredIntent, IntentType
-from .utils import format_contact_tags, format_user_context
+from .utils import format_contact_tags, format_user_context, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -123,11 +123,15 @@ async def triage_node(
     )
 
     # ── Build system prompt with optional FAQ hints ───────────────────────────
+    agent_type = (state.get("agent_type") or "sales").upper()
+    triage_key = f"{agent_type}_TRIAGE"
+    triage_prompt = resolve_prompt(config, triage_key, _TRIAGE_SYSTEM_PROMPT)
+
     faqs: list = state.get("faqs") or []
     faq_hints = _build_faq_hints(faqs)
 
     system_content = (
-        _TRIAGE_SYSTEM_PROMPT
+        triage_prompt
         + faq_hints
         + format_user_context(state)
         + format_contact_tags(state)

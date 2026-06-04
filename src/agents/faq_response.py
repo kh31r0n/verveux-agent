@@ -77,7 +77,9 @@ async def faq_response_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    faq_prompt = resolve_prompt(config, "FAQ", _FAQ_SYSTEM_PROMPT)
+    agent_type = (state.get("agent_type") or "sales").upper()
+    faq_key = f"{agent_type}_FAQ"
+    faq_prompt = resolve_prompt(config, faq_key, _FAQ_SYSTEM_PROMPT)
 
     # ── Inject FAQ knowledge from per-request FAQs ────────────────────────────
     faqs: list = state.get("faqs") or []

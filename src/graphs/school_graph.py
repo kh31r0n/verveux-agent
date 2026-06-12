@@ -12,6 +12,34 @@ from ..agents.schedule_inquiry import schedule_inquiry_node
 from ..agents.triage import triage_node
 from .state import AgentState
 
+_QUESTION_STARTERS = (
+    "qué ", "que ", "cuál", "cual", "cuándo", "cuando ", "cuánto", "cuanto",
+    "dónde", "donde ", "cómo", "como ", "por qué", "por que", "quién", "quien ",
+    "hay ", "tienen", "tienes", "existen", "puedo ", "se puede", "necesito saber",
+    "what ", "which ", "when ", "how ", "where ", "why ", "who ", "is there",
+    "are there", "do you", "can i",
+)
+
+
+def _latest_user_text(state: AgentState) -> str:
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "type", "") == "human":
+            return (msg.content or "") if hasattr(msg, "content") else ""
+    return ""
+
+
+def _looks_like_question(text: str) -> bool:
+    """Heuristic: detect interrogative user messages (Spanish + English)."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("¿") or stripped.endswith("?"):
+        return True
+    lowered = stripped.lower()
+    return any(lowered.startswith(starter) for starter in _QUESTION_STARTERS)
+
 
 def _route_from_triage(
     state: AgentState,
@@ -25,6 +53,11 @@ def _route_from_triage(
 ]:
     intent = state.get("intent", "")
     if intent == "admissions":
+        # Guard: if user is asking an informational question and no admissions
+        # data has been collected yet, answer via FAQ before starting the
+        # data-collection flow.
+        if not state.get("admissions_data") and _looks_like_question(_latest_user_text(state)):
+            return "faq_response"
         return "admissions_collect"
     if intent == "course_inquiry":
         return "course_inquiry"

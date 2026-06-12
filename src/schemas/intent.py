@@ -38,6 +38,6 @@ class IntentEntities(BaseModel):
 
 class StructuredIntent(BaseModel):
     intent: IntentType
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     entities: IntentEntities = Field(default_factory=IntentEntities)
-    raw_text: str
+    raw_text: str = ""

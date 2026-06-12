@@ -1,17 +1,24 @@
-"""Graph Registry — maps agent_type strings to compiled LangGraph graphs.
+"""Graph Registry — maps permanent agent CODE NAMES to compiled LangGraph graphs.
 
-Each agent domain gets its own fully isolated, pre-compiled graph.  The
-``get_agent_graph()`` function is the single dispatcher used by ``main.py``
-at request time.
+A code name (e.g. ``"helena"``, ``"sofia"``) is the permanent identifier for one
+graph topology. Code names are platform-level and assigned by developers; once
+seeded into ``agent_code_names`` they are never reassigned to a different builder.
 
-Design rationale (RFC V3):
-- Complete graph isolation prevents state pollution between domains.
-- Each graph is compiled once at startup and reused for all requests.
-- Unknown agent types fall back to SALES with a warning log.
+Compilation is lazy and protected by an asyncio lock — graphs are built on first
+request per code name. The FastAPI lifespan warms up only the code names that
+are currently assigned to at least one active channel connection.
+
+Phase-1 deprecation: ``get_agent_graph_by_agent_type()`` provides a fallback for
+requests that arrive without ``agent_code_name`` (older NestJS deployments).
+The fallback increments ``legacy_agent_type_fallback_total`` and will be removed
+in phase 2.
 """
 
-import logging
-from typing import Callable
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Callable, Iterable, Mapping
 
 import structlog
 
@@ -22,55 +29,133 @@ from .school_graph import build_school_graph
 
 logger = structlog.get_logger(__name__)
 
-# Type alias for graph builder functions
 GraphBuilder = Callable
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-# Keys MUST match the lowercase AgentType enum values sent by NestJS:
-#   SALES → "sales", SCHOOL → "school", etc.
+# ── Code name registry ────────────────────────────────────────────────────────
+# Keys are permanent identifiers; values are the builders. New code names get a
+# DB seed migration AND an entry here in the same release.
 
-AGENT_REGISTRY: dict[str, GraphBuilder] = {
-    "sales": build_sales_graph,
-    "school": build_school_graph,
-    "restaurant": build_restaurant_graph,
-    "appointments": build_appointments_graph,
+CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
+    "helena": build_sales_graph,
+    "sofia": build_school_graph,
+    "giulia": build_restaurant_graph,
+    "marco": build_appointments_graph,
 }
 
-# ── Compiled graph cache (populated at startup) ──────────────────────────────
+# Phase-1 fallback: legacy agent_type → canonical code name.
+# Removed in phase 2.
+AGENT_TYPE_FALLBACK: Mapping[str, str] = {
+    "sales": "helena",
+    "school": "sofia",
+    "restaurant": "giulia",
+    "appointments": "marco",
+}
 
+
+class UnknownCodeNameError(Exception):
+    """Raised when a request references a code name not in CODE_NAME_REGISTRY."""
+
+    def __init__(self, code_name: str, known: Iterable[str]) -> None:
+        self.code_name = code_name
+        self.known = sorted(known)
+        super().__init__(
+            f"Unknown agent_code_name '{code_name}'. Known: {self.known}"
+        )
+
+
+# Module-level state populated lazily during request handling and the
+# startup warm-up. Guarded by ``_compile_lock`` for concurrent compilation.
 _compiled_graphs: dict[str, object] = {}
+_compile_lock = asyncio.Lock()
+_checkpointer: object | None = None
 
 
-def compile_all_graphs(checkpointer) -> None:
-    """Compile every registered graph with the given checkpointer.
+def set_checkpointer(checkpointer: object) -> None:
+    """Cache the checkpointer captured at FastAPI lifespan startup so lazy
+    compilations during request handling can reuse it without dependency
+    injection plumbing."""
+    global _checkpointer
+    _checkpointer = checkpointer
 
-    Called once during FastAPI lifespan startup.
+
+def known_code_names() -> set[str]:
+    """Return the set of code names this Python deployment can serve."""
+    return set(CODE_NAME_REGISTRY)
+
+
+def is_compiled(code_name: str) -> bool:
+    return code_name in _compiled_graphs
+
+
+async def get_or_compile_graph(code_name: str, checkpointer: object | None = None):
+    """Return the compiled graph for ``code_name``, compiling on first use.
+
+    Raises :class:`UnknownCodeNameError` if the code name is not registered.
     """
-    for agent_type, builder in AGENT_REGISTRY.items():
-        _compiled_graphs[agent_type] = builder(checkpointer)
-        logger.info("graph_compiled", agent_type=agent_type)
+    cached = _compiled_graphs.get(code_name)
+    if cached is not None:
+        return cached
 
-    logger.info(
-        "all_graphs_compiled",
-        agent_types=list(_compiled_graphs.keys()),
-    )
+    ckpt = checkpointer if checkpointer is not None else _checkpointer
+    if ckpt is None:
+        raise RuntimeError(
+            "Checkpointer is not initialised; cannot compile graphs"
+        )
 
+    async with _compile_lock:
+        cached = _compiled_graphs.get(code_name)
+        if cached is not None:
+            return cached
 
-def get_agent_graph(agent_type: str):
-    """Return the compiled graph for the given agent_type.
+        builder = CODE_NAME_REGISTRY.get(code_name)
+        if builder is None:
+            raise UnknownCodeNameError(code_name, CODE_NAME_REGISTRY)
 
-    Falls back to SALES if the agent_type is unknown, logging a warning.
-    Returns ``None`` only if ``compile_all_graphs()`` has not been called.
-    """
-    normalized = agent_type.lower() if agent_type else "sales"
+        # Imported lazily so unit tests can patch the metric module without
+        # forcing prometheus_client at registry import time.
+        from ..observability import graph_compile_duration
 
-    graph = _compiled_graphs.get(normalized)
-    if graph is not None:
+        start = time.perf_counter()
+        graph = builder(ckpt)
+        duration = time.perf_counter() - start
+        _compiled_graphs[code_name] = graph
+
+        try:
+            graph_compile_duration.labels(agent_code_name=code_name).observe(
+                duration
+            )
+        except Exception:  # pragma: no cover — metric failure must not block serving
+            pass
+
+        logger.info(
+            "graph_compiled",
+            agent_code_name=code_name,
+            duration_seconds=round(duration, 4),
+        )
         return graph
 
-    logger.warning(
-        "unknown_agent_type_fallback",
-        requested=normalized,
-        fallback="sales",
-    )
-    return _compiled_graphs.get("sales")
+
+async def warm_up(code_names: Iterable[str], checkpointer: object) -> list[str]:
+    """Pre-compile graphs for the supplied code names. Returns the list that
+    was actually compiled (excludes unknown names; the caller is responsible
+    for surfacing startup validation errors)."""
+    set_checkpointer(checkpointer)
+    compiled: list[str] = []
+    for name in code_names:
+        if name not in CODE_NAME_REGISTRY:
+            logger.warning("warm_up_unknown_code_name", code_name=name)
+            continue
+        await get_or_compile_graph(name, checkpointer)
+        compiled.append(name)
+    if compiled:
+        logger.info("warm_up_complete", code_names=compiled)
+    return compiled
+
+
+def resolve_legacy_agent_type(agent_type: str) -> str | None:
+    """Phase-1 only: map a legacy agent_type to its canonical code name.
+
+    Returns ``None`` if the agent_type is not recognised, so the caller can
+    raise an HTTP 400 instead of silently routing to a default.
+    """
+    return AGENT_TYPE_FALLBACK.get((agent_type or "").lower())

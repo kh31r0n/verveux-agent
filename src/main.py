@@ -16,14 +16,34 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 from starlette.responses import Response
 
+import asyncio
+
 from .auth.cognito import get_current_user, scoped_thread_id
-from .agents.backend_client import fetch_agent_credentials
+from .agents.backend_client import (
+    fetch_active_code_names,
+    fetch_agent_credentials,
+    fetch_in_use_code_names,
+)
 from .config import settings
-from .db.postgres import close_pool, get_pool, init_pool, run_migrations
-from .graphs.registry import compile_all_graphs, get_agent_graph
+from .db.postgres import (
+    close_pool,
+    get_pool,
+    init_pool,
+    run_migrations,
+)
+from .graphs.registry import (
+    CODE_NAME_REGISTRY,
+    UnknownCodeNameError,
+    get_or_compile_graph,
+    known_code_names,
+    resolve_legacy_agent_type,
+    set_checkpointer,
+    warm_up,
+)
 from .observability import (
     agent_interrupt_events_total,
     agent_requests_total,
+    legacy_agent_type_fallback_total,
     record_tool_error,
 )
 
@@ -50,17 +70,83 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+async def _fetch_active_code_names_with_retry(
+    max_attempts: int = 5,
+    base_delay: float = 1.0,
+) -> set[str]:
+    """Backend may not yet be reachable when the agent boots (start ordering in
+    ECS/Compose). Retry the validation call a few times before giving up."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await fetch_active_code_names()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == max_attempts:
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "active_code_names_fetch_retry",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                next_delay_seconds=delay,
+                error=str(exc),
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialise application DB pool and run migrations
+    # Initialise application DB pool (LangGraph checkpoints + RAG) and run migrations.
     pool = await init_pool()
     await run_migrations(pool)
 
-    # Initialise LangGraph checkpointer and compile all agent graphs.
     async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
         await checkpointer.setup()
-        compile_all_graphs(checkpointer)
-        logger.info("langgraph_ready")
+        set_checkpointer(checkpointer)
+
+        registry = known_code_names()
+
+        # ── Startup validation: backend ⇄ registry ────────────────────────────
+        # The source of truth for agent_code_names / channel_connections is the
+        # NestJS backend's DB. We consume it via internal HTTP endpoints rather
+        # than opening a second DB pool, so the agent stays decoupled from the
+        # backend's schema and credentials.
+        try:
+            db_active = await _fetch_active_code_names_with_retry()
+        except Exception as exc:
+            logger.error("startup_validation_query_failed", error=str(exc))
+            raise
+
+        missing_in_registry = db_active - registry
+        if missing_in_registry:
+            raise SystemExit(
+                "Startup validation failed: agent_code_names has active "
+                f"entries not in CODE_NAME_REGISTRY: {sorted(missing_in_registry)}. "
+                "Deploy a Python version that includes builders for these code names."
+            )
+        missing_in_db = registry - db_active
+        if missing_in_db:
+            logger.warning(
+                "registry_codenames_not_in_db",
+                code_names=sorted(missing_in_db),
+            )
+
+        # ── Warm-up: compile only the code names actually assigned somewhere ──
+        try:
+            in_use = await fetch_in_use_code_names()
+        except Exception as exc:
+            logger.warning("warm_up_query_failed", error=str(exc))
+            in_use = []
+
+        compiled = await warm_up(in_use, checkpointer)
+        logger.info(
+            "langgraph_ready",
+            warm_compiled=compiled,
+            registered=sorted(registry),
+        )
         yield
 
     await close_pool()
@@ -112,6 +198,13 @@ class ChatStreamRequest(BaseModel):
     vertex_credentials: dict = {}
     vertex_project_id: str = ""
     vertex_location: str = ""
+    # ── Multi-agent versioning ───────────────────────────────────────────────
+    # `agent_code_name` is the canonical routing key (e.g. "helena"). Phase-1
+    # callers may omit it; we fall back to `agent_type` via the registry shim
+    # and emit `legacy_agent_type_fallback_total`. In phase 2 the empty default
+    # becomes a hard 400.
+    agent_code_name: str = ""
+    agent_version: int = 1
     agent_type: str = "sales"
     capabilities: list = []
 
@@ -122,6 +215,10 @@ class ChatResumeRequest(BaseModel):
     interrupt_id: str
     approved: bool
     openai_api_key: str = ""
+    tenant_id: str = ""
+    conversation_id: str = ""
+    agent_code_name: str = ""
+    agent_version: int = 1
     agent_type: str = "sales"
 
 
@@ -147,6 +244,7 @@ async def _stream_graph(
     inputs: dict | Command,
     config: dict,
     graph=None,
+    agent_code_name: str = "unknown",
 ) -> AsyncGenerator[str, None]:
     """Consume a graph.astream() and yield SSE-formatted strings."""
     if graph is None:
@@ -247,7 +345,7 @@ async def _stream_graph(
                                 error=str(db_exc),
                                 thread_id=thread_id_value,
                             )
-                            record_tool_error("audit_db")
+                            record_tool_error("audit_db", agent_code_name)
 
                         agent_interrupt_events_total.inc()
                         logger.info(
@@ -299,7 +397,7 @@ async def _stream_graph(
 
     except Exception as exc:
         logger.error("stream_error", error=str(exc), traceback=traceback.format_exc())
-        record_tool_error("graph_stream")
+        record_tool_error("graph_stream", agent_code_name)
         yield _sse_event({"type": "error", "message": str(exc)})
 
 
@@ -325,13 +423,39 @@ async def chat_stream(
     req: ChatStreamRequest,
     user_sub: Annotated[str, Depends(get_current_user)],
 ) -> StreamingResponse:
-    agent_type = (req.agent_type or "sales").lower()
-    graph = get_agent_graph(agent_type)
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Agent graph not initialised")
+    agent_type = (req.agent_type or "").lower()
+    code_name = (req.agent_code_name or "").strip().lower()
+    if not code_name:
+        code_name = resolve_legacy_agent_type(agent_type) or ""
+        if code_name:
+            legacy_agent_type_fallback_total.inc()
+            logger.warning(
+                "legacy_agent_type_fallback",
+                agent_type=agent_type,
+                resolved=code_name,
+            )
+    if not code_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"agent_code_name is required; agent_type={agent_type!r} is "
+                f"not mappable. Known code names: {sorted(CODE_NAME_REGISTRY)}"
+            ),
+        )
 
-    thread_id = scoped_thread_id(req.tenant_id, user_sub, req.conversation_id)
-    agent_requests_total.inc()
+    try:
+        graph = await get_or_compile_graph(code_name)
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    thread_id = scoped_thread_id(
+        req.tenant_id,
+        user_sub,
+        req.conversation_id,
+        code_name,
+        req.agent_version,
+    )
+    agent_requests_total.labels(agent_code_name=code_name).inc()
 
     # ── Resolve credentials from NestJS ──────────────────────────────────────
     # We fetch once per request. The result is injected into configurable and
@@ -395,7 +519,9 @@ async def chat_stream(
         "thread_id": thread_id,
         "tenant_id": req.tenant_id,
         "conversation_id": req.conversation_id,
-        "agent_type": agent_type,
+        "agent_type": agent_type or "",
+        "agent_code_name": code_name,
+        "agent_version": req.agent_version,
         "capabilities": {"agent_type": agent_type, "capabilities": req.capabilities},
         "domain_state": {},
         "product_catalog": req.product_catalog,
@@ -421,6 +547,8 @@ async def chat_stream(
         thread_id=thread_id,
         user_sub=user_sub,
         tenant_id=req.tenant_id,
+        agent_code_name=code_name,
+        agent_version=req.agent_version,
         agent_type=agent_type,
         provider=llm_provider,
         model=llm_model,
@@ -429,7 +557,7 @@ async def chat_stream(
     )
 
     return StreamingResponse(
-        _stream_graph(inputs, config, graph=graph),
+        _stream_graph(inputs, config, graph=graph, agent_code_name=code_name),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -440,12 +568,33 @@ async def chat_resume(
     req: ChatResumeRequest,
     user_sub: Annotated[str, Depends(get_current_user)],
 ) -> StreamingResponse:
-    agent_type = (req.agent_type or "sales").lower()
-    graph = get_agent_graph(agent_type)
-    if graph is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Agent graph not initialised")
+    agent_type = (req.agent_type or "").lower()
+    code_name = (req.agent_code_name or "").strip().lower()
+    if not code_name:
+        code_name = resolve_legacy_agent_type(agent_type) or ""
+        if code_name:
+            legacy_agent_type_fallback_total.inc()
+    if not code_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"agent_code_name is required; agent_type={agent_type!r} is "
+                f"not mappable. Known code names: {sorted(CODE_NAME_REGISTRY)}"
+            ),
+        )
 
-    thread_id = scoped_thread_id(user_sub, req.thread_id)
+    try:
+        graph = await get_or_compile_graph(code_name)
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    thread_id = scoped_thread_id(
+        req.tenant_id,
+        user_sub,
+        req.conversation_id or req.thread_id,
+        code_name,
+        req.agent_version,
+    )
 
     # Verify the interrupt belongs to this thread
     try:
@@ -512,7 +661,12 @@ async def chat_resume(
     )
 
     return StreamingResponse(
-        _stream_graph(Command(resume=req.approved), config, graph=graph),
+        _stream_graph(
+            Command(resume=req.approved),
+            config,
+            graph=graph,
+            agent_code_name=code_name,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

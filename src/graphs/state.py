@@ -12,6 +12,13 @@ class AgentState(TypedDict):
 
     # ── Multi-agent identity ──────────────────────────────────────────
     agent_type: str              # "sales" | "school" | "restaurant" | "appointments"
+    # Permanent code name of the graph topology (e.g. "helena", "sofia").
+    # Set from the request body; optional so existing checkpoints written
+    # before the migration deserialize cleanly.
+    agent_code_name: str
+    # Position of the AgentAssignment in the connection's history (1-indexed).
+    # Snapshotted on the conversation at creation; immutable.
+    agent_version: int
     capabilities: dict           # capability contract from NestJS (read-only)
     domain_state: dict           # generic bag for domain-specific data (prevents state pollution)
 

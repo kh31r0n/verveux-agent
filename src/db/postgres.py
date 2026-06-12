@@ -64,3 +64,5 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
                 )
 
     logger.info("migrations_applied", file=str(sql_path))
+
+

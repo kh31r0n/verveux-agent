@@ -125,7 +125,24 @@ def get_current_user(payload: dict = Depends(verify_token)) -> str:
 
 
 
-def scoped_thread_id(tenant_id: str, user_sub: str, conversation_id: str) -> str:
-    """Construct a thread_id scoped to the tenant, user, and conversation."""
-    return f"{tenant_id}:{user_sub}:{conversation_id}"
+def scoped_thread_id(
+    tenant_id: str,
+    user_sub: str,
+    conversation_id: str,
+    agent_code_name: str,
+    agent_version: int,
+) -> str:
+    """Construct a thread_id scoped to tenant, user, conversation, agent code
+    name, and agent version.
+
+    Format: ``{tenantId}:{userSub}:{conversationId}:{agentCodeName}:v{agentVersion}``
+
+    Every segment is independently queryable in logs. The graph that owns a
+    checkpoint is explicit in the key, so cleanup for a decommissioned agent
+    is a prefix scan on ``*:helena:*``.
+    """
+    return (
+        f"{tenant_id}:{user_sub}:{conversation_id}:"
+        f"{agent_code_name}:v{agent_version}"
+    )
 

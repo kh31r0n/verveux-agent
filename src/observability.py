@@ -1,5 +1,5 @@
 import structlog
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram
 
 from .config import settings
 
@@ -12,6 +12,7 @@ logger = structlog.get_logger(__name__)
 agent_requests_total = Counter(
     "agent_requests_total",
     "Total number of chat requests processed",
+    ["agent_code_name"],
 )
 
 agent_interrupt_events_total = Counter(
@@ -22,13 +23,27 @@ agent_interrupt_events_total = Counter(
 agent_node_invocations_total = Counter(
     "agent_node_invocations_total",
     "Total number of node invocations",
-    ["node"],
+    ["agent_code_name", "node"],
 )
 
 agent_tool_errors_total = Counter(
     "agent_tool_errors_total",
     "Total number of tool/node errors",
-    ["tool"],
+    ["agent_code_name", "tool"],
+)
+
+graph_compile_duration = Histogram(
+    "graph_compile_duration_seconds",
+    "Time spent compiling a LangGraph topology on first request",
+    ["agent_code_name"],
+)
+
+# Phase-1 deprecation canary. Increments any time a request arrives without an
+# agent_code_name and is resolved through the legacy agent_type fallback. When
+# this stays at zero for 30 days, the fallback path is removed.
+legacy_agent_type_fallback_total = Counter(
+    "legacy_agent_type_fallback_total",
+    "Requests that fell back from agent_type to a canonical code name",
 )
 
 orders_started_total = Counter(
@@ -52,12 +67,16 @@ complaints_total = Counter(
 )
 
 
-def record_node_invocation(node: str) -> None:
-    agent_node_invocations_total.labels(node=node).inc()
+def record_node_invocation(node: str, agent_code_name: str = "unknown") -> None:
+    agent_node_invocations_total.labels(
+        agent_code_name=agent_code_name, node=node
+    ).inc()
 
 
-def record_tool_error(tool: str) -> None:
-    agent_tool_errors_total.labels(tool=tool).inc()
+def record_tool_error(tool: str, agent_code_name: str = "unknown") -> None:
+    agent_tool_errors_total.labels(
+        agent_code_name=agent_code_name, tool=tool
+    ).inc()
 
 
 # ---------------------------------------------------------------------------

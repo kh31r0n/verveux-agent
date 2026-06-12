@@ -70,6 +70,27 @@ async def fetch_agent_credentials(tenant_id: str) -> dict:
     )
 
 
+async def fetch_active_code_names() -> set[str]:
+    """GET /api/v1/internal/agent-versioning/active-code-names — all platform-active code names.
+
+    Used at startup to validate that this deployment's CODE_NAME_REGISTRY can serve
+    every code name the backend considers active (invariant #5).
+    """
+    data = await _get("/api/v1/internal/agent-versioning/active-code-names")
+    code_names = data.get("codeNames", []) if isinstance(data, dict) else []
+    return {c for c in code_names if isinstance(c, str)}
+
+
+async def fetch_in_use_code_names() -> list[str]:
+    """GET /api/v1/internal/agent-versioning/in-use-code-names — code names currently
+    assigned to at least one active, non-deleted channel connection. Used for startup
+    warm-up so we only compile graphs that real traffic will hit.
+    """
+    data = await _get("/api/v1/internal/agent-versioning/in-use-code-names")
+    code_names = data.get("codeNames", []) if isinstance(data, dict) else []
+    return [c for c in code_names if isinstance(c, str)]
+
+
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 

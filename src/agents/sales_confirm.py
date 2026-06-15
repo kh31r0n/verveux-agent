@@ -23,6 +23,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
+from ..usage import make_usage_record
 from .utils import language_instruction
 
 logger = structlog.get_logger(__name__)
@@ -185,7 +186,12 @@ async def sales_confirm_node(state: AgentState, config: RunnableConfig) -> dict:
     gen.end(output=full_response)
 
     # ── Build state update ────────────────────────────────────────────────────
-    update: dict = {"messages": [AIMessage(content=full_response)]}
+    update: dict = {
+        "messages": [AIMessage(content=full_response)],
+        "turn_usage": [
+            make_usage_record(node="sales_confirm", provider=provider, model=model)
+        ],
+    }
 
     if cart_confirmed is True:
         update["cart_confirmed"] = True

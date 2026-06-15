@@ -40,6 +40,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService
+from ..usage import make_usage_record
 from .utils import format_user_context, language_instruction
 
 logger = structlog.get_logger(__name__)
@@ -168,6 +169,7 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         bool(state["messages"])
         and getattr(state["messages"][-1], "type", "") == "human"
     )
+    turn_usage: list = []
 
     # ── Extract fields from user message ─────────────────────────────────────
     if has_new_message:
@@ -189,6 +191,11 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         extraction_raw = ""
         async for chunk in extraction_stream:
             extraction_raw += chunk
+        turn_usage.append(
+            make_usage_record(
+                node="customer_data_collect.extraction", provider=provider, model=model,
+            )
+        )
         extraction_gen.end(output=extraction_raw)
 
         try:
@@ -271,6 +278,11 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         write({"type": "token", "content": chunk})
         full_response += chunk
 
+    turn_usage.append(
+        make_usage_record(
+            node="customer_data_collect.reply", provider=provider, model=model,
+        )
+    )
     conv_gen.end(output=full_response)
 
     logger.info(
@@ -284,6 +296,7 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         "messages": [AIMessage(content=full_response)],
         "order_data": order_data,
         "customer_data_complete": customer_data_complete,
+        "turn_usage": turn_usage,
     }
     if customer_data_complete:
         update["sales_phase"] = "payment"

@@ -4,7 +4,7 @@ import json
 from google.genai import Client, types
 from google.oauth2 import service_account
 
-from .base import ChatProvider
+from .base import ChatProvider, UsageInfo
 from langgraph.types import RunnableConfig
 from ..config import settings
 
@@ -43,6 +43,7 @@ def _has_api_key(creds: dict) -> str | None:
 
 class VertexProvider(ChatProvider):
     def __init__(self, config: RunnableConfig):
+        super().__init__()
         self.credentials_dict = resolve_vertex_credentials(config)
         self.project_id = resolve_vertex_project_id(config)
         self.location = resolve_vertex_location(config)
@@ -109,6 +110,7 @@ class VertexProvider(ChatProvider):
         model: str,
         **kwargs,
     ) -> AsyncIterator[str]:
+        self.last_usage = UsageInfo()
         contents, system_instruction = self._build_contents(messages)
 
         config = types.GenerateContentConfig(
@@ -123,3 +125,12 @@ class VertexProvider(ChatProvider):
         async for response in stream:
             if response.text:
                 yield response.text
+            # Gemini emits usage_metadata on the final chunk(s); the last
+            # non-empty value is cumulative for the full completion.
+            usage_meta = getattr(response, "usage_metadata", None)
+            if usage_meta is not None:
+                self.last_usage = UsageInfo(
+                    input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
+                    output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
+                    cached_input_tokens=getattr(usage_meta, "cached_content_token_count", 0) or 0,
+                )

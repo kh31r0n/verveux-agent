@@ -21,6 +21,8 @@ from typing import Optional
 
 import structlog
 
+from ..usage import make_usage_record
+
 logger = structlog.get_logger(__name__)
 
 FUZZY_THRESHOLD = 0.50      # minimum difflib similarity score
@@ -127,6 +129,7 @@ class ProductResolver:
         name: str,
         provider, # ChatProvider
         model: str = "gpt-5.4-nano",
+        usage_sink: Optional[list] = None,
     ) -> ResolutionResult:
         result = self.resolve(name)
         if result.resolved is not None:
@@ -151,6 +154,12 @@ class ProductResolver:
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=80,
             )
+            if usage_sink is not None:
+                usage_sink.append(
+                    make_usage_record(
+                        node="product_resolver", provider=provider, model=model,
+                    )
+                )
             parsed = json.loads(raw.strip())
             pid: Optional[str] = parsed.get("product_id")
             if pid:
@@ -175,6 +184,7 @@ class ProductResolver:
         items: list[dict],
         provider=None, # ChatProvider
         model: str = "gpt-5.4-nano",
+        usage_sink: Optional[list] = None,
     ) -> tuple[list[dict], list[dict]]:
         """
         Resolve a batch of items extracted by the LLM.
@@ -203,7 +213,9 @@ class ProductResolver:
                 continue
 
             if provider:
-                result = await self.resolve_with_llm_fallback(query_name, provider, model)
+                result = await self.resolve_with_llm_fallback(
+                    query_name, provider, model, usage_sink=usage_sink,
+                )
             else:
                 result = self.resolve(query_name)
 

@@ -38,6 +38,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
+from ..usage import make_usage_record
 from ..services.product_resolver import ProductResolver
 from .utils import format_user_context, language_instruction
 from .backend_client import upsert_cart_item
@@ -193,6 +194,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     unresolved_items: list[dict] = []
     user_done_signal = False
     backend_sync_ok = True  # optimistic until proven otherwise
+    turn_usage: list = []   # populated after each provider call below
 
     # ── Step 1: Extract intent from user message ──────────────────────────────
     if has_new_message:
@@ -226,6 +228,11 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         extraction_raw = ""
         async for chunk in extraction_stream:
             extraction_raw += chunk
+        turn_usage.append(
+            make_usage_record(
+                node="sales_collect.extraction", provider=provider, model=model,
+            )
+        )
         extraction_gen.end(output=extraction_raw)
 
         try:
@@ -240,7 +247,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         if extracted_items:
             resolver = ProductResolver(catalog)
             resolved_items, unresolved_items = await resolver.resolve_many(
-                extracted_items, provider=provider, model=model
+                extracted_items, provider=provider, model=model, usage_sink=turn_usage,
             )
             logger.info(
                 "product_resolution_done",
@@ -397,6 +404,12 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         write({"type": "token", "content": chunk})
         full_response += chunk
 
+    turn_usage.append(
+        make_usage_record(
+            node="sales_collect.reply", provider=provider, model=model,
+        )
+    )
+
     conv_gen.end(output=full_response)
 
     logger.info(
@@ -418,4 +431,5 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         "sales_phase": sales_phase,
         # Signals to order_summary that it must use state cart as fallback
         "backend_cart_sync_failed": not backend_sync_ok,
+        "turn_usage": turn_usage,
     }

@@ -1,9 +1,11 @@
+import operator
 from typing import Annotated, List, Optional
 
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 from ..schemas.intent import StructuredIntent
+from ..usage import InvocationUsage
 
 
 class AgentState(TypedDict):
@@ -111,3 +113,11 @@ class AgentState(TypedDict):
 
     # ── Execution ──────────────────────────────────────────────────────
     execute_confirmed: bool
+
+    # ── Token usage ────────────────────────────────────────────────────
+    # Append-only list: each node adds one entry per provider call. The
+    # operator.add reducer concatenates partial state updates, so multiple
+    # nodes (e.g. sales_collect → order_summary in a single turn) all
+    # contribute without overwriting. Forwarded to NestJS on the SSE
+    # `done` event, then persisted as AiInvocationUsage rows.
+    turn_usage: Annotated[List[InvocationUsage], operator.add]

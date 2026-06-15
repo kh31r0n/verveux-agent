@@ -10,6 +10,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import language_instruction, resolve_prompt, format_user_context
 
 logger = structlog.get_logger(__name__)
@@ -79,6 +80,7 @@ async def restaurant_order_collect_node(
     )
 
     order_data: dict = state.get("restaurant_order_data") or {}
+    turn_usage: list = []
 
     # ── Stage 1: Extraction ──────────────────────────────────────────────────
     last_user_msg = ""
@@ -100,6 +102,13 @@ async def restaurant_order_collect_node(
         extracted_text = ""
         async for chunk in provider.stream_chat(model=model, messages=extraction_messages):
             extracted_text += chunk
+        turn_usage.append(
+            make_usage_record(
+                node="restaurant_order_collect.extraction",
+                provider=provider,
+                model=model,
+            )
+        )
         gen.end(output=extracted_text)
 
         try:
@@ -150,10 +159,16 @@ async def restaurant_order_collect_node(
     async for chunk in provider.stream_chat(model=model, messages=messages_payload):
         write({"type": "token", "content": chunk})
         full_response += chunk
+    turn_usage.append(
+        make_usage_record(
+            node="restaurant_order_collect.reply", provider=provider, model=model,
+        )
+    )
     gen2.end(output=full_response)
 
     return {
         "messages": [AIMessage(content=full_response)],
         "restaurant_order_data": order_data,
         "restaurant_order_complete": is_complete,
+        "turn_usage": turn_usage,
     }

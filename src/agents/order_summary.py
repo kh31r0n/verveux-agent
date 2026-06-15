@@ -6,6 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import language_instruction, resolve_prompt
 from .backend_client import get_or_create_cart
 
@@ -220,4 +221,7 @@ async def order_summary_node(
         "messages": [AIMessage(content=full_response)],
         "current_cart": cart,
         "order_confirmed": order_confirmed,
+        "turn_usage": [
+            make_usage_record(node="order_summary", provider=provider, model=model)
+        ],
     }

@@ -6,6 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -100,5 +101,8 @@ async def escalation_node(
                 content=full_response,
                 additional_kwargs={"escalation_payload": escalation_payload},
             )
+        ],
+        "turn_usage": [
+            make_usage_record(node="escalation", provider=provider, model=model)
         ],
     }

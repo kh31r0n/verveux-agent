@@ -8,6 +8,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import language_instruction, resolve_prompt, format_user_context
 
 logger = structlog.get_logger(__name__)
@@ -95,4 +96,7 @@ async def booking_confirm_node(
     return {
         "messages": [AIMessage(content=full_response)],
         "booking_confirmed": confirmed,
+        "turn_usage": [
+            make_usage_record(node="booking_confirm", provider=provider, model=model)
+        ],
     }

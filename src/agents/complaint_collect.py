@@ -9,6 +9,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import format_user_context, language_instruction, resolve_prompt
 from ..services.command_bus import command_bus_client, CommandResult
 
@@ -67,6 +68,7 @@ async def complaint_collect_node(
     write({"type": "step_progress", "step": 1, "total_steps": 1, "topic": "Registro de queja"})
 
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
+    turn_usage: list = []
 
     agent_type = (state.get("agent_type") or "sales").upper()
     complaint_ext_key = f"RESTAURANT_COMPLAINT_EXTRACTION" if agent_type == "RESTAURANT" else "COMPLAINT_EXTRACTION"
@@ -93,6 +95,11 @@ async def complaint_collect_node(
         extraction_raw = ""
         async for chunk in extraction_stream:
             extraction_raw += chunk
+        turn_usage.append(
+            make_usage_record(
+                node="complaint_collect.extraction", provider=provider, model=model,
+            )
+        )
 
         extraction_gen.end(output=extraction_raw)
 
@@ -134,6 +141,7 @@ async def complaint_collect_node(
                 "complaint_complete": True,
                 "execute_confirmed": True,
                 "complaint_data": result.data,
+                "turn_usage": turn_usage,
             }
         else:
             conv_prompt = (
@@ -178,6 +186,11 @@ async def complaint_collect_node(
     async for chunk in conv_stream:
         write({"type": "token", "content": chunk})
         full_response += chunk
+    turn_usage.append(
+        make_usage_record(
+            node="complaint_collect.reply", provider=provider, model=model,
+        )
+    )
 
     conv_gen.end(output=full_response)
 
@@ -185,5 +198,6 @@ async def complaint_collect_node(
         "messages": [AIMessage(content=full_response)],
         "complaint_data": complaint_data,
         "complaint_complete": complaint_complete,
+        "turn_usage": turn_usage,
     }
 

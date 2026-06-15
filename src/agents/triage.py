@@ -11,6 +11,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..schemas.intent import StructuredIntent, IntentType
+from ..usage import make_usage_record
 from .utils import format_contact_tags, format_user_context, resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -159,6 +160,8 @@ async def triage_node(
     async for chunk in stream:
         full_response += chunk
 
+    usage_record = make_usage_record(node="triage", provider=provider, model=model)
+
     generation.end(
         output=full_response,
     )
@@ -199,9 +202,18 @@ async def triage_node(
             "source": "WHATSAPP",
         })
         logger.info("triage_deal_created", thread_id=thread_id, contact_id=contact_id)
-        return {"intent": intent.value, "structured_intent": structured_intent, "deal_created": True}
+        return {
+            "intent": intent.value,
+            "structured_intent": structured_intent,
+            "deal_created": True,
+            "turn_usage": [usage_record],
+        }
 
-    return {"intent": intent.value, "structured_intent": structured_intent}
+    return {
+        "intent": intent.value,
+        "structured_intent": structured_intent,
+        "turn_usage": [usage_record],
+    }
 
 
 def route_from_triage(

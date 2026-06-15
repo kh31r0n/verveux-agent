@@ -6,6 +6,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import format_user_context, language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -142,4 +143,7 @@ async def faq_response_node(
 
     return {
         "messages": [AIMessage(content=full_response)],
+        "turn_usage": [
+            make_usage_record(node="faq_response", provider=provider, model=model)
+        ],
     }

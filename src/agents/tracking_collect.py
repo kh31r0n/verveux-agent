@@ -8,6 +8,7 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
+from ..usage import make_usage_record
 from .utils import format_user_context, language_instruction, resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -64,6 +65,7 @@ async def tracking_collect_node(
     write({"type": "step_progress", "step": 1, "total_steps": 1, "topic": "Rastreo de pedido"})
 
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
+    turn_usage: list = []
 
     if has_new_message:
         tracking_ext_prompt = resolve_prompt(config, "TRACKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT)
@@ -86,6 +88,11 @@ async def tracking_collect_node(
         extraction_raw = ""
         async for chunk in extraction_stream:
             extraction_raw += chunk
+        turn_usage.append(
+            make_usage_record(
+                node="tracking_collect.extraction", provider=provider, model=model,
+            )
+        )
 
         extraction_gen.end(output=extraction_raw)
 
@@ -156,6 +163,11 @@ async def tracking_collect_node(
     async for chunk in conv_stream:
         write({"type": "token", "content": chunk})
         full_response += chunk
+    turn_usage.append(
+        make_usage_record(
+            node="tracking_collect.reply", provider=provider, model=model,
+        )
+    )
 
     conv_gen.end(output=full_response)
 
@@ -163,4 +175,5 @@ async def tracking_collect_node(
         "messages": [AIMessage(content=full_response)],
         "tracking_data": tracking_data,
         "tracking_complete": tracking_complete,
+        "turn_usage": turn_usage,
     }

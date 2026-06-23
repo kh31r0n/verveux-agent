@@ -91,6 +91,36 @@ async def fetch_in_use_code_names() -> list[str]:
     return [c for c in code_names if isinstance(c, str)]
 
 
+async def update_contact_name(contact_id: str, name: str, tenant_id: str) -> dict:
+    """POST /internal/contacts/:contactId/name — persist the captured contact
+    name (camila's name_capture node). Backend writes Contact.customName and
+    emits a realtime contact:updated event."""
+    return await _post(
+        f"/api/v1/internal/contacts/{contact_id}/name",
+        json={"name": name, "tenantId": tenant_id},
+    )
+
+
+async def request_handoff(
+    conversation_id: str,
+    tenant_id: str,
+    reason: str,
+    intents: list[str] | None = None,
+    has_attachments: bool = False,
+) -> dict:
+    """POST /internal/conversations/:conversationId/handoff — flip the
+    conversation's aiEnabled to false and record an Incident. Idempotent."""
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/handoff",
+        json={
+            "reason": reason,
+            "tenantId": tenant_id,
+            "intents": intents or [],
+            "hasAttachments": has_attachments,
+        },
+    )
+
+
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 

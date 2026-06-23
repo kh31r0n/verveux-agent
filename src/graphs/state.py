@@ -121,3 +121,17 @@ class AgentState(TypedDict):
     # contribute without overwriting. Forwarded to NestJS on the SSE
     # `done` event, then persisted as AiInvocationUsage rows.
     turn_usage: Annotated[List[InvocationUsage], operator.add]
+
+    # ── Camila (academic-secretary) fields ─────────────────────────────
+    # Non-text content carried by the inbound message. Populated per-turn
+    # from the NestJS request; intentionally overwritten each turn so
+    # stale attachments don't bleed across turns. Camila escalates to
+    # human as soon as this list is non-empty.
+    attachments: list
+    # Latched True once the contact's name has been parsed and persisted
+    # to the backend by name_capture. Prevents the graph from re-asking.
+    school_name_captured: bool
+    # Free-text reason recorded when handoff runs; mirrors the value sent
+    # to /internal/conversations/:id/handoff so the audit trail stays
+    # consistent between graph state and the backend Incident record.
+    handoff_reason: Optional[str]

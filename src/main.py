@@ -211,6 +211,9 @@ class ChatStreamRequest(BaseModel):
     # configurable and echoed back on the SSE `done` event so the backend
     # can deduplicate retries when persisting AiInvocationUsage rows.
     turn_request_id: str = ""
+    # Non-text content carried by the inbound message — populated by NestJS
+    # when content.type is not text/audio. Only camila currently inspects it.
+    attachments: list = []
 
 
 
@@ -560,6 +563,7 @@ async def chat_stream(
             for f in (req.rawFaqs or [])
             if isinstance(f, dict)
         ],
+        "attachments": [a for a in (req.attachments or []) if isinstance(a, dict)],
     }
 
     logger.info(

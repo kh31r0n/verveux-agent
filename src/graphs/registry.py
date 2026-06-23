@@ -23,6 +23,7 @@ from typing import Callable, Iterable, Mapping
 import structlog
 
 from .appointments_graph import build_appointments_graph
+from .camila_graph import build_camila_graph
 from .restaurant_graph import build_restaurant_graph
 from .sales_graph import build_sales_graph
 from .school_graph import build_school_graph
@@ -38,6 +39,7 @@ GraphBuilder = Callable
 CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "helena": build_sales_graph,
     "sofia": build_school_graph,
+    "camila": build_camila_graph,
     "giulia": build_restaurant_graph,
     "marco": build_appointments_graph,
 }

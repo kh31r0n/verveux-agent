@@ -15,6 +15,7 @@ import structlog
 from httpx import HTTPStatusError, RequestError
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
 from ..observability import record_node_invocation
@@ -80,6 +81,13 @@ async def handoff_node(
             tenant_id=tenant_id,
             conversation_id=conversation_id,
         )
+
+    # Emit the templated Spanish reply as a single SSE token so the backend
+    # (which accumulates `type: token` events to build the WhatsApp message)
+    # actually has text to send. Without this the conversation goes silent
+    # even though the handoff side effects already ran.
+    write = get_stream_writer()
+    write({"type": "token", "content": _HANDOFF_REPLY})
 
     logger.info(
         "handoff_emitted",

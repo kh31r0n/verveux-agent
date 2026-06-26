@@ -40,13 +40,24 @@ from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
 from ..usage import make_usage_record
 from ..services.product_resolver import ProductResolver
-from .utils import format_user_context, language_instruction
+from .utils import format_user_context, language_instruction, resolve_persona
 from .backend_client import upsert_cart_item
 
 logger = structlog.get_logger(__name__)
 
 MAX_PRODUCT_TURNS = 3
 _BACKEND_SYNC_RETRIES = 2
+
+
+def _format_money(value) -> str:
+    """Render a catalog price as ``X.YY``. Defensive — older payloads sometimes
+    arrived with the price coerced into a Decimal-shaped dict ({s,e,d}) by the
+    backend's nulls-to-empty-strings pass; falling back to ``0.00`` here keeps
+    the catalog string usable instead of crashing the whole turn."""
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
 
 # ── Extraction prompt ────────────────────────────────────────────────────────
 
@@ -59,6 +70,11 @@ Analiza el mensaje del usuario y devuelve un JSON con:
     - "operation":      "add" | "remove" | "update_quantity" | "replace"
     - "old_product_id": solo si operation="replace", el nombre del producto a reemplazar (string o null)
     - "notes":          nota adicional del usuario sobre este ítem (string o "")
+- "referenced_product_names": lista de nombres de productos sobre los que el usuario
+    está preguntando o hablando, AUNQUE NO los esté agregando al carrito
+    (ej. "¿cuánto cuesta el X?", "muéstrame el Y", "háblame del Z",
+    "qué tiene el W"). Incluye también los nombres que aparecen en "items".
+    Si no menciona ningún producto específico, devuelve [].
 - "user_done_signal":  true si el usuario indica que terminó de agregar productos
     (frases como "eso es todo", "nada más", "listo", "ya está", "es todo")
 
@@ -68,13 +84,14 @@ Ejemplo:
   "items": [
     {"name": "Arroz integral", "quantity": 2, "operation": "add", "old_product_id": null, "notes": ""}
   ],
+  "referenced_product_names": ["Arroz integral"],
   "user_done_signal": false
 }
 """
 
 # ── Conversational prompt ─────────────────────────────────────────────────────
 
-_CONV_SYSTEM_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. Eres amable y concisa.
+_CONV_SYSTEM_PROMPT = """Eres {persona}, asistente de ventas por WhatsApp. Eres amable y concisa.
 {language_rule}
 
 Estás ayudando al usuario a armar su carrito de compras.
@@ -166,6 +183,47 @@ async def _sync_full_cart_to_backend(
     return all_ok
 
 
+def _compute_mentioned_product_ids(
+    resolved_items: list[dict],
+    referenced_names: list[str],
+    catalog: list[dict],
+) -> list[str]:
+    """
+    Returns ``[product_id]`` when exactly one distinct catalog product is
+    referenced this turn, otherwise ``[]``.
+
+    Combines two signals:
+      * Stage-1 cart-op items already resolved to product_ids.
+      * "referenced_product_names" — products the user asked or talked
+        about, even without a cart op (e.g. "¿cuánto cuesta el X?").
+
+    Names are resolved via heuristic-only ``ProductResolver.resolve`` (no
+    LLM fallback) — this is a best-effort signal for image attachment, not
+    an authoritative cart operation, so the extra latency/cost of an LLM
+    call would be disproportionate.
+    """
+    if not resolved_items and not referenced_names:
+        return []
+
+    pids: set[str] = set()
+
+    for item in resolved_items:
+        pid = item.get("product_id")
+        if pid:
+            pids.add(pid)
+
+    if referenced_names:
+        resolver = ProductResolver(catalog)
+        for name in referenced_names:
+            if not isinstance(name, str) or not name.strip():
+                continue
+            result = resolver.resolve(name)
+            if result.resolved:
+                pids.add(result.resolved.product_id)
+
+    return [next(iter(pids))] if len(pids) == 1 else []
+
+
 async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("sales_collect")
 
@@ -195,12 +253,13 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     user_done_signal = False
     backend_sync_ok = True  # optimistic until proven otherwise
     turn_usage: list = []   # populated after each provider call below
+    referenced_names: list[str] = []  # raw names the user asked about
 
     # ── Step 1: Extract intent from user message ──────────────────────────────
     if has_new_message:
         turns += 1
         catalog_str = "\n".join(
-            f"- {p.get('name', 'N/A')}: ${p.get('price', 0):.2f} (stock: {p.get('stock', 'N/A')})"
+            f"- {p.get('name', 'N/A')}: ${_format_money(p.get('price', 0))} (stock: {p.get('stock', 'N/A')})"
             for p in catalog
         ) or "Sin catálogo disponible."
 
@@ -238,6 +297,8 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         try:
             parsed = json.loads(extraction_raw.strip())
             extracted_items: list[dict] = parsed.get("items") or []
+            raw_refs = parsed.get("referenced_product_names") or []
+            referenced_names = [r for r in raw_refs if isinstance(r, str)]
             user_done_signal = bool(parsed.get("user_done_signal", False))
         except (json.JSONDecodeError, ValueError):
             logger.warning("sales_collect_extraction_parse_failed", raw=extraction_raw[:200])
@@ -327,7 +388,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     catalog_block = ""
     if not cart_has_items and catalog:
         catalog_lines = "\n".join(
-            f"- {p.get('name', 'N/A')} — ${p.get('price', 0):.2f}"
+            f"- {p.get('name', 'N/A')} — ${_format_money(p.get('price', 0))}"
             for p in catalog[:10]
         )
         catalog_block = f"📦 *Catálogo disponible:*\n{catalog_lines}"
@@ -370,6 +431,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         {
             "role": "system",
             "content": _CONV_SYSTEM_PROMPT.format(
+                persona=resolve_persona(state, "Helena"),
                 language_rule=language_instruction(state.get("language", "es")),
                 cart_summary=cart_summary,
                 unresolved_block=unresolved_block,
@@ -422,6 +484,12 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         backend_sync_ok=backend_sync_ok,
     )
 
+    mentioned_product_ids = _compute_mentioned_product_ids(
+        resolved_items=resolved_items,
+        referenced_names=referenced_names,
+        catalog=catalog,
+    )
+
     return {
         "messages": [AIMessage(content=full_response)],
         "cart": cart,
@@ -432,4 +500,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         # Signals to order_summary that it must use state cart as fallback
         "backend_cart_sync_failed": not backend_sync_ok,
         "turn_usage": turn_usage,
+        # Surfaced to NestJS via the SSE `done` event so it can decide
+        # whether to attach a product image to the outbound WhatsApp reply.
+        "mentioned_product_ids": mentioned_product_ids,
     }

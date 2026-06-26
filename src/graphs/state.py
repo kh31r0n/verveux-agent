@@ -18,6 +18,9 @@ class AgentState(TypedDict):
     # Set from the request body; optional so existing checkpoints written
     # before the migration deserialize cleanly.
     agent_code_name: str
+    # Custom persona name the agent uses to introduce itself on this channel
+    # (e.g. "Helena", "Admisiones"). Empty = use the graph's default identity.
+    agent_persona_name: str
     # Position of the AgentAssignment in the connection's history (1-indexed).
     # Snapshotted on the conversation at creation; immutable.
     agent_version: int
@@ -70,6 +73,13 @@ class AgentState(TypedDict):
     # Items the ProductResolver could not map to a catalog product_id.
     # Cleared on each turn and rebuilt from the latest extraction.
     pending_unknown_items: list  # [{name, qty, alternatives}]
+
+    # Product ids the SALES reply is "about" this turn. Holds exactly one id
+    # when a single catalog product was referenced (info query or cart op);
+    # empty when zero or >1 distinct products were referenced. NestJS reads
+    # this off the SSE `done` event and attaches the product image to the
+    # outbound WhatsApp message only on the single-id case.
+    mentioned_product_ids: list  # list[str]
 
     # Phase completion flags (set by node code, read by routing edges)
     product_selection_complete: bool  # True → advance to product_confirmation

@@ -61,7 +61,7 @@ async def course_inquiry_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    prompt = resolve_prompt(config, "COURSE_INQUIRY", _COURSE_INQUIRY_SYSTEM_PROMPT)
+    prompt = resolve_prompt(config, "COURSE_INQUIRY", _COURSE_INQUIRY_SYSTEM_PROMPT, state)
     system_content = prompt.format(language_rule=lang_rule)
     system_content += _format_knowledge(state)
     system_content += format_user_context(state)

@@ -53,7 +53,7 @@ async def schedule_inquiry_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    prompt = resolve_prompt(config, "SCHEDULE_INQUIRY", _SCHEDULE_INQUIRY_SYSTEM_PROMPT)
+    prompt = resolve_prompt(config, "SCHEDULE_INQUIRY", _SCHEDULE_INQUIRY_SYSTEM_PROMPT, state)
     system_content = prompt.format(language_rule=lang_rule)
     system_content += _format_schedule_knowledge(state)
     system_content += format_user_context(state)

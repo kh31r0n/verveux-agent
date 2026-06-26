@@ -7,12 +7,12 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import language_instruction, resolve_prompt
+from .utils import language_instruction, resolve_persona, resolve_prompt
 from .backend_client import get_or_create_cart
 
 logger = structlog.get_logger(__name__)
 
-_SUMMARY_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp.
+_SUMMARY_SYSTEM_PROMPT = """Eres {persona}, una asistente de ventas por WhatsApp.
 
 El backend ha calculado el resumen del carrito del cliente.
 Presenta el resumen de forma clara y amigable con:
@@ -26,7 +26,7 @@ Después del resumen, pregunta al cliente si desea confirmar:
 {language_rule}
 """
 
-_CORRECTION_SYSTEM_PROMPT = """Eres Helena, una asistente de ventas por WhatsApp.
+_CORRECTION_SYSTEM_PROMPT = """Eres {persona}, una asistente de ventas por WhatsApp.
 
 El cliente quiere corregir algo en su pedido. Su solicitud es:
 "{correction}"
@@ -175,11 +175,12 @@ async def order_summary_node(
         kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS
     ):
         correction_text = state["messages"][-1].content or ""
-        correction_prompt = resolve_prompt(config, "ORDER_CORRECTION", _CORRECTION_SYSTEM_PROMPT)
+        correction_prompt = resolve_prompt(config, "ORDER_CORRECTION", _CORRECTION_SYSTEM_PROMPT, state)
         messages_payload = [
             {
                 "role": "system",
                 "content": correction_prompt.format(
+                    persona=resolve_persona(state, "Helena"),
                     correction=correction_text,
                     cart_summary=cart_summary_str,
                     language_rule=lang_rule,
@@ -187,11 +188,14 @@ async def order_summary_node(
             }
         ]
     else:
-        summary_prompt = resolve_prompt(config, "ORDER_SUMMARY", _SUMMARY_SYSTEM_PROMPT)
+        summary_prompt = resolve_prompt(config, "ORDER_SUMMARY", _SUMMARY_SYSTEM_PROMPT, state)
         messages_payload = [
             {
                 "role": "system",
-                "content": summary_prompt.format(language_rule=lang_rule),
+                "content": summary_prompt.format(
+                    persona=resolve_persona(state, "Helena"),
+                    language_rule=lang_rule,
+                ),
             },
             {
                 "role": "user",

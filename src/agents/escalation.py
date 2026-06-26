@@ -48,7 +48,7 @@ async def escalation_node(
     lang_rule = language_instruction(state.get("language", "en"))
     agent_type = (state.get("agent_type") or "school").upper()
     escalation_key = f"{agent_type}_ESCALATION"
-    escalation_prompt = resolve_prompt(config, escalation_key, _ESCALATION_SYSTEM_PROMPT)
+    escalation_prompt = resolve_prompt(config, escalation_key, _ESCALATION_SYSTEM_PROMPT, state)
     messages_payload = [
         {"role": "system", "content": escalation_prompt.format(language_rule=lang_rule)},
         {

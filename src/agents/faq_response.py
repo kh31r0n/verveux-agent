@@ -7,11 +7,11 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import format_user_context, language_instruction, resolve_prompt
+from .utils import format_user_context, language_instruction, resolve_persona, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
-_FAQ_SYSTEM_PROMPT = """Eres Helena, una asistente de atención al cliente por WhatsApp para una tienda de productos físicos.
+_FAQ_SYSTEM_PROMPT = """Eres {persona}, una asistente de atención al cliente por WhatsApp para una tienda de productos físicos.
 
 El usuario tiene una pregunta general o un saludo. Responde de forma amigable y útil.
 
@@ -80,7 +80,7 @@ async def faq_response_node(
     lang_rule = language_instruction(state.get("language", "en"))
     agent_type = (state.get("agent_type") or "sales").upper()
     faq_key = f"{agent_type}_FAQ"
-    faq_prompt = resolve_prompt(config, faq_key, _FAQ_SYSTEM_PROMPT)
+    faq_prompt = resolve_prompt(config, faq_key, _FAQ_SYSTEM_PROMPT, state)
 
     # ── Inject FAQ knowledge from per-request FAQs ────────────────────────────
     faqs: list = state.get("faqs") or []
@@ -100,7 +100,10 @@ async def faq_response_node(
         catalog_block = "\n".join(lines)
 
     system_content = (
-        faq_prompt.format(language_rule=lang_rule)
+        faq_prompt.format(
+            persona=resolve_persona(state, "Helena"),
+            language_rule=lang_rule,
+        )
         + faq_knowledge_block
         + catalog_block
         + format_user_context(state)

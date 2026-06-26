@@ -24,7 +24,7 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
 from ..usage import make_usage_record
-from .utils import language_instruction
+from .utils import language_instruction, resolve_persona
 
 logger = structlog.get_logger(__name__)
 
@@ -46,7 +46,7 @@ _NO = {
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
-_PRESENT_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. {language_rule}
+_PRESENT_PROMPT = """Eres {persona}, asistente de ventas por WhatsApp. {language_rule}
 
 El usuario acaba de terminar de seleccionar sus productos.
 Presenta el siguiente resumen de carrito de forma clara y amigable,
@@ -61,7 +61,7 @@ Al final, agrega:
 Sé breve. No agregues más información.
 """
 
-_CONFIRMED_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. {language_rule}
+_CONFIRMED_PROMPT = """Eres {persona}, asistente de ventas por WhatsApp. {language_rule}
 
 El usuario acaba de confirmar su carrito.
 Responde de forma breve y positiva: confirma que los productos están listos
@@ -69,7 +69,7 @@ y dile que ahora necesitas sus datos de entrega.
 No repitas el resumen del carrito.
 """
 
-_REJECTED_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. {language_rule}
+_REJECTED_PROMPT = """Eres {persona}, asistente de ventas por WhatsApp. {language_rule}
 
 El usuario quiere hacer cambios en su carrito.
 Responde amablemente: dile que con gusto puedes modificar los productos
@@ -77,7 +77,7 @@ y pregunta qué desea cambiar.
 No repitas el resumen del carrito.
 """
 
-_UNCLEAR_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. {language_rule}
+_UNCLEAR_PROMPT = """Eres {persona}, asistente de ventas por WhatsApp. {language_rule}
 
 El usuario respondió algo que no es claramente sí o no.
 
@@ -146,19 +146,25 @@ async def sales_confirm_node(state: AgentState, config: RunnableConfig) -> dict:
     # ── Compose response text via LLM ─────────────────────────────────────────
     lang_rule = language_instruction(lang)
 
+    persona = resolve_persona(state, "Helena")
+
     if cart_confirmed is True:
-        system_content = _CONFIRMED_PROMPT.format(language_rule=lang_rule)
+        system_content = _CONFIRMED_PROMPT.format(
+            persona=persona, language_rule=lang_rule
+        )
     elif cart_confirmed is False:
-        system_content = _REJECTED_PROMPT.format(language_rule=lang_rule)
+        system_content = _REJECTED_PROMPT.format(
+            persona=persona, language_rule=lang_rule
+        )
     elif has_new_message:
         # Ambiguous user reply
         system_content = _UNCLEAR_PROMPT.format(
-            language_rule=lang_rule, cart_summary=cart_summary
+            persona=persona, language_rule=lang_rule, cart_summary=cart_summary
         )
     else:
         # First visit to this node — present the cart
         system_content = _PRESENT_PROMPT.format(
-            language_rule=lang_rule, cart_summary=cart_summary
+            persona=persona, language_rule=lang_rule, cart_summary=cart_summary
         )
 
     messages_payload = [{"role": "system", "content": system_content}]

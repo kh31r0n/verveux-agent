@@ -34,8 +34,8 @@ class TestSalesFlow:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.sales_collect_node", new=mock_sales),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.sales_collect_node", new=mock_sales),
         ):
             graph = build_graph(MemorySaver())
             chunks = []
@@ -72,8 +72,8 @@ class TestSalesFlow:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.sales_collect_node", new=mock_sales),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.sales_collect_node", new=mock_sales),
         ):
             graph = build_graph(MemorySaver())
             chunks = []
@@ -136,12 +136,12 @@ class TestSalesFlow:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.sales_collect_node", new=mock_sales),
-            patch("src.graphs.main_graph.sales_confirm_node", new=mock_sales_confirm),
-            patch("src.graphs.main_graph.customer_data_collect_node", new=mock_customer_data),
-            patch("src.graphs.main_graph.order_summary_node", new=mock_summary),
-            patch("src.graphs.main_graph.execute_node", new=mock_execute),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.sales_collect_node", new=mock_sales),
+            patch("src.graphs.sales_graph.sales_confirm_node", new=mock_sales_confirm),
+            patch("src.graphs.sales_graph.customer_data_collect_node", new=mock_customer_data),
+            patch("src.graphs.sales_graph.order_summary_node", new=mock_summary),
+            patch("src.graphs.sales_graph.execute_node", new=mock_execute),
             patch("src.providers.openai.OpenAIProvider.stream_chat", new=mock_stream_chat),
             patch("src.providers.anthropic.AnthropicProvider.stream_chat", new=mock_stream_chat),
             patch("src.providers.vertex.VertexProvider.stream_chat", new=mock_stream_chat),        ):
@@ -187,9 +187,9 @@ class TestSalesFlow:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.tracking_collect_node", new=mock_tracking),
-            patch("src.graphs.main_graph.execute_node", new=mock_execute),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.tracking_collect_node", new=mock_tracking),
+            patch("src.graphs.sales_graph.execute_node", new=mock_execute),
         ):
             graph = build_graph(MemorySaver())
             chunks = []
@@ -230,9 +230,9 @@ class TestSalesFlow:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.complaint_collect_node", new=mock_complaint),
-            patch("src.graphs.main_graph.execute_node", new=mock_execute),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.complaint_collect_node", new=mock_complaint),
+            patch("src.graphs.sales_graph.execute_node", new=mock_execute),
         ):
             graph = build_graph(MemorySaver())
             chunks = []
@@ -264,8 +264,8 @@ class TestSalesFlow:
         mock_faq = AsyncMock(return_value={"messages": [AIMessage(content="Hola")]})
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.faq_response_node", new=mock_faq),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.faq_response_node", new=mock_faq),
         ):
             graph = build_graph(MemorySaver())
             async for chunk in graph.astream(

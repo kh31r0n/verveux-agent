@@ -59,7 +59,7 @@ async def orchestrator_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    orchestrator_prompt = resolve_prompt(config, "ORCHESTRATOR", SYSTEM_PROMPT)
+    orchestrator_prompt = resolve_prompt(config, "ORCHESTRATOR", SYSTEM_PROMPT, state)
     messages_payload = [{"role": "system", "content": orchestrator_prompt.format(language_rule=lang_rule)}]
     for msg in state["messages"]:
         if hasattr(msg, "type"):

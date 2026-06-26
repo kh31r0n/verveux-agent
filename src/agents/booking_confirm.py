@@ -48,7 +48,7 @@ async def booking_confirm_node(
     booking_data = state.get("booking_data") or {}
 
     lang_rule = language_instruction(state.get("language", "en"))
-    prompt = resolve_prompt(config, "BOOKING_CONFIRMATION", _CONFIRMATION_SYSTEM_PROMPT)
+    prompt = resolve_prompt(config, "BOOKING_CONFIRMATION", _CONFIRMATION_SYSTEM_PROMPT, state)
     system_content = prompt.format(language_rule=lang_rule)
 
     # Add booking data context

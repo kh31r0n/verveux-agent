@@ -29,8 +29,8 @@ class TestGraphWiring:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.faq_response_node", new=mock_faq),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.faq_response_node", new=mock_faq),
         ):
             graph = build_graph(MemorySaver())
             results = []
@@ -68,8 +68,8 @@ class TestGraphWiring:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.sales_collect_node", new=mock_sales),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.sales_collect_node", new=mock_sales),
         ):
             graph = build_graph(MemorySaver())
             results = []
@@ -101,8 +101,8 @@ class TestGraphWiring:
         mock_faq = AsyncMock(return_value={"messages": [AIMessage(content="Puedo ayudarte.")]})
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.faq_response_node", new=mock_faq),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.faq_response_node", new=mock_faq),
         ):
             graph = build_graph(MemorySaver())
             async for chunk in graph.astream(
@@ -134,8 +134,8 @@ class TestGraphWiring:
         )
 
         with (
-            patch("src.graphs.main_graph.triage_node", new=mock_triage),
-            patch("src.graphs.main_graph.faq_response_node", new=mock_faq),
+            patch("src.graphs.sales_graph.triage_node", new=mock_triage),
+            patch("src.graphs.sales_graph.faq_response_node", new=mock_faq),
         ):
             graph = build_graph(MemorySaver())
             async for chunk in graph.astream(

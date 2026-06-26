@@ -108,7 +108,7 @@ async def camila_triage_node(
     )
 
     triage_prompt = resolve_prompt(
-        config, "SCHOOL_CAMILA_TRIAGE", _CAMILA_TRIAGE_SYSTEM_PROMPT
+        config, "SCHOOL_CAMILA_TRIAGE", _CAMILA_TRIAGE_SYSTEM_PROMPT, state
     )
 
     faqs: list = state.get("faqs") or []

@@ -11,7 +11,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import language_instruction, resolve_prompt, format_user_context
+from .utils import language_instruction, resolve_persona, resolve_prompt, format_user_context
 
 logger = structlog.get_logger(__name__)
 
@@ -28,7 +28,7 @@ Extrae del mensaje del usuario la siguiente información:
 Devuelve un objeto JSON con los campos encontrados. Omite campos no mencionados.
 Responde SOLO con el objeto JSON — sin markdown, sin explicación."""
 
-_CONVERSATIONAL_SYSTEM_PROMPT = """Eres Helena, una asistente de reservaciones por WhatsApp.
+_CONVERSATIONAL_SYSTEM_PROMPT = """Eres {persona}, una asistente de reservaciones por WhatsApp.
 Eres amable y eficiente. {language_rule}
 
 Tu tarea: recopilar la información necesaria para completar una reservación.
@@ -82,7 +82,7 @@ async def booking_collect_node(
 
     if last_user_msg:
         extraction_prompt = resolve_prompt(
-            config, "BOOKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT
+            config, "BOOKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT, state
         )
         extraction_messages = [
             {"role": "system", "content": extraction_prompt},
@@ -114,9 +114,10 @@ async def booking_collect_node(
     # ── Stage 3: Conversational response ─────────────────────────────────────
     lang_rule = language_instruction(state.get("language", "en"))
     conv_prompt = resolve_prompt(
-        config, "BOOKING_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT
+        config, "BOOKING_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT, state
     )
     system_content = conv_prompt.format(
+        persona=resolve_persona(state, "Helena"),
         language_rule=lang_rule,
         collected_fields=", ".join(f"{f}={booking_data[f]}" for f in collected),
         missing_fields=", ".join(missing) if missing else "Ninguno — todos recopilados",

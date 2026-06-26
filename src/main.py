@@ -204,6 +204,11 @@ class ChatStreamRequest(BaseModel):
     # and emit `legacy_agent_type_fallback_total`. In phase 2 the empty default
     # becomes a hard 400.
     agent_code_name: str = ""
+    # Custom persona the agent uses to introduce itself on this channel
+    # (e.g. "Helena", "Admisiones"). Empty = use the graph's default identity.
+    # Snapshotted on the conversation by the backend, so this value is stable
+    # across turns even if the channel's persona changes later.
+    agent_persona_name: str = ""
     agent_version: int = 1
     agent_type: str = "sales"
     capabilities: list = []
@@ -403,11 +408,17 @@ async def _stream_graph(
         # ── Final event: emit token usage for the turn ────────────────────
         # NestJS reads turn_usage off this event and persists it as
         # AiInvocationUsage rows. turn_request_id is echoed back as-is so
-        # the backend can drop duplicate runs.
+        # the backend can drop duplicate runs. mentioned_product_ids is
+        # consumed by NestJS to decide whether to attach a product image
+        # to the outbound WhatsApp message (SALES only today).
         turn_usage: list = []
+        mentioned_product_ids: list = []
         try:
             final_state = await graph.aget_state(config)
             turn_usage = final_state.values.get("turn_usage", []) or []
+            mentioned_product_ids = (
+                final_state.values.get("mentioned_product_ids", []) or []
+            )
         except Exception as exc:
             logger.warning("done_event_state_fetch_failed", error=str(exc))
 
@@ -415,6 +426,7 @@ async def _stream_graph(
             "type": "done",
             "turn_request_id": config.get("configurable", {}).get("turn_request_id", ""),
             "turn_usage": turn_usage,
+            "mentioned_product_ids": mentioned_product_ids,
         })
 
     except Exception as exc:
@@ -544,6 +556,7 @@ async def chat_stream(
         "conversation_id": req.conversation_id,
         "agent_type": agent_type or "",
         "agent_code_name": code_name,
+        "agent_persona_name": req.agent_persona_name,
         "agent_version": req.agent_version,
         "capabilities": {"agent_type": agent_type, "capabilities": req.capabilities},
         "domain_state": {},

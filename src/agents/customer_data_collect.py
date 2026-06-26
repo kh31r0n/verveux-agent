@@ -41,7 +41,7 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService
 from ..usage import make_usage_record
-from .utils import format_user_context, language_instruction
+from .utils import format_user_context, language_instruction, resolve_persona
 
 logger = structlog.get_logger(__name__)
 
@@ -83,7 +83,7 @@ Sin markdown, sin explicación.
 
 # ── Conversational prompt ─────────────────────────────────────────────────────
 
-_CONV_SYSTEM_PROMPT = """Eres Helena, asistente de ventas por WhatsApp. {language_rule}
+_CONV_SYSTEM_PROMPT = """Eres {persona}, asistente de ventas por WhatsApp. {language_rule}
 
 El cliente ya confirmó su carrito y ahora necesitas sus datos de entrega.
 Ve directo al punto — no saludes ni uses frases de transición como "¡Perfecto!" o "¡Genial!".
@@ -245,6 +245,7 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         {
             "role": "system",
             "content": _CONV_SYSTEM_PROMPT.format(
+                persona=resolve_persona(state, "Helena"),
                 language_rule=language_instruction(lang),
                 cart_summary=cart_summary,
                 collected=collected_str,

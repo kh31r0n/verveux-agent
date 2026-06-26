@@ -50,12 +50,38 @@ def format_contact_tags(state) -> str:
     return "\n\nEtiquetas actuales del contacto: " + ", ".join(tag_names)
 
 
-def resolve_prompt(config: RunnableConfig, prompt_type: str, fallback: str) -> str:
-    """Return tenant prompt content from config, or fallback to hardcoded default."""
+def resolve_persona(state, default: str) -> str:
+    """Return the channel-configured persona name, or `default` when unset.
+
+    Snapshotted onto the conversation by the backend, so this value is stable
+    across turns even if the channel's persona is later changed.
+    """
+    persona = (state.get("agent_persona_name") or "").strip()
+    return persona if persona else default
+
+
+def resolve_prompt(
+    config: RunnableConfig,
+    prompt_type: str,
+    fallback: str,
+    state=None,
+) -> str:
+    """Return tenant prompt content from config, or fallback to hardcoded default.
+
+    When `state` is provided, any literal `{persona}` placeholder in the
+    resolved string is substituted with the channel-configured persona name
+    (or the default identity) BEFORE the caller runs its own `.format(...)`.
+    This lets admins drop `{persona}` into any prompt template via the editor
+    without each call site having to opt-in. Other placeholders (`{language_rule}`,
+    etc.) are left untouched for the caller's downstream `.format(...)` to handle.
+    """
     prompts = config.get("configurable", {}).get("prompts", {})
     payload = prompts.get(prompt_type, {})
     content = payload.get("content", "") if isinstance(payload, dict) else ""
-    return content if content else fallback
+    result = content if content else fallback
+    if state is not None and "{persona}" in result:
+        result = result.replace("{persona}", resolve_persona(state, "Helena"))
+    return result
 
 
 def resolve_model_config(config: RunnableConfig, prompt_type: str) -> dict:

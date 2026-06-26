@@ -63,7 +63,7 @@ async def menu_inquiry_node(
     )
 
     lang_rule = language_instruction(state.get("language", "en"))
-    prompt = resolve_prompt(config, "MENU_INQUIRY", _MENU_INQUIRY_SYSTEM_PROMPT)
+    prompt = resolve_prompt(config, "MENU_INQUIRY", _MENU_INQUIRY_SYSTEM_PROMPT, state)
     system_content = prompt.format(language_rule=lang_rule)
     system_content += _format_menu(state)
     system_content += format_user_context(state)

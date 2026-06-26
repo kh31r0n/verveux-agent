@@ -9,7 +9,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import format_user_context, language_instruction, resolve_prompt
+from .utils import format_user_context, language_instruction, resolve_persona, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -24,7 +24,7 @@ Devuelve un objeto JSON con los campos encontrados. Omite campos no mencionados.
 Responde SOLO con el objeto JSON — sin markdown, sin explicación.
 """
 
-_CONVERSATIONAL_SYSTEM_PROMPT = """Eres Helena, una asistente de atención al cliente por WhatsApp.
+_CONVERSATIONAL_SYSTEM_PROMPT = """Eres {persona}, una asistente de atención al cliente por WhatsApp.
 El cliente quiere rastrear un pedido.
 
 Tu tarea: pedir al cliente la información necesaria para buscar su pedido.
@@ -68,7 +68,7 @@ async def tracking_collect_node(
     turn_usage: list = []
 
     if has_new_message:
-        tracking_ext_prompt = resolve_prompt(config, "TRACKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT)
+        tracking_ext_prompt = resolve_prompt(config, "TRACKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT, state)
         extraction_messages = [
             {"role": "system", "content": tracking_ext_prompt},
             {"role": "user", "content": state["messages"][-1].content},
@@ -128,11 +128,12 @@ async def tracking_collect_node(
         ) + user_ctx_str
         conv_messages = [{"role": "system", "content": conv_prompt}]
     else:
-        tracking_conv_prompt = resolve_prompt(config, "TRACKING_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT)
+        tracking_conv_prompt = resolve_prompt(config, "TRACKING_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT, state)
         conv_messages = [
             {
                 "role": "system",
                 "content": tracking_conv_prompt.format(
+                    persona=resolve_persona(state, "Helena"),
                     collected_fields=collected_summary,
                     missing_info=", ".join(missing_info),
                     language_rule=language_instruction(state.get("language", "en")),

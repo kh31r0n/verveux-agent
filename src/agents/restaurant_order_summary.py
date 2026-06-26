@@ -49,7 +49,7 @@ async def restaurant_order_summary_node(
     catalog = state.get("product_catalog") or []
 
     lang_rule = language_instruction(state.get("language", "en"))
-    prompt = resolve_prompt(config, "RESTAURANT_ORDER_SUMMARY", _SUMMARY_SYSTEM_PROMPT)
+    prompt = resolve_prompt(config, "RESTAURANT_ORDER_SUMMARY", _SUMMARY_SYSTEM_PROMPT, state)
     system_content = prompt.format(language_rule=lang_rule)
 
     # Add order data context

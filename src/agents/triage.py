@@ -126,7 +126,7 @@ async def triage_node(
     # ── Build system prompt with optional FAQ hints ───────────────────────────
     agent_type = (state.get("agent_type") or "sales").upper()
     triage_key = f"{agent_type}_TRIAGE"
-    triage_prompt = resolve_prompt(config, triage_key, _TRIAGE_SYSTEM_PROMPT)
+    triage_prompt = resolve_prompt(config, triage_key, _TRIAGE_SYSTEM_PROMPT, state)
 
     faqs: list = state.get("faqs") or []
     faq_hints = _build_faq_hints(faqs)

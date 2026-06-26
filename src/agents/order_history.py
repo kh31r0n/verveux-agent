@@ -6,12 +6,12 @@ from langgraph.config import get_stream_writer
 from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
-from .utils import language_instruction
+from .utils import language_instruction, resolve_persona
 from .backend_client import get_order_history
 
 logger = structlog.get_logger(__name__)
 
-_HISTORY_SYSTEM_PROMPT = """Eres Helena, una asistente de atención al cliente por WhatsApp.
+_HISTORY_SYSTEM_PROMPT = """Eres {persona}, una asistente de atención al cliente por WhatsApp.
 
 El cliente quiere ver sus pedidos anteriores.
 Se te proporcionará la lista de pedidos recientes del backend.
@@ -83,7 +83,10 @@ async def order_history_node(
     messages_payload = [
         {
             "role": "system",
-            "content": _HISTORY_SYSTEM_PROMPT.format(language_rule=lang_rule),
+            "content": _HISTORY_SYSTEM_PROMPT.format(
+                persona=resolve_persona(state, "Helena"),
+                language_rule=lang_rule,
+            ),
         },
         {
             "role": "user",

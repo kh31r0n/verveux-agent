@@ -82,7 +82,7 @@ async def admissions_collect_node(
 
     if last_user_msg:
         extraction_prompt = resolve_prompt(
-            config, "ADMISSIONS_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT
+            config, "ADMISSIONS_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT, state
         )
         extraction_messages = [
             {"role": "system", "content": extraction_prompt},
@@ -114,7 +114,7 @@ async def admissions_collect_node(
     # ── Stage 3: Conversational response ─────────────────────────────────────
     lang_rule = language_instruction(state.get("language", "en"))
     conv_prompt = resolve_prompt(
-        config, "ADMISSIONS_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT
+        config, "ADMISSIONS_CONVERSATIONAL", _CONVERSATIONAL_SYSTEM_PROMPT, state
     )
     system_content = conv_prompt.format(
         language_rule=lang_rule,

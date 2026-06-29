@@ -121,6 +121,140 @@ async def request_handoff(
     )
 
 
+# ─── Appointments (/internal/appointments/*) ────────────────────────────────
+#
+# These call the NestJS internal controllers added in Phase 1. The agent never
+# touches the Prisma database directly — all booking validation, the EXCLUDE
+# constraint, and the audit trail stay on the backend.
+
+
+async def list_appointment_types(tenant_id: str) -> list[dict]:
+    """GET /internal/appointments/types?tenantId=... — active types catalog."""
+    data = await _get(
+        "/api/v1/internal/appointments/types",
+        params={"tenantId": tenant_id},
+    )
+    return data if isinstance(data, list) else []
+
+
+async def search_appointment_availability(
+    tenant_id: str,
+    appointment_type_id: str,
+    from_iso: str,
+    to_iso: str,
+    location_id: str | None = None,
+    resource_preferences: dict | None = None,
+    timezone: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """POST /internal/appointments/availability — on-demand slot search."""
+    body: dict = {
+        "tenantId": tenant_id,
+        "appointmentTypeId": appointment_type_id,
+        "from": from_iso,
+        "to": to_iso,
+        "limit": limit,
+    }
+    if location_id:
+        body["locationId"] = location_id
+    if resource_preferences:
+        body["resourcePreferences"] = resource_preferences
+    if timezone:
+        body["timezone"] = timezone
+    return await _post("/api/v1/internal/appointments/availability", json=body)
+
+
+async def create_appointment_hold(
+    tenant_id: str,
+    contact_id: str,
+    appointment_type_id: str,
+    starts_at_iso: str,
+    ends_at_iso: str,
+    resources: list[dict],
+    customer_data: dict | None = None,
+    location_id: str | None = None,
+    hold_minutes: int = 10,
+    thread_id: str | None = None,
+) -> dict:
+    """POST /internal/appointments/holds — create a PENDING_HOLD appointment.
+
+    The backend enforces double-booking via the EXCLUDE constraint, so this
+    call may raise HTTP 409 with ``code: SLOT_TAKEN``. The caller is
+    responsible for catching that and offering an alternative slot.
+    """
+    body: dict = {
+        "tenantId": tenant_id,
+        "contactId": contact_id,
+        "appointmentTypeId": appointment_type_id,
+        "startsAt": starts_at_iso,
+        "endsAt": ends_at_iso,
+        "resources": resources,
+        "holdMinutes": hold_minutes,
+    }
+    if location_id:
+        body["locationId"] = location_id
+    if customer_data:
+        body["customerData"] = customer_data
+    if thread_id:
+        body["threadId"] = thread_id
+    return await _post("/api/v1/internal/appointments/holds", json=body)
+
+
+async def confirm_appointment(appointment_id: str, tenant_id: str) -> dict:
+    """POST /internal/appointments/:id/confirm — promote hold to CONFIRMED."""
+    return await _post(
+        f"/api/v1/internal/appointments/{appointment_id}/confirm",
+        json={"tenantId": tenant_id},
+    )
+
+
+async def cancel_appointment(
+    appointment_id: str,
+    tenant_id: str,
+    reason: str | None = None,
+) -> dict:
+    """POST /internal/appointments/:id/cancel — cancel by id."""
+    body: dict = {"tenantId": tenant_id}
+    if reason:
+        body["reason"] = reason
+    return await _post(
+        f"/api/v1/internal/appointments/{appointment_id}/cancel", json=body
+    )
+
+
+async def reschedule_appointment(
+    appointment_id: str,
+    tenant_id: str,
+    starts_at_iso: str,
+    ends_at_iso: str,
+    resources: list[dict],
+) -> dict:
+    """POST /internal/appointments/:id/reschedule — move to a new slot."""
+    return await _post(
+        f"/api/v1/internal/appointments/{appointment_id}/reschedule",
+        json={
+            "tenantId": tenant_id,
+            "startsAt": starts_at_iso,
+            "endsAt": ends_at_iso,
+            "resources": resources,
+        },
+    )
+
+
+async def list_active_appointments_for_contact(
+    contact_id: str,
+    tenant_id: str,
+) -> list[dict]:
+    """GET /internal/appointments/contacts/:contactId/active — used by the
+    cancel / reschedule flows to disambiguate which booking the user means.
+    """
+    data = await _get(
+        f"/api/v1/internal/appointments/contacts/{contact_id}/active",
+        params={"tenantId": tenant_id},
+    )
+    return data if isinstance(data, list) else []
+
+
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 

@@ -110,9 +110,42 @@ class AgentState(TypedDict):
     restaurant_order_complete: bool
 
     # ── Appointments flow ─────────────────────────────────────────────
+    # Legacy fields (kept for backward compat with existing checkpoints
+    # that may have been written by the partial graph) and the new
+    # lifecycle fields used by the restructured appointments graph.
     booking_data: dict
     booking_complete: bool
     booking_confirmed: bool
+
+    # New lifecycle. `booking_intent` records what the user is here to do
+    # so subsequent turns can rejoin the flow mid-conversation without
+    # re-triage. Values: "book" | "reschedule" | "cancel" | "inquire".
+    booking_intent: Optional[str]
+    # Selected AppointmentType. Resolved by appointment_collect from the
+    # tenant's catalogue (loaded once per turn).
+    appointment_type_id: Optional[str]
+    appointment_type_name: Optional[str]
+    appointment_type_duration_min: Optional[int]
+    # Schema snapshot of the type's required customer fields. Drives the
+    # validation loop in appointment_collect.
+    required_customer_fields: List[dict]
+    # Values collected to satisfy required_customer_fields, keyed by `key`.
+    collected_customer_data: dict
+    # Candidate slots returned by availability_lookup (capped server-side).
+    # Schema: [{startsAt, endsAt, resources: [{kind, resourceId, name}], score}]
+    candidate_slots: List[dict]
+    # User-selected slot from candidate_slots (set by reservation_propose).
+    chosen_slot: Optional[dict]
+    # IDs returned by /internal/appointments/holds; populated after confirm.
+    reservation_appointment_id: Optional[str]
+    hold_expires_at: Optional[str]
+    # For cancel / reschedule disambiguation (set by appointment_cancel /
+    # appointment_reschedule when the user has multiple active bookings).
+    cancellation_target_id: Optional[str]
+    reschedule_source_id: Optional[str]
+    # Sentinel set when the backend rejects a hold with code SLOT_TAKEN so
+    # the graph can route back to availability_lookup and re-search.
+    slot_conflict: bool
 
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool

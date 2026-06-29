@@ -31,6 +31,8 @@ class IntentType(str, Enum):
     # Appointments-specific
     AVAILABILITY = "availability"
     BOOKING = "booking"
+    APPOINTMENT_CANCEL = "appointment_cancel"
+    APPOINTMENT_RESCHEDULE = "appointment_reschedule"
 
 class CartItemIntent(BaseModel):
     product_identifier: str

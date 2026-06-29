@@ -17,6 +17,7 @@ in phase 2.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Callable, Iterable, Mapping
 
@@ -43,6 +44,31 @@ CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "giulia": build_restaurant_graph,
     "marco": build_appointments_graph,
 }
+
+
+def _register_extra_appointment_code_names() -> None:
+    """Phase 6: tenants that run multiple appointment-style agents (e.g. a
+    dental clinic *and* a salon under the same Verveux deployment) can
+    register additional code names that reuse the appointments graph
+    topology.
+
+    Each extra code name still needs an ``AgentCodeName`` row on the backend
+    so the platform recognises it; this function only declares the Python
+    side. The names are read from ``APPOINTMENTS_EXTRA_CODE_NAMES`` as a
+    comma-separated list, e.g. ``dental,salon``.
+
+    Why not seed at the call site? Keeping the resolution here means a
+    single deploy variable maps a name to the appointments builder for
+    every request, without duplicating the registry literal.
+    """
+    raw = os.getenv("APPOINTMENTS_EXTRA_CODE_NAMES") or ""
+    for name in (s.strip() for s in raw.split(",")):
+        if not name or name in CODE_NAME_REGISTRY:
+            continue
+        CODE_NAME_REGISTRY[name] = build_appointments_graph
+
+
+_register_extra_appointment_code_names()
 
 # Phase-1 fallback: legacy agent_type → canonical code name.
 # Removed in phase 2.

@@ -16,6 +16,28 @@ from .utils import format_contact_tags, format_user_context, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
+_APPOINTMENTS_TRIAGE_SYSTEM_PROMPT = """Eres el agente de clasificación de Marco, un asistente de agendamiento de citas por WhatsApp.
+
+Tu trabajo es clasificar la intención del usuario y devolver SOLO un objeto JSON.
+
+Intenciones disponibles:
+- **booking**: El usuario quiere reservar/agendar una cita nueva, ver opciones, o iniciar el flujo de booking.
+- **appointment_cancel**: El usuario quiere cancelar una cita existente.
+- **appointment_reschedule**: El usuario quiere mover/cambiar una cita existente a otro horario.
+- **faq**: El usuario hace una pregunta general (horarios de atención, precios, ubicación, qué servicios ofrecen, etc.).
+- **greeting**: El usuario saluda sin intención clara.
+- **escalation**: El usuario pide hablar con una persona humana o expresa una queja seria.
+
+Reglas:
+- Si el usuario menciona "agendar", "reservar", "tomar cita", "quiero una cita" → **booking**.
+- Si menciona "cancelar", "anular" su cita → **appointment_cancel**.
+- Si menciona "reagendar", "cambiar fecha", "mover" su cita → **appointment_reschedule**.
+- Preguntas sobre disponibilidad general SIN compromiso de reservar → **faq** (el flujo de booking ya muestra disponibilidad).
+- Responde SOLO con un objeto JSON de una línea, sin markdown.
+- Esquema JSON: {{"intent": "<booking|appointment_cancel|appointment_reschedule|faq|greeting|escalation>", "confidence": 0.0-1.0, "raw_text": "..."}}
+"""
+
+
 _TRIAGE_SYSTEM_PROMPT = """Eres el agente de clasificación de Helena, un asistente de atención al cliente por WhatsApp para una tienda de productos físicos.
 
 Tu trabajo es clasificar la intención del usuario y devolver SOLO un objeto JSON.
@@ -113,6 +135,16 @@ async def triage_node(
     ):
         return {}
 
+    # ── Appointments: skip when a booking flow is mid-run ───────────────────
+    # The lifecycle nodes set `booking_intent` ("book" | "cancel" | "reschedule")
+    # so follow-up messages ("la 2 por favor", "sí confirmo") don't get
+    # re-triaged into faq.
+    if (
+        state.get("booking_intent")
+        and not state.get("booking_confirmed", False)
+    ):
+        return {}
+
     provider = get_provider(config)
     model = resolve_model(config)
     thread_id: str = state.get("thread_id", "unknown")
@@ -125,8 +157,16 @@ async def triage_node(
 
     # ── Build system prompt with optional FAQ hints ───────────────────────────
     agent_type = (state.get("agent_type") or "sales").upper()
+    code_name = (state.get("agent_code_name") or "").lower()
     triage_key = f"{agent_type}_TRIAGE"
-    triage_prompt = resolve_prompt(config, triage_key, _TRIAGE_SYSTEM_PROMPT, state)
+    # Pick the appointments-specific default when running under the appointments
+    # graph so the LLM doesn't try to classify booking talk as `sales`.
+    default_prompt = (
+        _APPOINTMENTS_TRIAGE_SYSTEM_PROMPT
+        if code_name == "marco" or agent_type == "APPOINTMENTS"
+        else _TRIAGE_SYSTEM_PROMPT
+    )
+    triage_prompt = resolve_prompt(config, triage_key, default_prompt, state)
 
     faqs: list = state.get("faqs") or []
     faq_hints = _build_faq_hints(faqs)

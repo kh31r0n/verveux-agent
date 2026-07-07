@@ -25,7 +25,12 @@ from ..observability import get_langfuse, record_node_invocation
 from ..providers.registry import get_provider, resolve_model
 from ..schemas.intent import IntentType, StructuredIntent
 from ..usage import make_usage_record
-from .identity_validator import detect_identity_conflict
+from ..graphs.shared_routing import contains_escalation_keywords
+from .identity_validator import (
+    detect_identity_conflict,
+    detect_identity_conflict_texts,
+    extract_human_texts,
+)
 from .triage import _build_faq_hints, _strip_json_fences
 from .utils import format_contact_tags, format_user_context, resolve_prompt
 
@@ -62,6 +67,38 @@ _HANDOFF_INTENTS = {
     IntentType.IDENTITY_CONFLICT,
 }
 
+# LLM-classified identity_conflict below this confidence is downgraded to faq
+# when the turn's text was typo-corrected and carries no escalation keyword —
+# a normalized typo is a more likely explanation than a real second identity.
+_IDENTITY_CONFLICT_MIN_CONFIDENCE = 0.75
+
+
+def _identity_conflict_confirmed(state: AgentState, messages: list) -> bool:
+    """Deterministic identity check, typo-aware.
+
+    When the normalizer corrected this turn's text, a "second identity" may
+    be nothing but the typo'd spelling of the first (Cortez / Cortés). In
+    that case require the conflict to persist on BOTH transcripts: the
+    original one and the one with the last user text replaced by the
+    corrected version. Without a normalization, behaves exactly as before.
+    """
+    if not detect_identity_conflict(messages):
+        return False
+
+    normalization = state.get("normalization") or {}
+    corrected = (
+        normalization.get("corrected_text")
+        if normalization.get("applied")
+        else None
+    )
+    if not corrected:
+        return True
+
+    texts = extract_human_texts(messages)
+    if not texts:
+        return True
+    return detect_identity_conflict_texts([*texts[:-1], corrected])
+
 
 async def camila_triage_node(
     state: AgentState,
@@ -76,7 +113,7 @@ async def camila_triage_node(
     # Pure-Python, no LLM. If the user mentioned two distinct full names or
     # two distinct documento numbers across the conversation, classify as
     # IDENTITY_CONFLICT and skip the classifier call.
-    if detect_identity_conflict(messages):
+    if _identity_conflict_confirmed(state, messages):
         logger.info("camila_triage_identity_conflict", thread_id=thread_id)
         structured = StructuredIntent(
             intent=IntentType.IDENTITY_CONFLICT,
@@ -93,7 +130,10 @@ async def camila_triage_node(
         )
         return {
             "intent": IntentType.IDENTITY_CONFLICT.value,
-            "structured_intent": structured,
+            # Stored as a plain JSON dict — checkpoints must never carry
+            # custom Python types (LangGraph blocks their deserialization
+            # in future versions).
+            "structured_intent": structured.model_dump(mode="json"),
             "handoff_reason": "identity_conflict",
         }
 
@@ -161,6 +201,25 @@ async def camila_triage_node(
         )
         intent = IntentType.UNKNOWN
 
+    normalization = state.get("normalization") or {}
+    normalization_applied = bool(normalization.get("applied"))
+
+    # Deterministic post-LLM guardrail: a weak identity_conflict signal on a
+    # typo-corrected turn without explicit escalation keywords is more likely
+    # a spelling artifact than a real second identity — downgrade to faq.
+    if (
+        intent == IntentType.IDENTITY_CONFLICT
+        and structured.confidence < _IDENTITY_CONFLICT_MIN_CONFIDENCE
+        and normalization_applied
+        and not contains_escalation_keywords(state.get("original_text") or "")
+    ):
+        logger.info(
+            "camila_identity_conflict_suppressed",
+            thread_id=thread_id,
+            confidence=structured.confidence,
+        )
+        intent = IntentType.FAQ
+
     # If the LLM returned a secondary intent that requires handoff, promote it.
     handoff_intent: IntentType | None = None
     if intent in _HANDOFF_INTENTS:
@@ -186,11 +245,13 @@ async def camila_triage_node(
         intent=intent.value,
         secondary_intents=[s.value for s in structured.secondary_intents],
         promoted_handoff=handoff_intent.value if handoff_intent else None,
+        normalization_applied=normalization_applied,
     )
 
     update: dict = {
         "intent": (handoff_intent or intent).value,
-        "structured_intent": structured,
+        # Plain JSON dict — keeps custom Python types out of checkpoints.
+        "structured_intent": structured.model_dump(mode="json"),
         "turn_usage": [usage_record],
     }
     if handoff_intent is not None:

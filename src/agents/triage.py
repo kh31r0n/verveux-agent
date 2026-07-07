@@ -228,6 +228,7 @@ async def triage_node(
         thread_id=thread_id,
         intent=intent.value,
         faq_hints_injected=len(faqs),
+        normalization_applied=bool((state.get("normalization") or {}).get("applied")),
     )
 
     # Emit create_deal SSE event when classifying as "sales" for the first time
@@ -244,14 +245,18 @@ async def triage_node(
         logger.info("triage_deal_created", thread_id=thread_id, contact_id=contact_id)
         return {
             "intent": intent.value,
-            "structured_intent": structured_intent,
+            # Stored as a plain JSON dict — checkpoints must never carry
+            # custom Python types (LangGraph blocks their deserialization
+            # in future versions). route_from_triage handles both shapes.
+            "structured_intent": structured_intent.model_dump(mode="json"),
             "deal_created": True,
             "turn_usage": [usage_record],
         }
 
     return {
         "intent": intent.value,
-        "structured_intent": structured_intent,
+        # Plain JSON dict — keeps custom Python types out of checkpoints.
+        "structured_intent": structured_intent.model_dump(mode="json"),
         "turn_usage": [usage_record],
     }
 

@@ -38,6 +38,7 @@ class TestGraphWiring:
                 {
                     "messages": [HumanMessage(content="Hola")],
                     "thread_id": "test-user:thread-1",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",
@@ -77,6 +78,7 @@ class TestGraphWiring:
                 {
                     "messages": [HumanMessage(content="Quiero comprar algo")],
                     "thread_id": "test-user:thread-2",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",
@@ -109,6 +111,7 @@ class TestGraphWiring:
                 {
                     "messages": [HumanMessage(content="test")],
                     "thread_id": "test-user:thread-3",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",
@@ -142,6 +145,7 @@ class TestGraphWiring:
                 {
                     "messages": [HumanMessage(content="test")],
                     "thread_id": "test-user:thread-4",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",

@@ -7,6 +7,35 @@ _LANGUAGE_NAMES = {
 }
 
 
+def latest_user_messages(state) -> list[str]:
+    """Return the texts of the user's current turn, oldest first.
+
+    WhatsApp users often split one thought across several rapid messages
+    ("Hola" / "una pregunta" / "¿tienen envíos?"). Each fragment lands as its
+    own HumanMessage, so the trailing run of consecutive human messages —
+    everything after the bot's last reply — is ONE logical turn. Nodes that
+    only read `messages[-1]` answer the last fragment and ignore the rest.
+    """
+    parts: list[str] = []
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "type", "") != "human":
+            break
+        content = msg.content if hasattr(msg, "content") else str(msg)
+        if content:
+            parts.append(content)
+    parts.reverse()
+    return parts
+
+
+def latest_user_text(state) -> str:
+    """Return the user's current turn as one string (fragments joined by newlines).
+
+    Drop-in replacement for `state["messages"][-1].content` at every site that
+    feeds the user message to an extraction or conversational LLM call.
+    """
+    return "\n".join(latest_user_messages(state))
+
+
 def language_instruction(lang: str) -> str:
     """Return an LLM instruction like 'Always respond in Spanish.' for the given language code."""
     name = _LANGUAGE_NAMES.get(lang, _LANGUAGE_NAMES["en"])

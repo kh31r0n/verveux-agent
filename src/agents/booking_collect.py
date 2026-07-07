@@ -11,7 +11,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import language_instruction, resolve_persona, resolve_prompt, format_user_context
+from .utils import language_instruction, latest_user_text, resolve_persona, resolve_prompt, format_user_context
 
 logger = structlog.get_logger(__name__)
 
@@ -74,11 +74,9 @@ async def booking_collect_node(
     turn_usage: list = []
 
     # ── Stage 1: Extraction ──────────────────────────────────────────────────
-    last_user_msg = ""
-    for msg in reversed(state["messages"]):
-        if getattr(msg, "type", "") == "human":
-            last_user_msg = msg.content
-            break
+    # Booking data (name, date, time...) often arrives split across several
+    # rapid WhatsApp messages — extract from the whole trailing burst.
+    last_user_msg = latest_user_text(state)
 
     if last_user_msg:
         extraction_prompt = resolve_prompt(

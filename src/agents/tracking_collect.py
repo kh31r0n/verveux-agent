@@ -9,7 +9,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import format_user_context, language_instruction, resolve_persona, resolve_prompt
+from .utils import format_user_context, language_instruction, latest_user_text, resolve_persona, resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -65,13 +65,16 @@ async def tracking_collect_node(
     write({"type": "step_progress", "step": 1, "total_steps": 1, "topic": "Rastreo de pedido"})
 
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
+    # The whole trailing burst of user messages — order id and contact data
+    # often arrive split across several rapid WhatsApp messages.
+    user_turn_text = latest_user_text(state)
     turn_usage: list = []
 
     if has_new_message:
         tracking_ext_prompt = resolve_prompt(config, "TRACKING_EXTRACTION", _EXTRACTION_SYSTEM_PROMPT, state)
         extraction_messages = [
             {"role": "system", "content": tracking_ext_prompt},
-            {"role": "user", "content": state["messages"][-1].content},
+            {"role": "user", "content": user_turn_text},
         ]
 
         extraction_gen = trace.generation(
@@ -142,7 +145,7 @@ async def tracking_collect_node(
             {
                 "role": "user",
                 "content": (
-                    state["messages"][-1].content
+                    user_turn_text
                     if has_new_message
                     else "Quiero rastrear mi pedido"
                 ),

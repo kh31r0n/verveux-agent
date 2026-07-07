@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # used in lifespan
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
@@ -103,7 +104,19 @@ async def lifespan(app: FastAPI):
     pool = await init_pool()
     await run_migrations(pool)
 
-    async with AsyncPostgresSaver.from_conn_string(settings.database_url) as checkpointer:
+    # Checkpoints written before 2026-07 contain StructuredIntent/IntentType
+    # Pydantic objects; new code stores plain dicts. Allow-list the legacy
+    # types so old threads keep deserializing after LangGraph starts blocking
+    # unregistered classes. Do not extend this list — state must stay JSON-native.
+    legacy_serde = JsonPlusSerializer(
+        allowed_msgpack_modules=[
+            ("src.schemas.intent", "IntentType"),
+            ("src.schemas.intent", "StructuredIntent"),
+        ]
+    )
+    async with AsyncPostgresSaver.from_conn_string(
+        settings.database_url, serde=legacy_serde
+    ) as checkpointer:
         await checkpointer.setup()
         set_checkpointer(checkpointer)
 
@@ -219,6 +232,10 @@ class ChatStreamRequest(BaseModel):
     # Non-text content carried by the inbound message — populated by NestJS
     # when content.type is not text/audio. Only camila currently inspects it.
     attachments: list = []
+    # Per-tenant rollout flag for the query_normalizer node, read from
+    # TenantSettings.queryNormalizationEnabled by the backend. Combined with
+    # the fleet-wide settings.query_normalization_enabled env switch.
+    query_normalization_enabled: bool = False
 
 
 
@@ -232,6 +249,138 @@ class ChatResumeRequest(BaseModel):
     agent_code_name: str = ""
     agent_version: int = 1
     agent_type: str = "sales"
+
+
+# ---------------------------------------------------------------------------
+# Multi-message coalescing
+# ---------------------------------------------------------------------------
+# WhatsApp users often split one thought across several rapid messages, and
+# NestJS forwards each as its own POST /chat/stream. Without coordination the
+# runs execute concurrently against the same checkpoint thread and each one
+# replies to its own fragment in isolation (three greetings for three
+# messages). We serialize runs per thread and coalesce: fragments that arrive
+# while a turn is waiting or running are merged into the NEXT run as a single
+# user turn, and their own requests complete with an empty `done` event so the
+# backend releases their credit reservations and sends nothing.
+#
+# The locks are process-local — correct for the single-process deployment.
+# If the agent is ever scaled horizontally, requests must be routed sticky by
+# thread_id (or this moves to a Postgres advisory lock).
+
+
+class _ThreadTurnState:
+    __slots__ = ("lock", "pending", "requests")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        # Fragments not yet consumed by a graph run:
+        # (message, attachments, faqs) — faqs is the per-request FAQ payload
+        # NestJS retrieved for that fragment.
+        self.pending: list[tuple[str, list, list]] = []
+        # Number of requests currently referencing this state (for cleanup)
+        self.requests = 0
+
+
+_thread_turns: dict[str, _ThreadTurnState] = {}
+
+
+def _checkout_turn_state(thread_id: str) -> _ThreadTurnState:
+    state = _thread_turns.get(thread_id)
+    if state is None:
+        state = _ThreadTurnState()
+        _thread_turns[thread_id] = state
+    state.requests += 1
+    return state
+
+
+def _checkin_turn_state(thread_id: str, state: _ThreadTurnState) -> None:
+    state.requests -= 1
+    if state.requests <= 0 and not state.pending:
+        _thread_turns.pop(thread_id, None)
+
+
+async def _coalesced_stream(
+    message: str,
+    attachments: list,
+    faqs: list,
+    inputs: dict,
+    config: dict,
+    graph,
+    agent_code_name: str,
+    thread_id: str,
+) -> AsyncGenerator[str, None]:
+    """Serialize graph runs per thread and merge rapid message bursts.
+
+    Wraps _stream_graph. The request that wins the thread's run slot answers
+    every fragment buffered so far in one turn; superseded requests emit an
+    empty `done` event (turn_usage=[]) so NestJS releases their reservation
+    and dispatches no reply.
+    """
+    state = _checkout_turn_state(thread_id)
+    state.pending.append((message, attachments, faqs))
+    try:
+        async with state.lock:
+            # Settle window: keep waiting while new fragments are still
+            # arriving, so the whole burst is answered as one turn.
+            settle = settings.message_settle_seconds
+            if settle > 0:
+                waited = 0.0
+                while waited < settings.message_settle_max_seconds:
+                    seen = len(state.pending)
+                    await asyncio.sleep(settle)
+                    waited += settle
+                    if len(state.pending) == seen:
+                        break
+
+            if not state.pending:
+                # A sibling request already carried this fragment into its own
+                # run and answered it.
+                logger.info("chat_stream_superseded", thread_id=thread_id)
+                yield _sse_event({
+                    "type": "done",
+                    "turn_request_id": config.get("configurable", {}).get(
+                        "turn_request_id", ""
+                    ),
+                    "turn_usage": [],
+                    "mentioned_product_ids": [],
+                    "coalesced": True,
+                })
+                return
+
+            fragments = state.pending[:]
+            state.pending.clear()
+            if len(fragments) > 1:
+                logger.info(
+                    "chat_stream_coalesced",
+                    thread_id=thread_id,
+                    fragments=len(fragments),
+                )
+            merged_text = "\n".join(text for text, _, _ in fragments if text)
+            merged_attachments = [a for _, atts, _ in fragments for a in atts]
+            # Union of every fragment's FAQ payload, deduped by question.
+            # NestJS retrieves FAQs per request (querying the burst text it
+            # has seen so far), so later fragments carry matches the winning
+            # (first) request's payload lacks.
+            merged_faqs: list = []
+            seen_questions: set[str] = set()
+            for _, _, faq_list in fragments:
+                for faq in faq_list or []:
+                    question = (faq.get("question") or "").strip().lower()
+                    if question in seen_questions:
+                        continue
+                    if question:
+                        seen_questions.add(question)
+                    merged_faqs.append(faq)
+            inputs["messages"] = [HumanMessage(content=merged_text)]
+            inputs["attachments"] = merged_attachments
+            inputs["faqs"] = merged_faqs
+
+            async for event in _stream_graph(
+                inputs, config, graph=graph, agent_code_name=agent_code_name
+            ):
+                yield event
+    finally:
+        _checkin_turn_state(thread_id, state)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +411,19 @@ async def _stream_graph(
     if graph is None:
         yield _sse_event({"type": "error", "message": "Agent graph not initialised"})
         return
+
+    # turn_usage is an operator.add channel, so the checkpointer accumulates
+    # it across turns on the same thread. The done event must report only the
+    # records THIS run appended — otherwise NestJS re-persists every prior
+    # turn's invocations under the new turn_request_id (billing over-count).
+    # Snapshot the pre-run length and slice after the run; this also keeps
+    # /chat/resume correct, where a Command input can't reset any channel.
+    prev_usage_count = 0
+    try:
+        prior = await graph.aget_state(config)
+        prev_usage_count = len(prior.values.get("turn_usage") or [])
+    except Exception as exc:  # noqa: BLE001 — a fresh thread has no checkpoint
+        logger.debug("pre_run_state_fetch_failed", error=str(exc))
 
     try:
         async for chunk in graph.astream(
@@ -413,12 +575,15 @@ async def _stream_graph(
         # to the outbound WhatsApp message (SALES only today).
         turn_usage: list = []
         mentioned_product_ids: list = []
+        faq_used: list = []
         try:
             final_state = await graph.aget_state(config)
-            turn_usage = final_state.values.get("turn_usage", []) or []
+            all_usage = final_state.values.get("turn_usage", []) or []
+            turn_usage = all_usage[prev_usage_count:]
             mentioned_product_ids = (
                 final_state.values.get("mentioned_product_ids", []) or []
             )
+            faq_used = final_state.values.get("faq_used") or []
         except Exception as exc:
             logger.warning("done_event_state_fetch_failed", error=str(exc))
 
@@ -427,6 +592,7 @@ async def _stream_graph(
             "turn_request_id": config.get("configurable", {}).get("turn_request_id", ""),
             "turn_usage": turn_usage,
             "mentioned_product_ids": mentioned_product_ids,
+            "faq_used": faq_used,
         })
 
     except Exception as exc:
@@ -545,6 +711,7 @@ async def chat_stream(
             "llm_model": llm_model,
             "prompts": prompts_dict,
             "turn_request_id": req.turn_request_id,
+            "normalization_enabled": req.query_normalization_enabled,
             **provider_config,   # injects the right keys for the resolved provider
         }
     }
@@ -568,15 +735,27 @@ async def chat_stream(
         "knowledge": req.knowledge,
         "faqs": [
             {
+                "id": str(f.get("id") or ""),
                 "question": f.get("question", ""),
                 "answer": f.get("answer", ""),
                 "category": f.get("category", ""),
                 "priority": f.get("priority", 0),
+                # Retrieval score from the backend FTS/trigram search. The
+                # query_normalizer trigger reads it to decide whether the
+                # initial retrieval was empty/marginal.
+                "score": float(f.get("score") or 0.0),
             }
             for f in (req.rawFaqs or [])
             if isinstance(f, dict)
         ],
         "attachments": [a for a in (req.attachments or []) if isinstance(a, dict)],
+        # Per-turn fields: reset on every request so a turn that skips the
+        # writing node never re-reports the previous turn's values on the done
+        # event (the checkpointer persists state across turns). A stale
+        # mentioned_product_ids would re-attach a product image to an
+        # unrelated reply; a stale faq_used would double-log FAQ usage.
+        "faq_used": None,
+        "mentioned_product_ids": [],
     }
 
     logger.info(
@@ -594,7 +773,16 @@ async def chat_stream(
     )
 
     return StreamingResponse(
-        _stream_graph(inputs, config, graph=graph, agent_code_name=code_name),
+        _coalesced_stream(
+            req.message,
+            inputs["attachments"],
+            inputs["faqs"],
+            inputs,
+            config,
+            graph,
+            code_name,
+            thread_id,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

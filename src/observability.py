@@ -66,6 +66,14 @@ complaints_total = Counter(
     "Total number of complaints registered",
 )
 
+# Outcomes: applied | discarded_high_risk | discarded_low_confidence |
+# no_trigger | retrieval_empty | retrieval_failed | error
+query_normalizations_total = Counter(
+    "query_normalizations_total",
+    "Query normalization outcomes per turn",
+    ["outcome"],
+)
+
 
 def record_node_invocation(node: str, agent_code_name: str = "unknown") -> None:
     agent_node_invocations_total.labels(

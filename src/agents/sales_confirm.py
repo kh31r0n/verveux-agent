@@ -24,7 +24,7 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
 from ..usage import make_usage_record
-from .utils import language_instruction, resolve_persona
+from .utils import language_instruction, latest_user_text, resolve_persona
 
 logger = structlog.get_logger(__name__)
 
@@ -133,7 +133,9 @@ async def sales_confirm_node(state: AgentState, config: RunnableConfig) -> dict:
     cart_confirmed: bool | None = None   # True=yes, False=no, None=unclear/first visit
 
     if has_new_message:
-        user_text = (state["messages"][-1].content or "").lower().strip()
+        # Join the trailing burst of user messages — a confirmation may arrive
+        # split across fragments ("mmm" / "sí, dale").
+        user_text = latest_user_text(state).lower().strip()
         # Tokenise loosely: split on spaces and check individual words too
         tokens = set(user_text.split())
 
@@ -170,7 +172,7 @@ async def sales_confirm_node(state: AgentState, config: RunnableConfig) -> dict:
     messages_payload = [{"role": "system", "content": system_content}]
     if has_new_message:
         messages_payload.append(
-            {"role": "user", "content": state["messages"][-1].content}
+            {"role": "user", "content": latest_user_text(state)}
         )
 
     gen = trace.generation(

@@ -40,7 +40,7 @@ from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
 from ..usage import make_usage_record
 from ..services.product_resolver import ProductResolver
-from .utils import format_user_context, language_instruction, resolve_persona
+from .utils import format_user_context, language_instruction, latest_user_text, resolve_persona
 from .backend_client import upsert_cart_item
 
 logger = structlog.get_logger(__name__)
@@ -247,6 +247,9 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     contact_id: str = state.get("contact_id", "")
     conversation_id: str = state.get("conversation_id", "")
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
+    # The whole trailing burst of user messages — users often split one order
+    # across several rapid WhatsApp messages, and each must be considered.
+    user_turn_text = latest_user_text(state)
 
     resolved_items: list[dict] = []
     unresolved_items: list[dict] = []
@@ -269,7 +272,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
                 "role": "user",
                 "content": (
                     f"Catálogo disponible:\n{catalog_str}\n\n"
-                    f"Mensaje del usuario:\n{state['messages'][-1].content}"
+                    f"Mensaje del usuario:\n{user_turn_text}"
                 ),
             },
         ]
@@ -442,7 +445,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         {
             "role": "user",
             "content": (
-                state["messages"][-1].content
+                user_turn_text
                 if has_new_message
                 else "Hola, quiero hacer un pedido."
             ),

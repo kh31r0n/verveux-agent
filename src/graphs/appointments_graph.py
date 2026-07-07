@@ -8,6 +8,7 @@ Topology::
         appointment_cancel,
         appointment_reschedule → availability_lookup →
             reservation_propose → reschedule_execute,
+        greeting_response  (greeting + name known — deterministic, no LLM),
         faq_response,
         escalation,
     } → END
@@ -38,7 +39,11 @@ from ..agents.appointments.confirmation import confirmation_node
 from ..agents.appointments.reservation_propose import reservation_propose_node
 from ..agents.escalation import escalation_node
 from ..agents.faq_response import faq_response_node
+from ..agents.greeting_response import greeting_response_node, has_contact_name
+from ..agents.name_capture import name_capture_node
+from ..agents.query_normalizer import query_normalizer_node
 from ..agents.triage import triage_node
+from .shared_routing import should_capture_name
 from .state import AgentState
 
 
@@ -48,6 +53,8 @@ def _route_from_triage(
     "appointment_collect",
     "appointment_cancel",
     "appointment_reschedule",
+    "greeting_response",
+    "name_capture",
     "faq_response",
     "escalation",
     "__end__",
@@ -64,15 +71,32 @@ def _route_from_triage(
     if booking_intent == "reschedule":
         return "appointment_reschedule"
 
-    if intent == "booking":
-        return "appointment_collect"
     if intent == "appointment_cancel":
         return "appointment_cancel"
-    if intent == "appointment_reschedule":
-        return "appointment_reschedule"
     if intent == "escalation":
         return "escalation"
+    # New users introduce themselves before a fresh flow starts; urgent
+    # intents (cancel, escalation — above) and in-progress flows skip it.
+    if should_capture_name(state, intent):
+        return "name_capture"
+
+    if intent == "booking":
+        return "appointment_collect"
+    if intent == "appointment_reschedule":
+        return "appointment_reschedule"
+    if intent == "greeting" and has_contact_name(state):
+        return "greeting_response"
     return "faq_response"
+
+
+def _route_from_name_capture(state: AgentState):
+    """End when the node already replied; otherwise answer the request that
+    came with the refusal/deferral in this same turn. Cannot loop back: the
+    node always latches a name or a deferral before this router runs."""
+    if state.get("name_capture_reply_sent"):
+        return END
+    route = _route_from_triage(state)
+    return "faq_response" if route == "name_capture" else route
 
 
 def _route_from_appointment_collect(
@@ -136,10 +160,14 @@ def build_appointments_graph(checkpointer):
     graph.add_node("appointment_cancel", appointment_cancel_node)
     graph.add_node("appointment_reschedule", appointment_reschedule_node)
     graph.add_node("reschedule_execute", reschedule_execute_node)
+    graph.add_node("greeting_response", greeting_response_node)
+    graph.add_node("name_capture", name_capture_node)
     graph.add_node("faq_response", faq_response_node)
     graph.add_node("escalation", escalation_node)
 
-    graph.add_edge(START, "triage")
+    graph.add_node("query_normalizer", query_normalizer_node)
+    graph.add_edge(START, "query_normalizer")
+    graph.add_edge("query_normalizer", "triage")
     graph.add_conditional_edges(
         "triage",
         _route_from_triage,
@@ -147,6 +175,21 @@ def build_appointments_graph(checkpointer):
             "appointment_collect": "appointment_collect",
             "appointment_cancel": "appointment_cancel",
             "appointment_reschedule": "appointment_reschedule",
+            "greeting_response": "greeting_response",
+            "name_capture": "name_capture",
+            "faq_response": "faq_response",
+            "escalation": "escalation",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "name_capture",
+        _route_from_name_capture,
+        {
+            "appointment_collect": "appointment_collect",
+            "appointment_cancel": "appointment_cancel",
+            "appointment_reschedule": "appointment_reschedule",
+            "greeting_response": "greeting_response",
             "faq_response": "faq_response",
             "escalation": "escalation",
             END: END,
@@ -190,6 +233,7 @@ def build_appointments_graph(checkpointer):
     )
 
     graph.add_edge("appointment_cancel", END)
+    graph.add_edge("greeting_response", END)
     graph.add_edge("faq_response", END)
     graph.add_edge("escalation", END)
 

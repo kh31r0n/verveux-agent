@@ -9,7 +9,7 @@ from ..llm import resolve_api_key
 from ..providers.openai import OpenAIProvider
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
-from .utils import language_instruction
+from .utils import language_instruction, latest_user_text
 
 logger = structlog.get_logger(__name__)
 
@@ -42,13 +42,9 @@ async def rag_node(
         metadata={"thread_id": thread_id, "node": "rag"},
     )
 
-    # Extract the latest user question
-    user_question = ""
-    for msg in reversed(state["messages"]):
-        role = getattr(msg, "type", None)
-        if role == "human" or (hasattr(msg, "role") and msg.role == "user"):
-            user_question = msg.content if hasattr(msg, "content") else str(msg)
-            break
+    # Extract the user's current turn — all trailing human messages joined,
+    # since users often split one question across rapid WhatsApp messages.
+    user_question = latest_user_text(state)
     if not user_question:
         user_question = state["messages"][-1].content if state["messages"] else ""
 

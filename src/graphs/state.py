@@ -4,7 +4,6 @@ from typing import Annotated, List, Optional
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-from ..schemas.intent import StructuredIntent
 from ..usage import InvocationUsage
 
 
@@ -46,7 +45,12 @@ class AgentState(TypedDict):
 
     # ── Triage ─────────────────────────────────────────────────────────
     intent: str              # "sales" | "tracking" | "complaint" | "faq"
-    structured_intent: Optional[StructuredIntent]
+    # StructuredIntent serialized via model_dump(mode="json") — checkpoints
+    # must only carry JSON-native values so LangGraph can deserialize them
+    # without allow-listing custom Python classes. Legacy checkpoints written
+    # before 2026-07 may still yield StructuredIntent instances (allow-listed
+    # in main.py); readers handle both shapes.
+    structured_intent: Optional[dict]
 
     # ── Sales — explicit phase machine ─────────────────────────────────
     #
@@ -171,10 +175,43 @@ class AgentState(TypedDict):
     # stale attachments don't bleed across turns. Camila escalates to
     # human as soon as this list is non-empty.
     attachments: list
-    # Latched True once the contact's name has been parsed and persisted
-    # to the backend by name_capture. Prevents the graph from re-asking.
+    # LEGACY latch (camila-only, superseded by `name_captured` below).
+    # Honoured read-only by shared_routing.has_name so existing camila
+    # checkpoints never re-ask; new captures set both flags.
     school_name_captured: bool
+
+    # ── Name capture (generic, all graphs) ─────────────────────────────
+    # Latched once a name is confirmed persisted by the backend (or adopted
+    # from a MANUAL human-edited name on applied=false). NOT set on backend
+    # HTTP failure — next turn the backend snapshot stays authoritative.
+    name_captured: bool
+    # Extraction attempts without success this thread; reaching
+    # MAX_NAME_CAPTURE_ATTEMPTS triggers an implicit deferral so the agent
+    # never nags indefinitely.
+    name_capture_attempts: int
+    # Local mirror of Contact.nameCaptureDeferredAt, set when the user
+    # declines. `user_context.name_capture_deferred` (backend snapshot,
+    # re-sent every turn with window expiry applied) is authoritative on
+    # subsequent turns.
+    name_capture_deferred: bool
+    # Per-turn flag ALWAYS written by name_capture_node: True → the node
+    # already replied (ask or greeting), end the turn; False → continue to
+    # the graph's normal intent routing in the same turn.
+    name_capture_reply_sent: bool
     # Free-text reason recorded when handoff runs; mirrors the value sent
     # to /internal/conversations/:id/handoff so the audit trail stays
     # consistent between graph state and the backend Incident record.
     handoff_reason: Optional[str]
+
+    # ── Query normalization (per-turn; sole writer: query_normalizer) ──
+    # Snapshot of the user's turn text before any typo correction. Stamped
+    # every turn by query_normalizer_node. Readers must use .get() — old
+    # checkpoints (and turns where the node was bypassed) lack the key.
+    original_text: Optional[str]
+    # Write-once provenance for the turn's normalization decision. Shape:
+    #   {enabled: bool, model: str|None, confidence: float|None,
+    #    changed_meaning_risk: "LOW"|"MEDIUM"|"HIGH"|None, reason: str,
+    #    applied: bool, corrected_text: str|None}
+    # JSON-native values only (checkpoint rule). None = node did not run
+    # (legacy checkpoint). Downstream nodes treat this as read-only.
+    normalization: Optional[dict]

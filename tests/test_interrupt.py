@@ -43,6 +43,7 @@ class TestSalesFlow:
                 {
                     "messages": [HumanMessage(content="Quiero hacer un pedido")],
                     "thread_id": "test-user:sales-thread-1",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",
@@ -81,6 +82,7 @@ class TestSalesFlow:
                 {
                     "messages": [HumanMessage(content="2 camisetas azules")],
                     "thread_id": "test-user:sales-thread-2",
+                    "user_context": {"name": "Ana"},
                     "intent": "sales",
                     "sales_step": 1,
                 },
@@ -151,6 +153,7 @@ class TestSalesFlow:
                 {
                     "messages": [HumanMessage(content="Quiero comprar camisetas")],
                     "thread_id": "test-user:sales-thread-3",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",
@@ -197,6 +200,7 @@ class TestSalesFlow:
                 {
                     "messages": [HumanMessage(content="¿Dónde está mi pedido ORD-123?")],
                     "thread_id": "test-user:tracking-thread-1",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",
@@ -272,6 +276,7 @@ class TestSalesFlow:
                 {
                     "messages": [HumanMessage(content="Hola")],
                     "thread_id": "test-user:sales-thread-4",
+                    "user_context": {"name": "Ana"},
                 },
                 config=config,
                 stream_mode="updates",

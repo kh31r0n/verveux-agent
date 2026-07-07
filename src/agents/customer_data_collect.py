@@ -41,7 +41,7 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService
 from ..usage import make_usage_record
-from .utils import format_user_context, language_instruction, resolve_persona
+from .utils import format_user_context, language_instruction, latest_user_text, resolve_persona
 
 logger = structlog.get_logger(__name__)
 
@@ -172,10 +172,14 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
     turn_usage: list = []
 
     # ── Extract fields from user message ─────────────────────────────────────
+    # The whole trailing burst of user messages — delivery data often arrives
+    # split across several rapid WhatsApp messages (name, then address, ...).
+    user_turn_text = latest_user_text(state)
+
     if has_new_message:
         extraction_messages = [
             {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": state["messages"][-1].content},
+            {"role": "user", "content": user_turn_text},
         ]
 
         extraction_gen = trace.generation(
@@ -256,7 +260,7 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         {
             "role": "user",
             "content": (
-                state["messages"][-1].content
+                user_turn_text
                 if has_new_message
                 else "Continuar con los datos de entrega"
             ),

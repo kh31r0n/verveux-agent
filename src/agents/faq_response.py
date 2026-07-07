@@ -144,8 +144,23 @@ async def faq_response_node(
         faqs_injected=len(faqs),
     )
 
+    # Every FAQ injected into the prompt counts as "used" for analytics.
+    # Ids are passed through from the backend payload verbatim — never
+    # invented — so NestJS can log usage by stable id instead of matching
+    # question text against LLM output.
+    faq_used = [
+        {
+            "id": faq.get("id"),
+            "question": faq.get("question", ""),
+            "confidence": faq.get("score", 0) or 0,
+        }
+        for faq in faqs
+        if faq.get("id") or faq.get("question")
+    ]
+
     return {
         "messages": [AIMessage(content=full_response)],
+        "faq_used": faq_used or None,
         "turn_usage": [
             make_usage_record(node="faq_response", provider=provider, model=model)
         ],

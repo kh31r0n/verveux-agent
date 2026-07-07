@@ -56,6 +56,20 @@ async def checkout_cart(contact_id: str, conversation_id: str | None = None) -> 
     return await _post("/api/v1/internal/orders/checkout", json=body)
 
 
+async def search_faqs(conversation_id: str, query: str, limit: int = 5) -> list:
+    """GET /internal/faqs/search — conversation-scoped FAQ retrieval.
+
+    Used by query_normalizer to re-run retrieval with a typo-corrected query.
+    The backend resolves the agentCodeName from the conversation snapshot.
+    Returns [{id, question, answer, category, score}]; [] on non-list.
+    """
+    data = await _get(
+        "/api/v1/internal/faqs/search",
+        params={"conversationId": conversation_id, "query": query, "limit": limit},
+    )
+    return data if isinstance(data, list) else []
+
+
 async def fetch_agent_credentials(tenant_id: str) -> dict:
     """
     GET /api/v1/internal/agent/credentials?tenantId=...
@@ -93,11 +107,23 @@ async def fetch_in_use_code_names() -> list[str]:
 
 async def update_contact_name(contact_id: str, name: str, tenant_id: str) -> dict:
     """POST /internal/contacts/:contactId/name — persist the captured contact
-    name (camila's name_capture node). Backend writes Contact.customName and
-    emits a realtime contact:updated event."""
+    name (name_capture node, all graphs). Backend sanitizes, writes
+    Contact.customName (unless a human set it: nameSource=MANUAL) and emits a
+    realtime contact:updated event. Response: {ok, applied, name, contactId} —
+    applied=false means a MANUAL name won; adopt `name` from the response."""
     return await _post(
         f"/api/v1/internal/contacts/{contact_id}/name",
         json={"name": name, "tenantId": tenant_id},
+    )
+
+
+async def defer_contact_name_capture(contact_id: str, tenant_id: str) -> dict:
+    """POST /internal/contacts/:contactId/name-capture/defer — the customer
+    declined to give their name. Backend stamps Contact.nameCaptureDeferredAt
+    so no graph re-asks until the deferral window expires."""
+    return await _post(
+        f"/api/v1/internal/contacts/{contact_id}/name-capture/defer",
+        json={"tenantId": tenant_id},
     )
 
 

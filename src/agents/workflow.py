@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, interrupt
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction
@@ -84,7 +85,7 @@ async def workflow_node(
     )
 
     try:
-        decision = json.loads(full_response.strip())
+        decision = json.loads(strip_json_fences(full_response))
     except json.JSONDecodeError:
         logger.warning("workflow_json_parse_failed", thread_id=thread_id)
         error_msg = AIMessage(content="I was unable to determine the appropriate workflow for your request.")

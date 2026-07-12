@@ -8,6 +8,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
@@ -99,10 +100,10 @@ async def booking_collect_node(
         gen.end(output=extracted_text)
 
         try:
-            extracted = json.loads(extracted_text)
+            extracted = json.loads(strip_json_fences(extracted_text))
             booking_data.update(extracted)
         except (json.JSONDecodeError, TypeError):
-            pass
+            logger.warning("booking_collect_extraction_parse_failed", raw=extracted_text[:200])
 
     # ── Stage 2: Check completion ────────────────────────────────────────────
     collected = [f for f in _REQUIRED_FIELDS if booking_data.get(f)]

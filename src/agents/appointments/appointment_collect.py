@@ -13,6 +13,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from ...graphs.state import AgentState
+from ...json_utils import strip_json_fences
 from ...providers.registry import get_provider, resolve_model
 from ...observability import record_node_invocation
 from ...usage import make_usage_record
@@ -102,6 +103,25 @@ def _last_user_message(state: AgentState) -> str:
     return ""
 
 
+def _autoselect_sole_type(
+    types: list[dict], appointment_type_id: str | None
+) -> str | None:
+    """Single-service tenants: adopt the only configured type.
+
+    The extraction stage sees only the user's latest message, so a bare
+    confirmation ("sí, agéndala") to a one-option offer can't resolve a type.
+    Without a structurally selected type ``booking_complete`` stays False and
+    the turn ends silently — even though the conversational reply (which does
+    see history) confidently promised to search availability. Auto-selecting
+    the sole type closes that gap.
+    """
+    if appointment_type_id:
+        return appointment_type_id
+    if len(types) == 1:
+        return types[0].get("id")
+    return None
+
+
 async def appointment_collect_node(
     state: AgentState,
     config: RunnableConfig,
@@ -120,15 +140,22 @@ async def appointment_collect_node(
     except Exception as exc:
         logger.warning("appointment_types_fetch_failed", error=str(exc))
 
-    appointment_type_id = state.get("appointment_type_id")
-    selected_type: dict | None = None
-    if appointment_type_id:
-        selected_type = next(
-            (t for t in types if t.get("id") == appointment_type_id), None
-        )
+    prior_type_id = state.get("appointment_type_id")
+    appointment_type_id = _autoselect_sole_type(types, prior_type_id)
+    selected_type: dict | None = (
+        next((t for t in types if t.get("id") == appointment_type_id), None)
+        if appointment_type_id
+        else None
+    )
 
     required_fields: list[dict] = state.get("required_customer_fields") or []
     collected: dict = dict(state.get("collected_customer_data") or {})
+
+    # A freshly auto-selected sole type carries no prior field state — load its
+    # required fields so the completion check below is accurate.
+    if selected_type and appointment_type_id != prior_type_id:
+        required_fields = selected_type.get("requiredCustomerFields") or []
+        collected = {}
 
     # ── Stage 1: extraction from the user's latest message ────────────────────
     last_user_msg = _last_user_message(state)
@@ -149,10 +176,22 @@ async def appointment_collect_node(
             required_fields=_format_required_fields(required_fields),
             collected=_format_collected(collected),
         )
-        extraction_messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": last_user_msg},
+        # Include recent turns so a bare confirmation ("sí, agéndala") can be
+        # resolved against the type the assistant just offered — the extraction
+        # LLM otherwise sees only the standalone latest message.
+        recent_history = [
+            {
+                "role": "user" if getattr(m, "type", "") == "human" else "assistant",
+                "content": m.content,
+            }
+            for m in (state.get("messages") or [])[-6:-1]
+            if hasattr(m, "content") and m.content
         ]
+        extraction_messages = (
+            [{"role": "system", "content": system_content}]
+            + recent_history
+            + [{"role": "user", "content": last_user_msg}]
+        )
         extracted_text = ""
         async for chunk in provider.stream_chat(
             model=model, messages=extraction_messages
@@ -167,8 +206,9 @@ async def appointment_collect_node(
         )
 
         try:
-            parsed = json.loads(extracted_text.strip().strip("`"))
+            parsed = json.loads(strip_json_fences(extracted_text))
         except (json.JSONDecodeError, ValueError):
+            logger.warning("appointment_collect_extraction_parse_failed", raw=extracted_text[:200])
             parsed = {}
 
         new_type_id = parsed.get("appointment_type_id")

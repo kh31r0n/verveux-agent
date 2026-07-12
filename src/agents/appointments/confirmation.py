@@ -40,6 +40,7 @@ async def confirmation_node(
     chosen = state.get("chosen_slot") or {}
     customer_data = state.get("collected_customer_data") or {}
     thread_id = state.get("thread_id", "")
+    conversation_id = state.get("conversation_id", "")
 
     if not (tenant_id and contact_id and appointment_type_id and chosen):
         return {
@@ -64,6 +65,7 @@ async def confirmation_node(
             resources=resources,
             customer_data=customer_data,
             thread_id=thread_id,
+            conversation_id=conversation_id,
         )
     except HTTPStatusError as exc:
         body: dict = {}
@@ -109,7 +111,9 @@ async def confirmation_node(
 
     confirmed_msg = "Tu cita quedó CONFIRMADA. Te enviaré el recordatorio por aquí."
     try:
-        await confirm_appointment(appointment_id, tenant_id)
+        await confirm_appointment(
+            appointment_id, tenant_id, conversation_id=conversation_id
+        )
     except Exception as exc:
         # The hold succeeded but confirm failed. The hold sweeper will clear
         # the reservation in a few minutes; ask the user to retry confirming.

@@ -37,6 +37,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService
@@ -203,7 +204,7 @@ async def customer_data_collect_node(state: AgentState, config: RunnableConfig) 
         extraction_gen.end(output=extraction_raw)
 
         try:
-            extracted = json.loads(extraction_raw.strip())
+            extracted = json.loads(strip_json_fences(extraction_raw))
             if isinstance(extracted, dict):
                 order_data.update({k: v for k, v in extracted.items() if v})
         except (json.JSONDecodeError, ValueError):

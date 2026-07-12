@@ -38,13 +38,21 @@ def _state(message: str = "Hola", **overrides) -> dict:
 class _FakeProvider:
     name = "fake"
 
-    def __init__(self, verdict: dict):
+    def __init__(self, verdict: dict, render: str = ""):
         self.verdict = verdict
+        # Second+ calls are the reply-render pass. Default "" makes the node
+        # fall back to the deterministic template, so template-based assertions
+        # still hold; pass `render` to exercise the LLM-rendered path.
+        self.render = render
+        self._calls = 0
         self.last_usage = UsageInfo(input_tokens=10, output_tokens=5)
 
     def stream_chat(self, *, model: str, messages: list[dict]):
+        self._calls += 1
+        is_extraction = self._calls == 1
+
         async def _gen():
-            yield json.dumps(self.verdict)
+            yield json.dumps(self.verdict) if is_extraction else self.render
 
         return _gen()
 
@@ -54,9 +62,15 @@ def _writer_recorder():
     return events, (lambda evt: events.append(evt))
 
 
-async def _run(state: dict, verdict: dict, **client_mocks) -> tuple[dict, list[dict]]:
-    """Run the node with a canned extraction verdict and mocked backend."""
-    provider = _FakeProvider(verdict)
+async def _run(
+    state: dict, verdict: dict, render: str = "", **client_mocks
+) -> tuple[dict, list[dict]]:
+    """Run the node with a canned extraction verdict and mocked backend.
+
+    `render` is what the reply-render LLM pass emits; "" (default) forces the
+    deterministic template fallback.
+    """
+    provider = _FakeProvider(verdict, render=render)
     events, write = _writer_recorder()
     update = client_mocks.get(
         "update",
@@ -244,6 +258,38 @@ class TestLanguageAndPersona:
             result = await name_capture_node(_state("Hola"), {"configurable": {}})
         assert result["name_capture_reply_sent"] is True
         assert result["name_capture_attempts"] == 1
+
+
+class TestLlmRendered:
+    async def test_ask_uses_llm_rendered_text(self):
+        result, events = await _run(
+            _state("Hola"),
+            {"found": False, "name": ""},
+            render="¡Hola! Soy Camila 👋 ¿Cómo te llamas?",
+        )
+        # The rendered text is emitted verbatim, not the deterministic template.
+        assert events[0]["content"] == "¡Hola! Soy Camila 👋 ¿Cómo te llamas?"
+        # extraction + render → two usage records.
+        assert len(result["turn_usage"]) == 2
+
+    async def test_ack_uses_llm_rendered_text(self):
+        result, events = await _run(
+            _state("Soy Ana"),
+            {"found": True, "name": "Ana"},
+            render="¡Qué gusto, Ana! ¿En qué te ayudo?",
+        )
+        assert events[0]["content"] == "¡Qué gusto, Ana! ¿En qué te ayudo?"
+        assert len(result["turn_usage"]) == 2
+
+    async def test_refusal_uses_llm_rendered_text(self):
+        result, events = await _run(
+            _state("prefiero no decirlo"),
+            {"found": False, "name": "", "refused": True},
+            render="¡Claro, sin problema! ¿En qué te ayudo?",
+        )
+        assert events[0]["content"] == "¡Claro, sin problema! ¿En qué te ayudo?"
+        assert result["name_capture_deferred"] is True
+        assert len(result["turn_usage"]) == 2
 
 
 async def _bad_json_gen():

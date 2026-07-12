@@ -30,14 +30,18 @@ async def upsert_cart_item(
     product_id: str,
     quantity: int,
     conversation_id: str | None = None,
+    notes: str | None = None,
 ) -> dict:
     """POST /internal/carts/:contactId/items — add/update item (quantity=0 removes it)."""
     params = {}
     if conversation_id:
         params["conversationId"] = conversation_id
+    body: dict = {"productId": product_id, "quantity": quantity}
+    if notes:
+        body["notes"] = notes
     return await _post(
         f"/api/v1/internal/carts/{contact_id}/items",
-        json={"productId": product_id, "quantity": quantity},
+        json=body,
         params=params,
     )
 
@@ -48,11 +52,21 @@ async def get_order_history(contact_id: str, limit: int = 5) -> list:
     return data if isinstance(data, list) else []
 
 
-async def checkout_cart(contact_id: str, conversation_id: str | None = None) -> dict:
-    """POST /internal/orders/checkout — converts active cart into an order."""
+async def checkout_cart(
+    contact_id: str,
+    conversation_id: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """POST /internal/orders/checkout — converts active cart into an order.
+
+    `metadata` is persisted verbatim on Order.metadata (restaurant orders send
+    serviceType / deliveryAddress / specialNotes).
+    """
     body: dict = {"contactId": contact_id}
     if conversation_id:
         body["conversationId"] = conversation_id
+    if metadata:
+        body["metadata"] = metadata
     return await _post("/api/v1/internal/orders/checkout", json=body)
 
 
@@ -201,12 +215,16 @@ async def create_appointment_hold(
     location_id: str | None = None,
     hold_minutes: int = 10,
     thread_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """POST /internal/appointments/holds — create a PENDING_HOLD appointment.
 
     The backend enforces double-booking via the EXCLUDE constraint, so this
     call may raise HTTP 409 with ``code: SLOT_TAKEN``. The caller is
     responsible for catching that and offering an alternative slot.
+
+    ``conversation_id`` links the resulting audit event to the originating
+    WhatsApp conversation (BD-3) so the CRM can deep-link the booking.
     """
     body: dict = {
         "tenantId": tenant_id,
@@ -223,14 +241,23 @@ async def create_appointment_hold(
         body["customerData"] = customer_data
     if thread_id:
         body["threadId"] = thread_id
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post("/api/v1/internal/appointments/holds", json=body)
 
 
-async def confirm_appointment(appointment_id: str, tenant_id: str) -> dict:
+async def confirm_appointment(
+    appointment_id: str,
+    tenant_id: str,
+    conversation_id: str | None = None,
+) -> dict:
     """POST /internal/appointments/:id/confirm — promote hold to CONFIRMED."""
+    body: dict = {"tenantId": tenant_id}
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post(
         f"/api/v1/internal/appointments/{appointment_id}/confirm",
-        json={"tenantId": tenant_id},
+        json=body,
     )
 
 
@@ -238,11 +265,14 @@ async def cancel_appointment(
     appointment_id: str,
     tenant_id: str,
     reason: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """POST /internal/appointments/:id/cancel — cancel by id."""
     body: dict = {"tenantId": tenant_id}
     if reason:
         body["reason"] = reason
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post(
         f"/api/v1/internal/appointments/{appointment_id}/cancel", json=body
     )
@@ -254,16 +284,20 @@ async def reschedule_appointment(
     starts_at_iso: str,
     ends_at_iso: str,
     resources: list[dict],
+    conversation_id: str | None = None,
 ) -> dict:
     """POST /internal/appointments/:id/reschedule — move to a new slot."""
+    body: dict = {
+        "tenantId": tenant_id,
+        "startsAt": starts_at_iso,
+        "endsAt": ends_at_iso,
+        "resources": resources,
+    }
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post(
         f"/api/v1/internal/appointments/{appointment_id}/reschedule",
-        json={
-            "tenantId": tenant_id,
-            "startsAt": starts_at_iso,
-            "endsAt": ends_at_iso,
-            "resources": resources,
-        },
+        json=body,
     )
 
 
@@ -284,6 +318,15 @@ async def list_active_appointments_for_contact(
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 
+def _error_body(exc: HTTPStatusError) -> str:
+    """Truncated response body for logging — surfaces backend error messages
+    (e.g. 'Insufficient stock …') that the bare status code hides."""
+    try:
+        return exc.response.text[:500]
+    except Exception:
+        return ""
+
+
 async def _get(path: str, params: dict | None = None) -> dict | list:
     url = f"{_BASE}{path}"
     try:
@@ -292,7 +335,12 @@ async def _get(path: str, params: dict | None = None) -> dict | list:
             resp.raise_for_status()
             return resp.json()
     except HTTPStatusError as exc:
-        logger.error("backend_get_error", path=path, status=exc.response.status_code)
+        logger.error(
+            "backend_get_error",
+            path=path,
+            status=exc.response.status_code,
+            body=_error_body(exc),
+        )
         raise
     except RequestError as exc:
         logger.error("backend_get_network_error", path=path, error=str(exc))
@@ -307,7 +355,12 @@ async def _post(path: str, json: dict | None = None, params: dict | None = None)
             resp.raise_for_status()
             return resp.json()
     except HTTPStatusError as exc:
-        logger.error("backend_post_error", path=path, status=exc.response.status_code)
+        logger.error(
+            "backend_post_error",
+            path=path,
+            status=exc.response.status_code,
+            body=_error_body(exc),
+        )
         raise
     except RequestError as exc:
         logger.error("backend_post_network_error", path=path, error=str(exc))

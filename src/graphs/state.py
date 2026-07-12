@@ -110,8 +110,20 @@ class AgentState(TypedDict):
     admissions_complete: bool
 
     # ── Restaurant flow ───────────────────────────────────────────────
+    # restaurant_order_data holds ONLY order-level fields collected in
+    # conversation (service_type, delivery_address, special_notes) — the
+    # items themselves live in `cart` (shared with the sales flow) so the
+    # backend cart/checkout machinery works unchanged.
     restaurant_order_data: dict
+    # True when cart is non-empty + service_type set (+ address if delivery).
     restaurant_order_complete: bool
+    # "collect" | "confirmation". The summary node latches "confirmation"
+    # so the next turn resumes at restaurant_confirm instead of re-collecting.
+    # Readers must use .get() — old checkpoints lack the key.
+    restaurant_phase: str
+    # Set by restaurant_confirm on a clear yes; routes the same turn to
+    # execute (checkout). Reset when a new order starts post-checkout.
+    restaurant_order_confirmed: bool
 
     # ── Appointments flow ─────────────────────────────────────────────
     # Legacy fields (kept for backward compat with existing checkpoints

@@ -31,7 +31,8 @@ from .identity_validator import (
     detect_identity_conflict_texts,
     extract_human_texts,
 )
-from .triage import _build_faq_hints, _strip_json_fences
+from ..json_utils import strip_json_fences
+from .triage import _build_faq_hints
 from .utils import format_contact_tags, format_user_context, resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -186,7 +187,7 @@ async def camila_triage_node(
     structured: StructuredIntent
     intent: IntentType
     try:
-        parsed_json = json.loads(_strip_json_fences(full_response))
+        parsed_json = json.loads(strip_json_fences(full_response))
         structured = StructuredIntent.model_validate(parsed_json)
         intent = structured.intent
     except (ValidationError, json.JSONDecodeError) as exc:

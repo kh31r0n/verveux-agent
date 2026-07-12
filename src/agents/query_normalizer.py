@@ -27,8 +27,8 @@ from ..graphs.state import AgentState
 from ..observability import query_normalizations_total, record_node_invocation
 from ..providers.registry import get_provider, resolve_model
 from ..usage import make_usage_record
+from ..json_utils import strip_json_fences
 from . import backend_client
-from .triage import _strip_json_fences
 from .utils import latest_user_text, resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -131,7 +131,7 @@ async def query_normalizer_node(
     outcome: str
     applied = False
     try:
-        parsed = json.loads(_strip_json_fences(full_response))
+        parsed = json.loads(strip_json_fences(full_response))
         corrected = str(parsed.get("corrected_text") or "").strip()
         confidence = float(parsed.get("confidence") or 0.0)
         risk = str(parsed.get("changed_meaning_risk") or "HIGH").upper()

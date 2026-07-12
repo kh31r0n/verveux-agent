@@ -22,12 +22,26 @@ async def execute_node(
 
     write = get_stream_writer()
 
-    if intent == "sales" and contact_id:
+    if intent in ("sales", "order") and contact_id:
+        # Restaurant orders carry order-level context onto Order.metadata;
+        # helena sends none (backward compatible).
+        metadata = None
+        if intent == "order":
+            rod = state.get("restaurant_order_data") or {}
+            metadata = {
+                "source": "restaurant_agent",
+                "serviceType": rod.get("service_type"),
+                "deliveryAddress": rod.get("delivery_address"),
+                "specialNotes": rod.get("special_notes"),
+            }
+            metadata = {k: v for k, v in metadata.items() if v} or None
+
         # Checkout the backend cart into an immutable order
         try:
             order = await checkout_cart(
                 contact_id=contact_id,
                 conversation_id=conversation_id or None,
+                metadata=metadata,
             )
             logger.info(
                 "cart_checked_out",

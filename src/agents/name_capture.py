@@ -42,9 +42,15 @@ from .greeting_response import (
     _AGENT_PROFILES,
     _GENERIC_ROLES,
     _TYPE_ROLE_FALLBACK,
+    _render_prompt,
 )
-from .triage import _strip_json_fences
-from .utils import latest_user_text, resolve_persona
+from ..json_utils import strip_json_fences
+from .utils import (
+    language_instruction,
+    latest_user_text,
+    resolve_persona,
+    resolve_prompt,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -91,6 +97,88 @@ _REFUSAL_ACK_TEMPLATES = {
     "en": "No problem! How can I help you today?",
     "pt": "Sem problema! Como posso te ajudar hoje?",
 }
+
+# Hardcoded fallbacks for the editable NAME_CAPTURE_* prompts — mirror the
+# seeded defaults in verveux-backend/src/ai-prompts/ai-prompts.constants.ts.
+# Used only when the request carries no prompt payload for the key at all;
+# the LLM output (or, on failure, the deterministic templates above) is what
+# actually reaches the customer.
+_ASK_SYSTEM_PROMPT = """Eres {persona}. Atiendes por WhatsApp y es la primera vez que hablas con este usuario; aún no conoces su nombre.
+
+Tu única tarea: saludar brevemente y pedirle su nombre de forma amable.
+
+Reglas:
+- Preséntate como {persona} en una frase.
+- Pídele su nombre para poder atenderle mejor.
+- Máximo 2 líneas. Puedes usar un emoji.
+- NO pidas más datos ni inicies ningún flujo; solo saluda y pide el nombre.
+- {language_rule}"""
+
+_ACK_SYSTEM_PROMPT = """Eres {persona}. El usuario acaba de decirte su nombre: {name}.
+
+Tu única tarea: agradecer y saludar al usuario por su nombre, y ofrecer ayuda.
+
+Reglas:
+- Salúdalo por su nombre ({name}) de forma cálida.
+- Ofrece tu ayuda en una frase.
+- Máximo 2 líneas. Puedes usar un emoji.
+- {language_rule}"""
+
+_REFUSAL_SYSTEM_PROMPT = """Eres {persona}. El usuario prefirió no compartir su nombre.
+
+Tu única tarea: responder con amabilidad, sin insistir, y ofrecer ayuda.
+
+Reglas:
+- No vuelvas a pedir el nombre.
+- Ofrece tu ayuda en una frase.
+- Máximo 2 líneas. Puedes usar un emoji.
+- {language_rule}"""
+
+
+async def _render_llm(
+    config: RunnableConfig,
+    prompt_key: str,
+    fallback_system: str,
+    values: dict,
+    user_content: str,
+    fallback_text: str,
+    thread_id: str,
+) -> tuple[str, list]:
+    """LLM-render one name_capture line from its editable prompt.
+
+    Mirrors greeting_response: resolve the tenant prompt (or the hardcoded
+    fallback), substitute {persona}/{name}/{language_rule}, and render via one
+    LLM call. Any failure or empty output degrades to `fallback_text` (the
+    deterministic template) so the customer always gets a reply. Returns
+    (text, turn_usage) — turn_usage is empty when the LLM produced nothing.
+    """
+    template = resolve_prompt(config, prompt_key, fallback_system)
+    system_content = _render_prompt(template, values)
+    try:
+        provider = get_provider(config)
+        model = resolve_model(config)
+        text = ""
+        async for chunk in provider.stream_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
+            ],
+        ):
+            text += chunk
+        text = text.strip()
+        if text:
+            return text, [
+                make_usage_record(node="name_capture", provider=provider, model=model)
+            ]
+    except Exception as exc:
+        logger.warning(
+            "name_capture_render_failed",
+            thread_id=thread_id,
+            prompt_key=prompt_key,
+            error=str(exc),
+        )
+    return fallback_text, []
 
 
 def _resolve_lang(state: AgentState) -> str:
@@ -150,6 +238,15 @@ async def name_capture_node(
     # greeting ("Hola" / "Soy Patricia Hernández").
     user_text = latest_user_text(state)
 
+    # Shared substitution values for the editable NAME_CAPTURE_* prompts; `name`
+    # is filled per-branch (only the acknowledgment knows it).
+    base_values = {
+        "persona": persona,
+        "role": role,
+        "name": "",
+        "language_rule": language_instruction(lang),
+    }
+
     provider = get_provider(config)
     model = resolve_model(config)
 
@@ -172,7 +269,7 @@ async def name_capture_node(
     refused = False
     has_question = False
     try:
-        parsed = json.loads(_strip_json_fences(raw))
+        parsed = json.loads(strip_json_fences(raw))
         found = bool(parsed.get("found", False))
         name = str(parsed.get("name", "")).strip()
         refused = bool(parsed.get("refused", False))
@@ -190,13 +287,21 @@ async def name_capture_node(
         await _defer_on_backend(state, thread_id)
         if refused and not has_question:
             # Nothing else to answer — acknowledge and end the turn.
-            ack = _REFUSAL_ACK_TEMPLATES[lang]
+            ack, render_usage = await _render_llm(
+                config,
+                "NAME_CAPTURE_REFUSAL",
+                _REFUSAL_SYSTEM_PROMPT,
+                base_values,
+                user_text or "Prefiero no dar mi nombre",
+                _REFUSAL_ACK_TEMPLATES[lang],
+                thread_id,
+            )
             write({"type": "token", "content": ack})
             return {
                 "messages": [AIMessage(content=ack)],
                 "name_capture_deferred": True,
                 "name_capture_reply_sent": True,
-                "turn_usage": [usage_record],
+                "turn_usage": [usage_record, *render_usage],
             }
         # The message carries an actual request (or wasn't a refusal at all,
         # just a second miss) — fall through so the graph answers it now.
@@ -208,14 +313,22 @@ async def name_capture_node(
 
     # ── No name yet, first attempt → ask and end the turn ──────────────────
     if not (found and name):
-        ask = _ASK_TEMPLATES[lang].format(persona=persona, role=role)
+        ask, render_usage = await _render_llm(
+            config,
+            "NAME_CAPTURE_ASK",
+            _ASK_SYSTEM_PROMPT,
+            base_values,
+            user_text or "Hola",
+            _ASK_TEMPLATES[lang].format(persona=persona, role=role),
+            thread_id,
+        )
         write({"type": "token", "content": ask})
         logger.info("name_capture_asked", thread_id=thread_id, attempt=attempts + 1)
         return {
             "messages": [AIMessage(content=ask)],
             "name_capture_attempts": attempts + 1,
             "name_capture_reply_sent": True,
-            "turn_usage": [usage_record],
+            "turn_usage": [usage_record, *render_usage],
         }
 
     # ── Found → persist; the API result drives state ────────────────────────
@@ -251,10 +364,22 @@ async def name_capture_node(
     updated_context = dict(state.get("user_context") or {})
     updated_context["name"] = name
 
+    ack_usage: list = []
     if has_question:
+        # Short prefix only — the downstream node produces the substantive
+        # reply and the backend concatenates token events. Kept deterministic
+        # so the LLM can't prepend a full greeting ahead of that answer.
         greeting = _GREETING_PREFIX_TEMPLATES[lang].format(name=name)
     else:
-        greeting = _GREETING_TEMPLATES[lang].format(name=name)
+        greeting, ack_usage = await _render_llm(
+            config,
+            "NAME_CAPTURE_ACK",
+            _ACK_SYSTEM_PROMPT,
+            {**base_values, "name": name},
+            user_text or f"Soy {name}",
+            _GREETING_TEMPLATES[lang].format(name=name),
+            thread_id,
+        )
     write({"type": "token", "content": greeting})
 
     logger.info(
@@ -271,7 +396,7 @@ async def name_capture_node(
         # Continue routing when the same message carries a real request so
         # the downstream node answers it in this turn.
         "name_capture_reply_sent": not has_question,
-        "turn_usage": [usage_record],
+        "turn_usage": [usage_record, *ack_usage],
     }
     if persisted:
         # Latch only on confirmed persistence (or manual adoption): an HTTP

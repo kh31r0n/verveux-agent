@@ -57,6 +57,7 @@ async def appointment_cancel_node(
     record_node_invocation("appointment_cancel")
 
     tenant_id = state.get("tenant_id", "")
+    conversation_id = state.get("conversation_id", "")
     contact_id = state.get("contact_id", "")
 
     try:
@@ -106,7 +107,12 @@ async def appointment_cancel_node(
                 }
 
     try:
-        await cancel_appointment(target_id, tenant_id, reason="cancelled-by-customer")
+        await cancel_appointment(
+            target_id,
+            tenant_id,
+            reason="cancelled-by-customer",
+            conversation_id=conversation_id,
+        )
     except HTTPStatusError as exc:
         logger.error("appointment_cancel_failed", status=exc.response.status_code)
         return {

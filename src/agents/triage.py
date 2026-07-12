@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..schemas.intent import StructuredIntent, IntentType
@@ -82,18 +83,8 @@ def _build_faq_hints(faqs: list) -> str:
     return _FAQ_HINTS_BLOCK.format(faq_lines="\n".join(lines))
 
 
-def _strip_json_fences(raw: str) -> str:
-    """Remove markdown code fences that Gemini adds around JSON responses.
-
-    Handles both ```json ... ``` and ``` ... ``` variants.
-    """
-    s = raw.strip()
-    if s.startswith("```"):
-        # Drop the opening fence line (```json or ```)
-        s = s.split("\n", 1)[-1]
-        # Drop the closing fence
-        s = s.rsplit("```", 1)[0]
-    return s.strip()
+# Moved to src/json_utils.py; alias kept for existing importers.
+_strip_json_fences = strip_json_fences
 
 
 async def triage_node(
@@ -118,6 +109,17 @@ async def triage_node(
         state.get("intent") == "sales"
         and not state.get("execute_confirmed", False)
         and bool(state.get("cart"))  # must have actual cart items, not just stale turns
+    ):
+        return {}
+
+    # Restaurant: skip re-classification while an order is actively in
+    # progress. Conservative like the sales guard: require real cart items OR
+    # the awaiting-confirmation latch — restaurant_order_data alone can be
+    # stale from an abandoned order.
+    if (
+        state.get("intent") == "order"
+        and not state.get("execute_confirmed", False)
+        and (bool(state.get("cart")) or state.get("restaurant_phase") == "confirmation")
     ):
         return {}
 
@@ -208,7 +210,7 @@ async def triage_node(
 
     try:
         # Strip markdown code fences that Gemini adds despite being told not to.
-        parsed_json = json.loads(_strip_json_fences(full_response))
+        parsed_json = json.loads(strip_json_fences(full_response))
         structured_intent = StructuredIntent.model_validate(parsed_json)
         intent = structured_intent.intent
     except (ValidationError, json.JSONDecodeError) as e:

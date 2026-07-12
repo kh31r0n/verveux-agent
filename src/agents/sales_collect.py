@@ -35,18 +35,18 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..services.cart import CartService, normalize_cart
 from ..usage import make_usage_record
 from ..services.product_resolver import ProductResolver
 from .utils import format_user_context, language_instruction, latest_user_text, resolve_persona
-from .backend_client import upsert_cart_item
+from .cart_sync import sync_full_cart_to_backend
 
 logger = structlog.get_logger(__name__)
 
 MAX_PRODUCT_TURNS = 3
-_BACKEND_SYNC_RETRIES = 2
 
 
 def _format_money(value) -> str:
@@ -112,75 +112,6 @@ Reglas:
 - NO devuelvas JSON.
 - NO confirmes el pedido en este paso; eso se hace por separado.
 """
-
-
-async def _sync_full_cart_to_backend(
-    cart: list,
-    contact_id: str,
-    conversation_id: str | None,
-    thread_id: str,
-) -> bool:
-    """
-    Sync the entire in-memory cart to the backend in one pass.
-
-    Upserts each item's final quantity. Returns True when all upserts
-    succeed, False if any fail after retries. Failures are logged but
-    never raise — the in-memory cart remains the source of truth and
-    order_summary falls back to it when the backend is empty.
-    """
-    if not contact_id or not cart:
-        return True  # nothing to sync
-
-    all_ok = True
-    for item in cart:
-        product_id = item["product_id"]
-        qty = item["qty"]
-        succeeded = False
-
-        for attempt in range(_BACKEND_SYNC_RETRIES):
-            try:
-                await upsert_cart_item(
-                    contact_id,
-                    product_id,
-                    qty,
-                    conversation_id,
-                )
-                succeeded = True
-                break
-            except Exception as exc:
-                logger.warning(
-                    "backend_cart_upsert_retry",
-                    thread_id=thread_id,
-                    product_id=product_id,
-                    qty=qty,
-                    attempt=attempt + 1,
-                    max_attempts=_BACKEND_SYNC_RETRIES,
-                    error=str(exc),
-                )
-
-        if not succeeded:
-            logger.error(
-                "backend_cart_upsert_failed",
-                thread_id=thread_id,
-                product_id=product_id,
-                qty=qty,
-            )
-            all_ok = False
-
-    if all_ok:
-        logger.info(
-            "backend_cart_sync_ok",
-            thread_id=thread_id,
-            cart_size=len(cart),
-        )
-    else:
-        logger.error(
-            "backend_cart_sync_partial_failure",
-            thread_id=thread_id,
-            cart_size=len(cart),
-        )
-
-    return all_ok
 
 
 def _compute_mentioned_product_ids(
@@ -298,7 +229,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         extraction_gen.end(output=extraction_raw)
 
         try:
-            parsed = json.loads(extraction_raw.strip())
+            parsed = json.loads(strip_json_fences(extraction_raw))
             extracted_items: list[dict] = parsed.get("items") or []
             raw_refs = parsed.get("referenced_product_names") or []
             referenced_names = [r for r in raw_refs if isinstance(r, str)]
@@ -350,7 +281,7 @@ async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
         # This avoids partial backend state from item-by-item upserts that
         # could fail independently and leave the backend inconsistent.
         if resolved_items and contact_id:
-            backend_sync_ok = await _sync_full_cart_to_backend(
+            backend_sync_ok = await sync_full_cart_to_backend(
                 cart=cart,
                 contact_id=contact_id,
                 conversation_id=conversation_id or None,

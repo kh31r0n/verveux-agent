@@ -21,6 +21,7 @@ from typing import Optional
 
 import structlog
 
+from ..json_utils import strip_json_fences
 from ..usage import make_usage_record
 
 logger = structlog.get_logger(__name__)
@@ -160,7 +161,7 @@ class ProductResolver:
                         node="product_resolver", provider=provider, model=model,
                     )
                 )
-            parsed = json.loads(raw.strip())
+            parsed = json.loads(strip_json_fences(raw))
             pid: Optional[str] = parsed.get("product_id")
             if pid:
                 p = next((x for x in self.catalog if x["product_id"] == pid), None)

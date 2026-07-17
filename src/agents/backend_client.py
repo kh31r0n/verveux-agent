@@ -10,6 +10,20 @@ from ..config import settings
 
 logger = structlog.get_logger(__name__)
 
+
+class CapabilityDisabledError(Exception):
+    """An internal endpoint returned 403 with code CAPABILITY_DISABLED — the
+    tenant disabled a capability (e.g. CATALOG) for this agent. Callers turn
+    this into the degraded reply; it is never retried and never surfaced raw to
+    the customer. Distinct from other 403s (e.g. the inquiries codeName-mismatch
+    check) which stay HTTPStatusError."""
+
+    def __init__(self, capability: str = "", path: str = ""):
+        self.capability = capability
+        self.path = path
+        super().__init__(f"capability disabled: {capability or '?'} ({path})")
+
+
 _BASE = settings.nestjs_base_url.rstrip("/")
 _HEADERS = {
     "Content-Type": "application/json",
@@ -46,9 +60,20 @@ async def upsert_cart_item(
     )
 
 
-async def get_order_history(contact_id: str, limit: int = 5) -> list:
-    """GET /internal/orders?contactId=... — returns recent orders."""
-    data = await _get("/api/v1/internal/orders", params={"contactId": contact_id, "limit": limit})
+async def get_order_history(
+    contact_id: str,
+    limit: int = 5,
+    conversation_id: str | None = None,
+) -> list:
+    """GET /internal/orders?contactId=... — returns recent orders.
+
+    ``conversation_id`` lets the backend resolve the per-agent CATALOG policy
+    from the conversation snapshot; without it the tenant-default applies. May
+    raise CapabilityDisabledError when catalog access is off (tracking flow)."""
+    params: dict = {"contactId": contact_id, "limit": limit}
+    if conversation_id:
+        params["conversationId"] = conversation_id
+    data = await _get("/api/v1/internal/orders", params=params)
     return data if isinstance(data, list) else []
 
 
@@ -139,6 +164,44 @@ async def defer_contact_name_capture(contact_id: str, tenant_id: str) -> dict:
         f"/api/v1/internal/contacts/{contact_id}/name-capture/defer",
         json={"tenantId": tenant_id},
     )
+
+
+async def submit_inquiry(
+    tenant_id: str,
+    conversation_id: str,
+    idempotency_key: str,
+    lead_data: dict,
+) -> dict:
+    """POST /internal/inquiries — persist a qualified lead (veronica).
+
+    ``idempotency_key`` is the state-backed lead_submission_id: the backend
+    holds a unique index on it, so retries after network failures (and
+    LangGraph node replays) return the original Inquiry instead of inserting
+    a duplicate.
+    """
+    body = {
+        "idempotencyKey": idempotency_key,
+        "conversationId": conversation_id,
+        "tenantId": tenant_id,
+        **{
+            k: v
+            for k, v in lead_data.items()
+            if k
+            in {
+                "fullName",
+                "email",
+                "serviceInterest",
+                "company",
+                "phoneCountryCode",
+                "phoneNumber",
+                "challenge",
+                "comments",
+                "locale",
+            }
+            and v
+        },
+    }
+    return await _post("/api/v1/internal/inquiries", json=body)
 
 
 async def request_handoff(
@@ -327,6 +390,21 @@ def _error_body(exc: HTTPStatusError) -> str:
         return ""
 
 
+def _capability_disabled(exc: HTTPStatusError) -> str | None:
+    """Return the disabled capability name if this is a CAPABILITY_DISABLED 403,
+    else None. Keyed on the body `code` — NEVER on status alone, so unrelated
+    403s (inquiries codeName mismatch) are not misclassified."""
+    if exc.response.status_code != 403:
+        return None
+    try:
+        body = exc.response.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and body.get("code") == "CAPABILITY_DISABLED":
+        return str(body.get("capability") or "")
+    return None
+
+
 async def _get(path: str, params: dict | None = None) -> dict | list:
     url = f"{_BASE}{path}"
     try:
@@ -335,6 +413,12 @@ async def _get(path: str, params: dict | None = None) -> dict | list:
             resp.raise_for_status()
             return resp.json()
     except HTTPStatusError as exc:
+        capability = _capability_disabled(exc)
+        if capability is not None:
+            logger.info(
+                "capability_block", capability=capability, source="backstop_403", path=path
+            )
+            raise CapabilityDisabledError(capability, path) from exc
         logger.error(
             "backend_get_error",
             path=path,
@@ -355,6 +439,12 @@ async def _post(path: str, json: dict | None = None, params: dict | None = None)
             resp.raise_for_status()
             return resp.json()
     except HTTPStatusError as exc:
+        capability = _capability_disabled(exc)
+        if capability is not None:
+            logger.info(
+                "capability_block", capability=capability, source="backstop_403", path=path
+            )
+            raise CapabilityDisabledError(capability, path) from exc
         logger.error(
             "backend_post_error",
             path=path,

@@ -30,6 +30,18 @@ class AgentState(TypedDict):
     tenant_id: str
     conversation_id: str
     product_catalog: list    # [{product_id, name, description, price, stock}]
+    # Tenant-admin CATALOG capability toggle, forwarded per turn by the backend.
+    # When False, nodes that read product_catalog emit the degraded instruction
+    # instead of catalog data, and cart/order backend calls 403. Absent (old
+    # checkpoints) => treated as True by catalog_allowed().
+    catalog_access_enabled: bool
+    # Business-hours flag, resolved fresh by the backend every turn from the
+    # tenant's WorkingHours schedule (TenantSettings.agentBusinessHoursEnabled;
+    # always True when the tenant hasn't opted in). When False, graphs route
+    # every non-urgent turn to faq_response, which splices the per-agent
+    # OUTSIDE_HOURS prompt. Absent (old checkpoints) => treated as True by
+    # business_hours_gate.within_business_hours().
+    within_business_hours: bool
     knowledge: Optional[List[dict]]  # Unified knowledge payload
     user_context: dict       # {name, email, phone, address}
     contact_id: str
@@ -162,6 +174,22 @@ class AgentState(TypedDict):
     # Sentinel set when the backend rejects a hold with code SLOT_TAKEN so
     # the graph can route back to availability_lookup and re-search.
     slot_conflict: bool
+
+    # ── Leads flow (veronica) ─────────────────────────────────────────
+    # Fields extracted so far, keyed like the backend DTO (fullName, email,
+    # serviceInterest, company, phoneCountryCode, phoneNumber, challenge,
+    # comments). Merged turn by turn; never trimmed by the LLM.
+    lead_data: dict
+    # True once fullName + email + serviceInterest are all present/valid.
+    lead_collection_complete: bool
+    # Minted (uuid4) exactly once when collection completes; rides to the
+    # backend as the InquirySource.idempotencyKey so retries and LangGraph
+    # replays can never create a second Inquiry.
+    lead_submission_id: Optional[str]
+    # Latched by execute_lead ONLY on a confirmed 2xx from the backend; a
+    # failed POST leaves it False so the next turn retries with the same
+    # lead_submission_id.
+    lead_submitted: bool
 
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool

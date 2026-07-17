@@ -28,7 +28,7 @@ from ..agents.sales_collect import sales_collect_node
 from ..agents.sales_confirm import sales_confirm_node
 from ..agents.tracking_collect import tracking_collect_node
 from ..agents.triage import route_from_triage, triage_node
-from .shared_routing import should_capture_name
+from .shared_routing import should_capture_name, should_restrict_to_faq
 from .state import AgentState
 
 # ── Sales routing helpers ─────────────────────────────────────────────────────
@@ -132,6 +132,12 @@ def _route_from_triage(
     and the contact is already identified. Mid-flow turns keep their stale
     intent (triage_node skips re-classification), so flows are never hijacked.
     """
+    # Outside business hours: FAQ-only, including in-progress flows
+    # (immediate cutoff — the checkpointed cart/order state survives and the
+    # flow resumes when hours reopen). Urgent intents (complaint, …) keep
+    # their normal route via the shared router below.
+    if should_restrict_to_faq(state):
+        return "faq_response"
     if state.get("intent") == "greeting" and has_contact_name(state):
         return "greeting_response"
     # New users introduce themselves before a fresh flow starts; urgent

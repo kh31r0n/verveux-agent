@@ -118,6 +118,14 @@ _AGENT_PROFILES: dict[str, tuple[str, dict[str, str]]] = {
             "pt": "seu assistente de agendamento",
         },
     ),
+    "veronica": (
+        "Verónica",
+        {
+            "es": "tu asistente virtual",
+            "en": "your virtual assistant",
+            "pt": "sua assistente virtual",
+        },
+    ),
 }
 
 _GENERIC_ROLES = {
@@ -133,6 +141,7 @@ _TYPE_ROLE_FALLBACK: dict[str, dict[str, str]] = {
     "school": _AGENT_PROFILES["sofia"][1],
     "restaurant": _AGENT_PROFILES["giulia"][1],
     "appointments": _AGENT_PROFILES["marco"][1],
+    "leads": _AGENT_PROFILES["veronica"][1],
 }
 
 

@@ -22,6 +22,7 @@ from ..services.cart import CartService, normalize_cart
 from ..services.product_resolver import ProductResolver
 from ..usage import make_usage_record
 from .cart_sync import sync_full_cart_to_backend
+from .capability_gate import catalog_allowed, emit_degraded_catalog_reply
 from .utils import (
     format_user_context,
     language_instruction,
@@ -129,6 +130,17 @@ async def restaurant_order_collect_node(
     config: RunnableConfig,
 ) -> dict:
     record_node_invocation("restaurant_order_collect")
+
+    # CATALOG gate: no menu means no order to collect. Deflect politely.
+    if not catalog_allowed(state):
+        logger.info(
+            "capability_block",
+            capability="CATALOG",
+            source="node",
+            node="restaurant_order_collect",
+            thread_id=state.get("thread_id", "unknown"),
+        )
+        return emit_degraded_catalog_reply(state)
 
     provider = get_provider(config)
     model = resolve_model(config)

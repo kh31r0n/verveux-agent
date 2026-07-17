@@ -10,6 +10,7 @@ NAME_CAPTURE_DEFER_DAYS).
 
 from __future__ import annotations
 
+from ..agents.business_hours_gate import within_business_hours
 from ..config import settings
 from ..schemas.intent import IntentType
 from .state import AgentState
@@ -114,6 +115,25 @@ def should_normalize(text: str, faqs: list, flag_enabled: bool) -> bool:
         default=0.0,
     )
     return max_score < FAQ_SCORE_TRIGGER_THRESHOLD
+
+
+def should_restrict_to_faq(state: AgentState, intent: str | None = None) -> bool:
+    """Single policy gate: outside business hours, only FAQ + urgent intents.
+
+    True → the graph must route this turn to `faq_response` (which splices
+    the OUTSIDE_HOURS prompt so the customer is told the business is closed).
+    Urgent intents keep their normal route — an angry customer at 11 PM can
+    still complain, escalate, send payment proof, or cancel an appointment.
+    Graphs call this at the TOP of their triage router (before in-progress
+    branches and name capture) so mid-flow turns cut off immediately; the
+    checkpointed flow state survives and resumes when hours reopen.
+    """
+    if within_business_hours(state):
+        return False
+    effective_intent = (
+        intent if intent is not None else str(state.get("intent") or "")
+    ).lower()
+    return effective_intent not in URGENT_INTENTS
 
 
 def should_capture_name(state: AgentState, intent: str | None = None) -> bool:

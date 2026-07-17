@@ -19,7 +19,7 @@ from ..agents.query_normalizer import query_normalizer_node
 from ..agents.schedule_inquiry import schedule_inquiry_node
 from ..agents.triage import triage_node
 from ..agents.utils import latest_user_messages
-from .shared_routing import should_capture_name
+from .shared_routing import should_capture_name, should_restrict_to_faq
 from .state import AgentState
 
 _QUESTION_STARTERS = (
@@ -57,6 +57,12 @@ def _route_from_triage(
     "__end__",
 ]:
     intent = state.get("intent", "")
+    # Outside business hours: FAQ-only, including a mid-admissions turn
+    # (immediate cutoff — admissions_data survives in the checkpoint and the
+    # flow resumes when hours reopen). escalation is an URGENT_INTENT, so it
+    # falls through to its branch below.
+    if should_restrict_to_faq(state, intent):
+        return "faq_response"
     if intent == "escalation":
         return "escalation"
     # New users introduce themselves before a fresh flow starts; an

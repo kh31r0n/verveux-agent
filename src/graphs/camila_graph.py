@@ -27,7 +27,7 @@ from ..agents.handoff import handoff_node
 from ..agents.name_capture import name_capture_node
 from ..agents.query_normalizer import query_normalizer_node
 from ..schemas.intent import IntentType
-from .shared_routing import should_capture_name
+from .shared_routing import should_capture_name, should_restrict_to_faq
 from .state import AgentState
 
 _HANDOFF_INTENT_VALUES = {
@@ -48,6 +48,12 @@ def _route_from_triage(
     intent = str(state.get("intent") or "").lower()
     if intent in _HANDOFF_INTENT_VALUES:
         return "handoff"
+
+    # Outside business hours: FAQ-only. Placed AFTER the handoff branches —
+    # attachments and camila's handoff intents (a superset check vs the
+    # shared URGENT_INTENTS) must escalate to a human regardless of hours.
+    if should_restrict_to_faq(state, intent):
+        return "faq_response"
 
     if should_capture_name(state, intent):
         return "name_capture"

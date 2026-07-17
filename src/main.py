@@ -186,6 +186,9 @@ class PromptPayload(BaseModel):
     version: int = 0
     model_config_data: dict = {}
     is_default: bool = True
+    # AiPrompt row uuid from NestJS; "" when the slot is a platform default.
+    # Provenance-only — resolution reads `content` and ignores this field.
+    id: str = ""
 
     model_config = {"populate_by_name": True}
 
@@ -236,6 +239,19 @@ class ChatStreamRequest(BaseModel):
     # TenantSettings.queryNormalizationEnabled by the backend. Combined with
     # the fleet-wide settings.query_normalization_enabled env switch.
     query_normalization_enabled: bool = False
+    # Tenant-admin CATALOG capability toggle, resolved fresh by the backend
+    # every turn (AgentCapabilityPolicyService). Default True keeps behavior
+    # identical for older backends that don't send it. When False the backend
+    # already sent an empty product_catalog and the internal cart/order
+    # endpoints 403 — this flag drives the Python-side prompt gate + degraded
+    # instruction so the model never invents products, prices, or orders.
+    catalog_access_enabled: bool = True
+    # Business-hours flag, resolved fresh by the backend every turn
+    # (WorkingHoursService via TenantSettings.agentBusinessHoursEnabled).
+    # Default True keeps behavior identical for older backends that don't
+    # send it. When False, graphs route every non-urgent turn to
+    # faq_response, which splices the {AGENT_TYPE}_OUTSIDE_HOURS prompt.
+    within_business_hours: bool = True
 
 
 
@@ -728,6 +744,14 @@ async def chat_stream(
         "capabilities": {"agent_type": agent_type, "capabilities": req.capabilities},
         "domain_state": {},
         "product_catalog": req.product_catalog,
+        # Overwritten every turn (like product_catalog) so an admin flipping the
+        # CATALOG toggle takes effect on the next turn — the checkpointer can't
+        # leak a stale ON value.
+        "catalog_access_enabled": req.catalog_access_enabled,
+        # Same per-turn overwrite rationale: business hours can flip between
+        # turns (closing time), so a stale within-hours value must never leak
+        # from the checkpointer.
+        "within_business_hours": req.within_business_hours,
         "user_context": req.user_context,
         "contact_id": req.contact_id,
         "contact_tags": req.contact_tags,
@@ -769,7 +793,15 @@ async def chat_stream(
         provider=llm_provider,
         model=llm_model,
         catalog_count=len(req.product_catalog),
+        catalog_access_enabled=req.catalog_access_enabled,
         faq_count=len(req.rawFaqs or []),
+        # Compact prompt provenance for tenant-customised slots, keyed on the
+        # row id (NOT is_default, which older backends never populate).
+        custom_prompts={
+            k: f"{v.id[:8]}@v{v.version}"
+            for k, v in (req.prompts or {}).items()
+            if v.id
+        },
     )
 
     return StreamingResponse(

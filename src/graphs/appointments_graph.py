@@ -43,7 +43,7 @@ from ..agents.greeting_response import greeting_response_node, has_contact_name
 from ..agents.name_capture import name_capture_node
 from ..agents.query_normalizer import query_normalizer_node
 from ..agents.triage import triage_node
-from .shared_routing import should_capture_name
+from .shared_routing import should_capture_name, should_restrict_to_faq
 from .state import AgentState
 
 
@@ -61,6 +61,13 @@ def _route_from_triage(
 ]:
     intent = state.get("intent", "")
     booking_intent = state.get("booking_intent")
+
+    # Outside business hours: FAQ-only, including in-progress flows
+    # (immediate cutoff — booking state survives in the checkpoint and the
+    # flow resumes when hours reopen). appointment_cancel and escalation are
+    # URGENT_INTENTS, so they fall through to their branches below.
+    if should_restrict_to_faq(state, intent):
+        return "faq_response"
 
     # In-progress flow takes precedence over a fresh intent so a follow-up
     # message ("la 2 por favor", "sí confirmo") doesn't get re-triaged.

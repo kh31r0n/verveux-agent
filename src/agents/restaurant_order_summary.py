@@ -15,7 +15,8 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .backend_client import get_or_create_cart
+from .backend_client import CapabilityDisabledError, get_or_create_cart
+from .capability_gate import emit_degraded_catalog_reply
 from .order_summary import _build_cart_from_state, _format_cart_for_llm
 from .utils import (
     format_user_context,
@@ -99,6 +100,15 @@ async def restaurant_order_summary_node(
                 contact_id=contact_id,
                 conversation_id=conversation_id or None,
             )
+        except CapabilityDisabledError:
+            logger.info(
+                "capability_block",
+                capability="CATALOG",
+                source="backstop_403",
+                node="restaurant_order_summary",
+                thread_id=thread_id,
+            )
+            return emit_degraded_catalog_reply(state)
         except Exception as exc:
             logger.warning(
                 "restaurant_summary_cart_fetch_failed",

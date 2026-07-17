@@ -43,6 +43,7 @@ from ..usage import make_usage_record
 from ..services.product_resolver import ProductResolver
 from .utils import format_user_context, language_instruction, latest_user_text, resolve_persona
 from .cart_sync import sync_full_cart_to_backend
+from .capability_gate import catalog_allowed, emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -157,6 +158,19 @@ def _compute_mentioned_product_ids(
 
 async def sales_collect_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("sales_collect")
+
+    thread_id_early = state.get("thread_id", "unknown")
+    # CATALOG gate: with access off, there is no catalog to build an order from.
+    # Reply politely and stop — never invent products or prices.
+    if not catalog_allowed(state):
+        logger.info(
+            "capability_block",
+            capability="CATALOG",
+            source="node",
+            node="sales_collect",
+            thread_id=thread_id_early,
+        )
+        return emit_degraded_catalog_reply(state)
 
     provider = get_provider(config)
     model = resolve_model(config)

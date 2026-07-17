@@ -28,7 +28,7 @@ from ..agents.restaurant_confirm import restaurant_confirm_node
 from ..agents.restaurant_order_collect import restaurant_order_collect_node
 from ..agents.restaurant_order_summary import restaurant_order_summary_node
 from ..agents.triage import triage_node
-from .shared_routing import should_capture_name
+from .shared_routing import should_capture_name, should_restrict_to_faq
 from .state import AgentState
 
 # Re-use the complaint_collect node from the sales flow
@@ -56,6 +56,12 @@ def _route_from_triage(
     "__end__",
 ]:
     intent = state.get("intent", "")
+    # Outside business hours: FAQ-only, including a mid-order turn (immediate
+    # cutoff — the cart survives in the checkpoint and the order resumes when
+    # hours reopen). complaint/escalation are URGENT_INTENTS, so they fall
+    # through to their branches below.
+    if should_restrict_to_faq(state, intent):
+        return "faq_response"
     if intent == "complaint":
         return "complaint_collect"
     if intent == "escalation":

@@ -42,6 +42,26 @@ class TestCustomizedContent:
         )
         assert out == "tenant edition"
 
+    def test_extra_payload_keys_are_ignored(self):
+        """Payloads now carry provenance fields (id, version, isDefault…);
+        resolution reads only `content` and must ignore the rest."""
+        out = resolve_prompt(
+            make_config(
+                {
+                    "SALES_FAQ": {
+                        "content": "tenant edition",
+                        "id": "uuid-1",
+                        "version": 7,
+                        "isDefault": False,
+                        "future_field": {"nested": True},
+                    }
+                }
+            ),
+            "SALES_FAQ",
+            "fallback content",
+        )
+        assert out == "tenant edition"
+
 
 class TestPersonaSubstitution:
     fallback_with_persona = "Eres {persona}, asistente de ventas. {language_rule}"

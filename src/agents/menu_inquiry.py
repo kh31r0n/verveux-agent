@@ -17,6 +17,7 @@ from .utils import (
     resolve_prompt,
     format_user_context,
 )
+from .capability_gate import catalog_allowed, emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -158,6 +159,17 @@ async def menu_inquiry_node(
     config: RunnableConfig,
 ) -> dict:
     record_node_invocation("menu_inquiry")
+
+    # CATALOG gate: the menu IS the catalog. With access off, deflect politely.
+    if not catalog_allowed(state):
+        logger.info(
+            "capability_block",
+            capability="CATALOG",
+            source="node",
+            node="menu_inquiry",
+            thread_id=state.get("thread_id", "unknown"),
+        )
+        return emit_degraded_catalog_reply(state)
 
     provider = get_provider(config)
     model = resolve_model(config)

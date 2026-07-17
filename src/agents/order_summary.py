@@ -8,7 +8,8 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
 from .utils import language_instruction, latest_user_text, resolve_persona, resolve_prompt
-from .backend_client import get_or_create_cart
+from .backend_client import CapabilityDisabledError, get_or_create_cart
+from .capability_gate import emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -114,6 +115,15 @@ async def order_summary_node(
                 item_count=len(cart.get("items", [])),
                 grand_total=cart.get("grandTotal"),
             )
+        except CapabilityDisabledError:
+            logger.info(
+                "capability_block",
+                capability="CATALOG",
+                source="backstop_403",
+                node="order_summary",
+                thread_id=thread_id,
+            )
+            return emit_degraded_catalog_reply(state)
         except Exception as exc:
             logger.warning(
                 "order_summary_cart_fetch_failed",

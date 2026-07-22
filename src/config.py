@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,14 @@ class Settings(BaseSettings):
     vertex_service_account_json: str = ""
     vertex_project_id: str = ""
     vertex_location: str = ""
+    # ── Vertex AI rate-limit handling (429 RESOURCE_EXHAUSTED) ───────────────
+    # Vertex enforces per-model requests-per-minute quotas that the prospecting
+    # fan-out can exhaust. These bound an exponential-backoff retry that lives
+    # ONLY in the Vertex provider (openai/anthropic paths are untouched). Set
+    # vertex_max_retries=0 to disable retrying.
+    vertex_max_retries: int = 5
+    vertex_retry_base_seconds: float = 1.0
+    vertex_retry_max_seconds: float = 30.0
     langfuse_secret_key: str = ""
     langfuse_public_key: str = ""
     langfuse_host: str = "http://localhost:3010"
@@ -39,6 +48,37 @@ class Settings(BaseSettings):
     # forwarded on every /chat/stream call); this env var can disable the
     # feature everywhere regardless of tenant flags.
     query_normalization_enabled: bool = True
+    # ── Prospecting (aurora) ─────────────────────────────────────────────────
+    # Autonomous discovery agent. Search is done via Serper (Google SERP REST).
+    # `serper_api_key` is REQUIRED — the service refuses to start without it (see
+    # the validator below) so a missing key is caught at boot instead of every
+    # prospecting run silently completing with 0 results.
+    # `prospecting_max_searches` caps SERP calls per run (cost guardrail);
+    # `prospecting_fetch_timeout_seconds` bounds each page fetch.
+    serper_api_key: str = ""
+    prospecting_max_searches: int = 10
+    prospecting_fetch_timeout_seconds: float = 8.0
+    prospecting_max_results_per_search: int = 10
+    # Caps how many extract_and_enrich branches of the Send fan-out run at once.
+    # Applied to the prospecting graph ONLY when the tenant's provider is Vertex
+    # (its RPM quota is the tight one); other providers keep unbounded fan-out.
+    prospecting_vertex_extract_concurrency: int = 5
+
+    @model_validator(mode="after")
+    def _require_serper_api_key(self) -> "Settings":
+        """Fail fast at startup when the Serper key is absent.
+
+        Without it the prospecting agent's web_search node returns nothing and
+        every run completes with 0 found — a silent misconfiguration. We refuse
+        to boot instead so the problem surfaces immediately on deploy.
+        """
+        if not self.serper_api_key.strip():
+            raise ValueError(
+                "SERPER_API_KEY is not set. The prospecting agent (aurora) "
+                "requires it for web search; refusing to start. Set "
+                "SERPER_API_KEY in the environment."
+            )
+        return self
 
 
 settings = Settings()

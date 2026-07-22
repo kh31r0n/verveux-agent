@@ -224,6 +224,63 @@ async def request_handoff(
     )
 
 
+# ─── Prospecting (aurora — /internal/prospecting/*) ─────────────────────────
+
+
+async def check_prospect_duplicates(
+    tenant_id: str, candidates: list[dict]
+) -> dict[str, dict]:
+    """POST /internal/prospecting/contacts/dedup — bulk CRM duplicate check.
+
+    ``candidates`` is a list of ``{externalId, normalizedName?, domain?, email?}``.
+    Returns a map ``externalId -> {exists: bool, reason?: str}`` for O(1) lookup.
+    """
+    data = await _post(
+        "/api/v1/internal/prospecting/contacts/dedup",
+        json={"tenantId": tenant_id, "candidates": candidates},
+    )
+    results = data.get("results", []) if isinstance(data, dict) else []
+    return {
+        r["externalId"]: r
+        for r in results
+        if isinstance(r, dict) and r.get("externalId")
+    }
+
+
+async def create_prospect_contact(tenant_id: str, contact: dict) -> dict:
+    """POST /internal/prospecting/contacts — file one AI-discovered prospect.
+
+    ``contact`` carries ``{externalId, customName?, sourceUrl?, email?, website?,
+    city?, notes?, runId?}``. The backend is idempotent on the synthetic
+    ``externalId``, so a replayed run returns the existing row (``deduped: true``)
+    instead of creating a duplicate. Response: ``{ok, contactId, deduped}``.
+    """
+    return await _post(
+        "/api/v1/internal/prospecting/contacts",
+        json={"tenantId": tenant_id, **contact},
+    )
+
+
+async def report_prospecting_run(
+    run_id: str,
+    status: str,
+    metrics: dict | None = None,
+    usage: list[dict] | None = None,
+) -> dict:
+    """PATCH /internal/prospecting/runs/:id — terminal run report.
+
+    ``status`` is ``COMPLETED`` or ``FAILED``. ``usage`` is the run's token-usage
+    list (same shape as the SSE ``done`` event); the backend settles it against
+    AI credits, keyed on ``prospecting:{run_id}`` so a retry never double-debits.
+    """
+    body: dict = {"status": status}
+    if metrics is not None:
+        body["metrics"] = metrics
+    if usage:
+        body["usage"] = usage
+    return await _patch(f"/api/v1/internal/prospecting/runs/{run_id}", json=body)
+
+
 # ─── Appointments (/internal/appointments/*) ────────────────────────────────
 #
 # These call the NestJS internal controllers added in Phase 1. The agent never
@@ -454,4 +511,24 @@ async def _post(path: str, json: dict | None = None, params: dict | None = None)
         raise
     except RequestError as exc:
         logger.error("backend_post_network_error", path=path, error=str(exc))
+        raise
+
+
+async def _patch(path: str, json: dict | None = None) -> dict:
+    url = f"{_BASE}{path}"
+    try:
+        async with AsyncClient(timeout=10.0) as client:
+            resp = await client.patch(url, headers=_HEADERS, json=json)
+            resp.raise_for_status()
+            return resp.json()
+    except HTTPStatusError as exc:
+        logger.error(
+            "backend_patch_error",
+            path=path,
+            status=exc.response.status_code,
+            body=_error_body(exc),
+        )
+        raise
+    except RequestError as exc:
+        logger.error("backend_patch_network_error", path=path, error=str(exc))
         raise

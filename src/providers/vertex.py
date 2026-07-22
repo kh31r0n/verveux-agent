@@ -1,12 +1,33 @@
 from typing import AsyncIterator
+import asyncio
 import json
+import random
 
+import structlog
 from google.genai import Client, types
 from google.oauth2 import service_account
 
 from .base import ChatProvider, UsageInfo
 from langgraph.types import RunnableConfig
 from ..config import settings
+
+logger = structlog.get_logger(__name__)
+
+
+def _is_vertex_rate_limit(exc: Exception) -> bool:
+    """True for a Vertex quota error (HTTP 429 / RESOURCE_EXHAUSTED).
+
+    Detection is deliberately broad — the google-genai SDK surfaces the quota
+    error as a ClientError whose code is 429 and whose message contains
+    RESOURCE_EXHAUSTED — so we match either the numeric code or the status text
+    without importing the SDK's error type. Scoped to this module: only the
+    Vertex provider retries; openai/anthropic are untouched.
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code == 429:
+        return True
+    text = str(exc)
+    return "429" in text or "RESOURCE_EXHAUSTED" in text
 
 
 def resolve_vertex_credentials(config: RunnableConfig) -> dict:
@@ -117,20 +138,49 @@ class VertexProvider(ChatProvider):
             systemInstruction=system_instruction,
         ) if system_instruction else None
 
-        stream = await self._client.aio.models.generate_content_stream(
-            model=model or "gemini-2.5-flash",
-            contents=contents,
-            config=config,
-        )
-        async for response in stream:
-            if response.text:
-                yield response.text
-            # Gemini emits usage_metadata on the final chunk(s); the last
-            # non-empty value is cumulative for the full completion.
-            usage_meta = getattr(response, "usage_metadata", None)
-            if usage_meta is not None:
-                self.last_usage = UsageInfo(
-                    input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
-                    output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
-                    cached_input_tokens=getattr(usage_meta, "cached_content_token_count", 0) or 0,
+        # Retry only the Vertex 429/RESOURCE_EXHAUSTED quota error, and only
+        # while no chunk has been yielded yet (a mid-stream failure can't be
+        # replayed without duplicating text). Exponential backoff + full jitter.
+        attempt = 0
+        while True:
+            yielded = False
+            try:
+                stream = await self._client.aio.models.generate_content_stream(
+                    model=model or "gemini-2.5-flash",
+                    contents=contents,
+                    config=config,
                 )
+                async for response in stream:
+                    yielded = True
+                    if response.text:
+                        yield response.text
+                    # Gemini emits usage_metadata on the final chunk(s); the
+                    # last non-empty value is cumulative for the completion.
+                    usage_meta = getattr(response, "usage_metadata", None)
+                    if usage_meta is not None:
+                        self.last_usage = UsageInfo(
+                            input_tokens=getattr(usage_meta, "prompt_token_count", 0) or 0,
+                            output_tokens=getattr(usage_meta, "candidates_token_count", 0) or 0,
+                            cached_input_tokens=getattr(usage_meta, "cached_content_token_count", 0) or 0,
+                        )
+                return
+            except Exception as exc:
+                if (
+                    yielded
+                    or attempt >= settings.vertex_max_retries
+                    or not _is_vertex_rate_limit(exc)
+                ):
+                    raise
+                delay = min(
+                    settings.vertex_retry_base_seconds * (2 ** attempt),
+                    settings.vertex_retry_max_seconds,
+                )
+                delay = random.uniform(0, delay)  # full jitter
+                logger.warning(
+                    "vertex_rate_limited_retry",
+                    attempt=attempt + 1,
+                    max_retries=settings.vertex_max_retries,
+                    delay_seconds=round(delay, 2),
+                )
+                await asyncio.sleep(delay)
+                attempt += 1

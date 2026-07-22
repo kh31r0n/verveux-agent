@@ -26,6 +26,7 @@ import structlog
 from .appointments_graph import build_appointments_graph
 from .camila_graph import build_camila_graph
 from .leads_graph import build_leads_graph
+from .prospecting_graph import build_prospecting_graph
 from .restaurant_graph import build_restaurant_graph
 from .sales_graph import build_sales_graph
 from .school_graph import build_school_graph
@@ -45,6 +46,7 @@ CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "giulia": build_restaurant_graph,
     "marco": build_appointments_graph,
     "veronica": build_leads_graph,
+    "aurora": build_prospecting_graph,
 }
 
 
@@ -80,6 +82,7 @@ AGENT_TYPE_FALLBACK: Mapping[str, str] = {
     "restaurant": "giulia",
     "appointments": "marco",
     "leads": "veronica",
+    "prospecting": "aurora",
 }
 
 

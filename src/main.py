@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # used in lifespan
@@ -24,6 +24,7 @@ from .agents.backend_client import (
     fetch_active_code_names,
     fetch_agent_credentials,
     fetch_in_use_code_names,
+    report_prospecting_run,
 )
 from .config import settings
 from .db.postgres import (
@@ -265,6 +266,34 @@ class ChatResumeRequest(BaseModel):
     agent_code_name: str = ""
     agent_version: int = 1
     agent_type: str = "sales"
+
+
+class ProspectingRunRequest(BaseModel):
+    """Backend-scheduler trigger for one autonomous prospecting run (aurora).
+
+    Unlike the chat endpoints this is not authenticated with a Cognito JWT —
+    it's a service-to-service call gated by the shared X-Agent-Key. Credentials
+    are NOT forwarded here; the agent resolves the tenant's LLM key itself via
+    fetch_agent_credentials, exactly as /chat/stream does after receiving one.
+    """
+
+    tenant_id: str
+    run_id: str
+    run_date: str = ""
+    agent_code_name: str = "aurora"
+    prompts: dict[str, PromptPayload] = {}
+
+
+def require_agent_key(
+    x_agent_key: Annotated[str | None, Header(alias="x-agent-key")] = None,
+) -> None:
+    """FastAPI dependency: the shared internal service key (WEBHOOK_API_KEY).
+
+    First non-Cognito auth surface in this service — used only by internal
+    service-to-service endpoints (the prospecting trigger).
+    """
+    if not x_agent_key or x_agent_key != settings.webhook_api_key:
+        raise HTTPException(status_code=401, detail="Invalid agent key")
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +661,114 @@ async def health() -> dict:
 async def metrics() -> Response:
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+
+# Strong references to in-flight background prospecting runs (asyncio.create_task
+# only holds a weak ref, so without this the task can be GC'd mid-run).
+_prospecting_tasks: set[asyncio.Task] = set()
+
+
+async def _run_prospecting(
+    graph, inputs: dict, config: dict, run_id: str
+) -> None:
+    """Run one prospecting graph to completion in the background.
+
+    The graph's ``report`` node reports COMPLETED on success. If the run raises
+    before reaching it, mark the run FAILED here so the backend's daily lock is
+    released and the (bounded) usage that did happen is not lost. The backend
+    reaper is the final backstop if even this report never lands.
+    """
+    try:
+        await graph.ainvoke(inputs, config)
+    except Exception as exc:  # noqa: BLE001 — background task must not crash the loop
+        logger.error(
+            "prospecting_run_failed",
+            run_id=run_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        try:
+            await report_prospecting_run(
+                run_id, "FAILED", metrics={"reason": f"agent_error: {exc}"}
+            )
+        except Exception:  # noqa: BLE001
+            logger.error("prospecting_fail_report_failed", run_id=run_id)
+
+
+@app.post("/prospecting/run", status_code=202)
+async def prospecting_run(
+    req: ProspectingRunRequest,
+    _auth: Annotated[None, Depends(require_agent_key)],
+) -> dict:
+    code_name = (req.agent_code_name or "aurora").strip().lower()
+    try:
+        graph = await get_or_compile_graph(code_name)
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Resolve LLM credentials ourselves — there is no NestJS-forwarded key on a
+    # scheduler-triggered run (mirrors the /chat/stream credential fetch).
+    llm_provider = "openai"
+    llm_model = ""
+    provider_config: dict = {}
+    try:
+        creds = await fetch_agent_credentials(req.tenant_id)
+        llm_provider = creds.get("provider", "OPENAI").lower()
+        llm_model = creds.get("model") or ""
+        if llm_provider == "openai":
+            provider_config["openai_api_key"] = creds.get("apiKey", "")
+        elif llm_provider == "anthropic":
+            provider_config["anthropic_api_key"] = creds.get("apiKey", "")
+        elif llm_provider == "vertex":
+            provider_config["vertex_credentials"] = creds.get("vertexCredentials", {})
+            provider_config["vertex_project_id"] = creds.get("vertexProjectId", "")
+            provider_config["vertex_location"] = creds.get("vertexLocation", "")
+    except Exception as exc:
+        logger.warning(
+            "prospecting_credentials_fetch_failed",
+            tenant_id=req.tenant_id,
+            error=str(exc),
+        )
+        provider_config["openai_api_key"] = settings.openai_api_key
+
+    prompts_dict = (
+        {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
+    )
+    # One checkpoint thread per (tenant, day) so a crashed run resumes.
+    thread_id = f"prospecting:{req.tenant_id}:{req.run_date or req.run_id}"
+    config: dict = {
+        "configurable": {
+            "thread_id": thread_id,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "prompts": prompts_dict,
+            **provider_config,
+        }
+    }
+    # Bound the extract_and_enrich Send fan-out ONLY for Vertex, whose per-model
+    # RPM quota the ~90-way parallel burst exhausts (429 RESOURCE_EXHAUSTED).
+    # openai/anthropic keep LangGraph's default unbounded parallelism.
+    if llm_provider == "vertex":
+        config["max_concurrency"] = settings.prospecting_vertex_extract_concurrency
+    inputs: dict = {
+        "tenant_id": req.tenant_id,
+        "run_id": req.run_id,
+        "run_date": req.run_date,
+    }
+
+    # Fire-and-forget: the run streams no reply, and the scheduler already holds
+    # the daily lock, so return 202 immediately and work in the background.
+    # Keep a strong reference so the event loop doesn't GC the pending task.
+    task = asyncio.create_task(_run_prospecting(graph, inputs, config, req.run_id))
+    _prospecting_tasks.add(task)
+    task.add_done_callback(_prospecting_tasks.discard)
+    logger.info(
+        "prospecting_run_accepted",
+        run_id=req.run_id,
+        tenant_id=req.tenant_id,
+        code_name=code_name,
+    )
+    return {"accepted": True, "run_id": req.run_id}
 
 
 @app.post("/chat/stream")

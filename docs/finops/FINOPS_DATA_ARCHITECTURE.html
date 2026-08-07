@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Helena FinOps — Data Model Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg-dark: #0f172a;
+    --bg-section: #1e293b;
+    --bg-card: #253349;
+    --text-main: #f1f5f9;
+    --text-muted: #94a3b8;
+    --accent: #00E77C;
+    --accent-secondary: #64FF7C;
+    --accent-tertiary: #019F61;
+    --accent-warn: #EFD84B;
+    --border: rgba(255, 255, 255, 0.08);
+    --glow: rgba(0, 231, 124, 0.15);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg-dark);
+    background-image: radial-gradient(circle at 50% -20%, #1e293b, #0f172a);
+    background-attachment: fixed;
+    color: var(--text-main);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 15px;
+    font-weight: 400;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 4rem;
+  }
+
+  /* ── Gradient text ─────────────────────────── */
+  .grad {
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  /* ── Header ────────────────────────────────── */
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1.75rem;
+    margin-bottom: 2.5rem;
+  }
+  header h1 {
+    font-size: 2.6rem;
+    font-weight: 700;
+    margin: 0 0 0.5rem;
+    letter-spacing: -0.02em;
+  }
+  header p.sub {
+    color: var(--text-muted);
+    font-size: 1.05rem;
+    margin: 0;
+    max-width: 760px;
+  }
+
+  /* ── Hero ──────────────────────────────────── */
+  .hero {
+    background: linear-gradient(135deg, rgba(0,231,124,0.06), rgba(1,159,97,0.03));
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 2.75rem;
+    margin-bottom: 2.5rem;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 20px var(--glow);
+  }
+  .badge {
+    display: inline-block;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--accent);
+    background: rgba(0,231,124,0.1);
+    border: 1px solid rgba(0,231,124,0.3);
+    border-radius: 999px;
+    padding: 0.35rem 0.95rem;
+    margin-bottom: 1.25rem;
+  }
+  .hero h2 {
+    font-size: 2.1rem;
+    line-height: 1.25;
+    font-weight: 700;
+    margin: 0 0 1rem;
+    letter-spacing: -0.01em;
+  }
+  .hero p {
+    color: var(--text-muted);
+    font-size: 1.05rem;
+    max-width: 820px;
+    margin: 0;
+  }
+
+  /* ── KPI strip ─────────────────────────────── */
+  .kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.1rem;
+    margin-bottom: 3rem;
+  }
+  .kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.5rem 1.35rem;
+  }
+  .kpi-card .icon { font-size: 1.6rem; display: block; margin-bottom: 0.5rem; }
+  .kpi-card .val {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1.1;
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: transparent;
+  }
+  .kpi-card .lbl {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-top: 0.4rem;
+  }
+
+  /* ── Sections ──────────────────────────────── */
+  .section { margin-bottom: 2.5rem; }
+  .section h2 {
+    font-size: 1.7rem;
+    font-weight: 700;
+    margin: 0 0 1.2rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.01em;
+  }
+  .section h3 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--accent-secondary);
+    margin: 1.5rem 0 0.5rem;
+  }
+  .section p { color: #cbd5e1; }
+  .section ul { color: #cbd5e1; padding-left: 1.2rem; }
+  .section li { margin-bottom: 0.4rem; }
+  code {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 0.86em;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.08em 0.4em;
+    color: var(--accent-secondary);
+  }
+
+  .separator {
+    border: none;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(0,231,124,0.4), transparent);
+    margin: 3rem 0;
+  }
+
+  /* ── Vision grid ───────────────────────────── */
+  .vision-grid {
+    display: grid;
+    grid-template-columns: 1fr 0.85fr;
+    gap: 2.5rem;
+    align-items: start;
+  }
+  .arch-flow { display: flex; flex-direction: column; gap: 0; }
+  .arch-layer {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.8rem;
+  }
+  .arch-layer .ic { font-size: 1.3rem; line-height: 1.5; }
+  .arch-layer .ttl { font-weight: 600; font-size: 0.98rem; }
+  .arch-layer .desc { color: var(--text-muted); font-size: 0.84rem; line-height: 1.5; }
+  .arch-arrow { text-align: center; color: var(--accent-tertiary); font-size: 1.1rem; margin: 0.25rem 0; }
+  .l-dim { border-left-color: #38bdf8; }
+  .l-plan { border-left-color: var(--accent); }
+  .l-actual { border-left-color: var(--accent-warn); }
+  .l-fx { border-left-color: var(--accent-secondary); }
+  .l-agg { border-left-color: var(--accent-tertiary); }
+  .l-api { border-left-color: #c084fc; }
+
+  /* ── Notes ─────────────────────────────────── */
+  .note {
+    background: rgba(0,231,124,0.05);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+    color: #cbd5e1;
+    font-size: 0.92rem;
+  }
+  .note.warn { background: rgba(239,216,75,0.06); border-left-color: var(--accent-warn); }
+  .note strong { color: var(--text-main); }
+
+  /* ── Tables ────────────────────────────────── */
+  .table-responsive {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin: 1.25rem 0;
+  }
+  table { border-collapse: collapse; width: 100%; min-width: 540px; font-size: 0.88rem; }
+  thead th {
+    background: linear-gradient(135deg, var(--accent-tertiary), var(--accent));
+    color: #04261a;
+    font-weight: 700;
+    text-align: left;
+    padding: 0.7rem 0.9rem;
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 0.6rem 0.9rem;
+    border-top: 1px solid var(--border);
+    color: #cbd5e1;
+    vertical-align: top;
+  }
+  tbody tr:nth-child(even) { background: rgba(255,255,255,0.018); }
+  tbody td code { white-space: nowrap; }
+  tr.summary td { background: rgba(0,231,124,0.08); font-weight: 600; color: var(--text-main); }
+  .t-type { color: var(--accent-secondary); font-family: ui-monospace, monospace; font-size: 0.82rem; white-space: nowrap; }
+
+  .model-tag {
+    display: inline-block;
+    font-family: ui-monospace, monospace;
+    font-size: 0.74rem;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.1rem 0.5rem;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+
+  /* ── Mermaid containers ────────────────────── */
+  .diagram {
+    background: var(--bg-section);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 1.5rem;
+    margin: 1.5rem 0;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 20px var(--glow);
+    overflow-x: auto;
+  }
+  .diagram .cap { color: var(--text-muted); font-size: 0.82rem; text-align: center; margin-top: 0.75rem; }
+  .full-width {
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 96vw;
+    max-width: 1400px;
+  }
+  .mermaid { text-align: center; }
+
+  /* ── Tier strip ────────────────────────────── */
+  .tier-strip {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.1rem;
+  }
+  .tier-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 12px;
+    padding: 1.2rem 1.3rem;
+  }
+  .tier-card h4 { margin: 0 0 0.4rem; font-size: 1rem; font-weight: 700; }
+  .tier-card p { margin: 0; color: var(--text-muted); font-size: 0.85rem; line-height: 1.55; }
+  .tier-card:nth-child(1) { border-left-color: var(--accent); }
+  .tier-card:nth-child(2) { border-left-color: var(--accent-secondary); }
+  .tier-card:nth-child(3) { border-left-color: var(--accent-tertiary); }
+  .tier-card:nth-child(4) { border-left-color: #38bdf8; }
+  .tier-card:nth-child(5) { border-left-color: var(--accent-warn); }
+  .tier-card:nth-child(6) { border-left-color: #c084fc; }
+
+  /* ── Footer ────────────────────────────────── */
+  footer {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    border-top: 1px solid var(--border);
+    padding-top: 1.5rem;
+    margin-top: 3rem;
+  }
+
+  /* ── Responsive ────────────────────────────── */
+  @media (max-width: 768px) {
+    .wrap { padding: 2rem 1rem 3rem; }
+    header h1 { font-size: 1.9rem; }
+    .hero { padding: 1.75rem; }
+    .hero h2 { font-size: 1.55rem; }
+    .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+    .vision-grid { grid-template-columns: 1fr; gap: 1.5rem; }
+    .tier-strip { grid-template-columns: 1fr; }
+    .full-width { width: 100%; left: 0; transform: none; }
+  }
+
+  /* ── Print ─────────────────────────────────── */
+  @media print {
+    body { background: #fff; color: #111; }
+    .wrap { max-width: 100%; }
+    .grad, .kpi-card .val { -webkit-text-fill-color: #019F61; color: #019F61; }
+    .hero, .kpi-card, .tier-card, .arch-layer, .diagram, .section h2 {
+      box-shadow: none; background: #fff; border-color: #ccc;
+    }
+    .section p, .section ul, tbody td, .hero p, .kpi-card .lbl, .arch-layer .desc { color: #333; }
+    thead th { background: #019F61 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .note { background: #f3faf6; }
+    a { color: #019F61; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ═══ HEADER ═══ -->
+  <header>
+    <h1 class="grad">Helena FinOps — Data Model Architecture</h1>
+    <p class="sub">The data structure behind SEK's IT cost-management platform — controlled dimensions, planned-vs-actual fact tables, transactional FX, and the reports they power. Scope: the <code>finops_*</code> domain only.</p>
+  </header>
+
+  <!-- ═══ HERO ═══ -->
+  <section class="hero">
+    <span class="badge">Cost Management · Single-tenant · Multi-currency</span>
+    <h2>Evidence the delta between <span class="grad">projected and real IT spend</span>,<br/>and prove savings — across currencies and dimensions.</h2>
+    <p>FinOps separates what we <em>plan</em> to spend (obligations) from what we <em>actually</em> spend (transactions), normalizes every amount to a single base currency at the moment of record, and classifies everything against eight controlled catalogs aligned to the <strong>SEK Cost Classification Standard v1.0</strong> (servicio · país · cliente · tipo de costo). That clean separation is what makes the projection, GAP, variance, and savings-realization reports trustworthy.</p>
+  </section>
+
+  <!-- ═══ KPI STRIP ═══ -->
+  <section class="kpi-strip">
+    <div class="kpi-card">
+      <span class="icon">🗂️</span>
+      <div class="val">8</div>
+      <div class="lbl">Controlled catalogs</div>
+    </div>
+    <div class="kpi-card">
+      <span class="icon">⚖️</span>
+      <div class="val">2</div>
+      <div class="lbl">Fact tables — planned vs actual</div>
+    </div>
+    <div class="kpi-card">
+      <span class="icon">💱</span>
+      <div class="val">Frozen</div>
+      <div class="lbl">Transactional FX per record</div>
+    </div>
+    <div class="kpi-card">
+      <span class="icon">📊</span>
+      <div class="val">8+</div>
+      <div class="lbl">Report / aggregation endpoints</div>
+    </div>
+  </section>
+
+  <!-- ═══ VISION GENERAL ═══ -->
+  <section class="section">
+    <h2 class="grad">Overview — the shape of the model</h2>
+    <div class="vision-grid">
+      <div>
+        <h3>The problem</h3>
+        <p>IT cost data arrives in many currencies, from many sources (SAP, cards, cloud bills, manual entry), tagged inconsistently. Leadership needs to answer: <em>are we on budget, where is the variance, and did our savings initiatives actually land?</em> Raw invoices can't answer that.</p>
+        <h3>The solution</h3>
+        <p>Three design choices make the reports reliable:</p>
+        <ul>
+          <li><strong>Planned vs Actual separation.</strong> <code>CostItem</code> holds an <em>obligation</em> (no provenance); <code>RealSpendRecord</code> holds a <em>transaction</em> (full provenance). They never blend.</li>
+          <li><strong>Transactional FX.</strong> Every monetary row stores its original amount <em>and</em> a frozen base-currency value (<code>baseAmount</code> + <code>fxRate</code> + <code>fxRateDate</code>), so historical reports never drift when rates change.</li>
+          <li><strong>Controlled dimensions.</strong> Eight catalogs (country, service, client, category…) are the only allowed tags — every report can group consistently.</li>
+          <li><strong>SEK classification &amp; governance.</strong> The client dimension (<code>clientClassification</code> + a Service-Operation-Hub-backed <code>ClientCatalog</code>), approved <code>DistributionFormula</code> references for factorizable costs, and investment/CAPEX approval rules make the four-dimension standard enforceable.</li>
+        </ul>
+      </div>
+      <div class="arch-flow">
+        <div class="arch-layer l-dim"><span class="ic">🗂️</span><div><div class="ttl">Dimensions / Catalogs</div><div class="desc">8 controlled vocabularies tag every cost.</div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer l-plan"><span class="ic">📋</span><div><div class="ttl">Planned obligations</div><div class="desc"><code>CostItem</code> + <code>CostAllocation</code> (prorrateo).</div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer l-actual"><span class="ic">💳</span><div><div class="ttl">Actual transactions</div><div class="desc"><code>RealSpendRecord</code> — dedup'd, reconciled.</div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer l-fx"><span class="ic">💱</span><div><div class="ttl">FX normalization</div><div class="desc"><code>ExchangeRate</code> freezes a base amount on write.</div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer l-agg"><span class="ic">🧮</span><div><div class="ttl">Aggregation / Reports</div><div class="desc">Projection · GAP · Variance · Savings.</div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer l-api"><span class="ic">🖥️</span><div><div class="ttl">API / UI</div><div class="desc"><code>/api/v3/finops/*</code> → dashboards.</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="separator" />
+
+  <!-- ═══ ER DIAGRAM ═══ -->
+  <section class="section">
+    <h2 class="grad">High-level entity relationships</h2>
+    <p>The financial core: two fact tables (<code>CostItem</code>, <code>RealSpendRecord</code>) both reference the eight catalogs as dimensions. <code>CostAllocation</code> spreads a transversal cost item across a dimension (service, country or client); <code>DistributionFormula</code> is the approved prorrateo rule those allocations reference; <code>SavingsInitiative</code> links to cost items it intends to reduce; <code>ExchangeRate</code> feeds the base-currency freeze on every monetary row.</p>
+    <div class="diagram full-width">
+      <pre class="mermaid">
+erDiagram
+    COUNTRY_CATALOG       ||--o{ COST_ITEM : tags
+    SERVICE_CATALOG       ||--o{ COST_ITEM : tags
+    CATEGORY_CATALOG      ||--o{ COST_ITEM : tags
+    COST_CENTER_CATALOG   ||--o{ COST_ITEM : tags
+    BUSINESS_UNIT_CATALOG ||--o{ COST_ITEM : tags
+    CLIENT_CATALOG        ||--o{ COST_ITEM : tags
+    PROVIDER_CATALOG      ||--o{ COST_ITEM : tags
+    PRODUCT_CATALOG       ||--o{ COST_ITEM : tags
+
+    COUNTRY_CATALOG       ||--o{ REAL_SPEND_RECORD : tags
+    SERVICE_CATALOG       ||--o{ REAL_SPEND_RECORD : tags
+    CLIENT_CATALOG        ||--o{ REAL_SPEND_RECORD : tags
+    PROVIDER_CATALOG      ||--o{ REAL_SPEND_RECORD : tags
+
+    COST_ITEM            ||--o{ COST_ALLOCATION : "spread across"
+    DISTRIBUTION_FORMULA ||--o{ COST_ALLOCATION : "approved rule"
+    DISTRIBUTION_FORMULA ||--o{ COST_ITEM : "formula_ref"
+    COST_ITEM            ||--o{ REAL_SPEND_RECORD : "reconciles to"
+
+    SAVINGS_INITIATIVE      ||--o{ SAVINGS_INITIATIVE_ITEM : links
+    COST_ITEM               ||--o{ SAVINGS_INITIATIVE_ITEM : "targeted by"
+
+    EXCHANGE_RATE {
+      string base_currency
+      string quote_currency
+      decimal rate
+      datetime rate_date
+    }
+    DISTRIBUTION_FORMULA {
+      string name
+      enum criterion
+      enum status
+      string approved_by_user_id
+    }
+    COST_ALLOCATION {
+      enum dimension
+      string target_id
+      decimal percentage
+      string formula_id
+    }
+    COST_ITEM {
+      decimal estimated_amount
+      decimal base_amount
+      bool is_transversal
+      enum cost_nature
+      bool is_investment_project
+      enum client_classification
+    }
+    REAL_SPEND_RECORD {
+      decimal amount
+      decimal base_amount
+      datetime spend_date
+      enum payment_origin
+      enum client_classification
+    }
+      </pre>
+      <div class="cap">Financial-core ER diagram — eight catalogs (dimensions) feed both fact tables; allocations (now polymorphic over a dimension) and savings links bridge them, and distribution formulas back factorizable costs.</div>
+    </div>
+  </section>
+
+  <hr class="separator" />
+
+  <!-- ═══ §1 CATALOGS ═══ -->
+  <section class="section">
+    <h2 class="grad">1 · Controlled classification catalogs</h2>
+    <p>Eight small lookup tables provide the <em>only</em> allowed tags for costs and spend. Each shares the same shape: a stable <code>id</code>, a unique short <code>code</code>, a human <code>name</code>, and a soft-delete flag (<code>isActive</code>). They are never deleted — deactivation preserves history. "Country", "Business Unit" and "Client" here are <strong>cost dimensions</strong>, not the support system's organizations. For the <strong>Client</strong> catalog the <code>code</code> is the official Service Operation Hub (CMDB) client/contract ID — no local identifiers (SEK standard §9).</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr><td><code>code</code></td><td class="t-type">VarChar(32), unique</td><td>Stable short code used by imports to resolve a dimension (e.g. <code>EC2</code>).</td></tr>
+          <tr><td><code>name</code></td><td class="t-type">String</td><td>Display name (e.g. "Amazon Elastic Compute Cloud").</td></tr>
+          <tr><td><code>isActive</code></td><td class="t-type">Boolean = true</td><td>Soft-deactivation; inactive entries hide from pickers but keep history.</td></tr>
+          <tr><td><code>createdAt / updatedAt</code></td><td class="t-type">DateTime</td><td>Audit timestamps.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Catalog</th><th>Table</th><th>Used as dimension on</th></tr></thead>
+        <tbody>
+          <tr><td>Country</td><td><code>finops_country_catalog</code></td><td>CostItem · RealSpendRecord · SavingsInitiative · <strong>CostAllocation target (COUNTRY)</strong></td></tr>
+          <tr><td>Service</td><td><code>finops_service_catalog</code></td><td>CostItem · RealSpendRecord · SavingsInitiative · <strong>CostAllocation target (SERVICE)</strong></td></tr>
+          <tr><td>Client</td><td><code>finops_client_catalog</code></td><td>CostItem · RealSpendRecord · SavingsInitiative · <strong>CostAllocation target (CLIENT)</strong></td></tr>
+          <tr><td>Category</td><td><code>finops_category_catalog</code></td><td>CostItem · RealSpendRecord</td></tr>
+          <tr><td>Cost Center</td><td><code>finops_cost_center_catalog</code></td><td>CostItem · RealSpendRecord</td></tr>
+          <tr><td>Business Unit</td><td><code>finops_business_unit_catalog</code></td><td>CostItem · RealSpendRecord · SavingsInitiative</td></tr>
+          <tr><td>Provider</td><td><code>finops_provider_catalog</code></td><td>CostItem · RealSpendRecord</td></tr>
+          <tr><td>Product</td><td><code>finops_product_catalog</code></td><td>CostItem · RealSpendRecord</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <p>Every grouped report (<code>groupBy=country|service|client|category|…</code>) resolves its buckets through these catalogs. The breakdown dashboard groups planned cost by tipo-costo/country/category/client; accumulated spend and GAP group actual spend by any dimension. The <code>Service</code>, <code>Country</code> and <code>Client</code> catalogs participate in transversal-cost spreading — a <code>CostAllocation</code> row's <code>targetId</code> is resolved (per its <code>dimension</code>) against the matching catalog rather than by a hard foreign key.</p>
+  </section>
+
+  <!-- ═══ §2 COSTITEM ═══ -->
+  <section class="section">
+    <h2 class="grad">2 · CostItem <span class="model-tag">finops_cost_items</span></h2>
+    <p>The <strong>planned / expected obligation</strong> — what we intend to spend. It carries no provenance (it is not a transaction). Its recurrence and vigencia (validity window) let the projection engine expand it into dated payment occurrences; its classification flags drive the COGS/SG&amp;A/CAPEX and recurring/licenses/investment splits.</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr><td><code>name / description</code></td><td class="t-type">String / String?</td><td>Label and optional notes.</td></tr>
+          <tr class="summary"><td colspan="3">Monetary &amp; frozen base-currency view</td></tr>
+          <tr><td><code>estimatedAmount</code></td><td class="t-type">Decimal(18,4)</td><td>Planned amount in its original <code>currency</code>.</td></tr>
+          <tr><td><code>currency</code></td><td class="t-type">VarChar(3)</td><td>ISO currency of the estimate.</td></tr>
+          <tr><td><code>baseAmount</code></td><td class="t-type">Decimal(18,4)?</td><td>Frozen base-currency value (computed on write).</td></tr>
+          <tr><td><code>fxRate / fxRateDate</code></td><td class="t-type">Decimal(18,8)? / DateTime?</td><td>Rate and as-of date used for the freeze.</td></tr>
+          <tr><td><code>amountPeriod</code></td><td class="t-type">enum CostAmountPeriod</td><td><code>MONTHLY</code> | <code>ANNUAL</code> — how to read the amount.</td></tr>
+          <tr><td><code>paymentDate</code></td><td class="t-type">DateTime?</td><td>Anchor for one-time / non-recurring payments.</td></tr>
+          <tr class="summary"><td colspan="3">Recurrence &amp; vigencia</td></tr>
+          <tr><td><code>isRecurring</code></td><td class="t-type">Boolean = false</td><td>Whether the projection engine repeats it.</td></tr>
+          <tr><td><code>startDate / endDate</code></td><td class="t-type">DateTime?</td><td>Validity window; <code>endDate</code> bounds projection.</td></tr>
+          <tr><td><code>frequency</code></td><td class="t-type">enum CostFrequency</td><td><code>MONTHLY…ANNUAL</code> / <code>ONE_TIME</code> — months per occurrence.</td></tr>
+          <tr><td><code>contractTermMonths</code></td><td class="t-type">Int?</td><td>Derives an implicit end date when <code>endDate</code> is null.</td></tr>
+          <tr><td><code>autoRenew</code></td><td class="t-type">Boolean = false</td><td>Flags upcoming renewals in the dashboard.</td></tr>
+          <tr class="summary"><td colspan="3">Classification (drives report splits)</td></tr>
+          <tr><td><code>valueType</code></td><td class="t-type">enum CostValueType</td><td><code>FIXED</code> | <code>ESTIMATED</code>.</td></tr>
+          <tr><td><code>costNature</code></td><td class="t-type">enum CostNature</td><td><code>OPEX</code> | <code>CAPEX</code>.</td></tr>
+          <tr><td><code>isInvestmentProject</code></td><td class="t-type">Boolean</td><td>Marks investment-budget spend (cost-type split).</td></tr>
+          <tr><td><code>isCogs</code></td><td class="t-type">Boolean</td><td>Cost-of-goods-sold flag (accounting split). Invariant: <code>isCogs ⇒ serviceId</code>.</td></tr>
+          <tr><td><code>isTransversal</code></td><td class="t-type">Boolean</td><td>Cross-dimension cost → eligible for allocation spreading.</td></tr>
+          <tr><td><code>isActive</code></td><td class="t-type">Boolean</td><td>Soft delete; reports read active items only.</td></tr>
+          <tr class="summary"><td colspan="3">SEK Dimension 3 (Cliente/Negocio) &amp; investment governance</td></tr>
+          <tr><td><code>clientClassification</code></td><td class="t-type">enum ClientClassification = NA</td><td><code>CLI_ESP</code> | <code>CLI_FAC</code> | <code>NA</code>. <code>NA</code> distinguishes an explicit "no aplica" from an unclassified (null) client. <code>CLI_ESP</code> requires <code>clientId</code>.</td></tr>
+          <tr><td><code>investmentApprovalRef</code></td><td class="t-type">String?</td><td>C-Level approval reference; without it an OPEX-INV/CAPEX item is coerced to OPEX-GST (§10).</td></tr>
+          <tr><td><code>investmentApprovedByUserId / investmentApprovedAt</code></td><td class="t-type">String? / DateTime?</td><td>Approver + stamp, set on write when approval is present.</td></tr>
+          <tr><td><code>clientExceptionApproved</code></td><td class="t-type">Boolean = false</td><td>Finance-approved exception to "CAPEX/OPEX-INV ⇒ cliente = N/A" (§4/§5).</td></tr>
+          <tr class="summary"><td colspan="3">Dimensions (foreign keys to catalogs)</td></tr>
+          <tr><td><code>providerId, productId, countryId, costCenterId, categoryId</code></td><td class="t-type">String (FK)</td><td>Required dimension tags.</td></tr>
+          <tr><td><code>serviceId, businessUnitId, clientId</code></td><td class="t-type">String? (FK)</td><td>Optional dimension tags (<code>clientId</code> → ClientCatalog).</td></tr>
+          <tr><td><code>formulaId</code></td><td class="t-type">String? (FK)</td><td>Approved <code>DistributionFormula</code> reference for factorizable (*-FAC/*-TRV) costs.</td></tr>
+          <tr><td><code>createdByUserId</code></td><td class="t-type">String?</td><td>Created-by user (core system) — not modeled here.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <ul>
+      <li><strong>Projection &amp; Cash-flow:</strong> each active item is expanded into dated occurrences by frequency/vigencia and summed per period in base currency.</li>
+      <li><strong>GAP (projected side):</strong> the projected total per dimension that real spend is compared against.</li>
+      <li><strong>Overview KPIs &amp; breakdown:</strong> recurring-monthly, annual-licenses, investment-budget, projected-remaining plus the <strong>OPEX-GST / OPEX-INV / CAPEX</strong> ratio; breakdown buckets by accounting type / tipo-costo / country / category / client. Accounting type is derived <code>CAPEX → COGS → SG&amp;A</code>; cost type as <code>investment → licenses(annual) → recurring</code>; tipo-costo (SEK Dim 4) is derived <code>CAPEX → OPEX-INV(investment) → OPEX-GST</code> — all from existing fields, no stored column.</li>
+    </ul>
+  </section>
+
+  <!-- ═══ §3 COSTALLOCATION ═══ -->
+  <section class="section">
+    <h2 class="grad">3 · CostAllocation <span class="model-tag">finops_cost_allocations</span></h2>
+    <p>Prorrateo: when a planned cost is <em>transversal / factorizable</em>, this table spreads it across one or more targets of a chosen <strong>dimension</strong> by percentage. The SEK standard's factorizable codes map to the three allowed dimensions: <code>SVC-*/*-TRV</code> → <code>SERVICE</code>, <code>REG-FAC</code> → <code>COUNTRY</code>, <code>CLI-FAC</code> → <code>CLIENT</code>. Percentages for a given cost item must sum to 100 <em>within each dimension</em> (or be empty). Uniqueness on <code>(costItemId, dimension, targetId)</code> prevents double-weighting.</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr><td><code>costItemId</code></td><td class="t-type">String (FK)</td><td>The transversal cost item being spread (cascade delete).</td></tr>
+          <tr><td><code>dimension</code></td><td class="t-type">enum AllocationDimension = SERVICE</td><td><code>SERVICE</code> | <code>COUNTRY</code> | <code>CLIENT</code> — which dimension this share prorrates.</td></tr>
+          <tr><td><code>targetId</code></td><td class="t-type">String</td><td>Id of the service/country/client catalog entry (polymorphic; validated in the service layer against the active catalog, no hard FK).</td></tr>
+          <tr><td><code>percentage</code></td><td class="t-type">Decimal(7,4)</td><td>Share of the cost item allocated to this target (0–100).</td></tr>
+          <tr><td><code>formulaId</code></td><td class="t-type">String? (FK)</td><td>Approved <code>DistributionFormula</code> backing this split (SEK <code>formula_ref</code>).</td></tr>
+          <tr><td><code>createdAt / updatedAt</code></td><td class="t-type">DateTime</td><td>Audit timestamps.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <p>When Projection or GAP is grouped <code>by service</code>, <code>by country</code> or <code>by client</code>, items with allocations for that dimension are split across their targets by percentage weight; items without allocations are attributed whole to their own dimension id. This is what lets a shared platform cost show up proportionally under each service, country or client it supports.</p>
+  </section>
+
+  <!-- ═══ §4 DISTRIBUTIONFORMULA ═══ -->
+  <section class="section">
+    <h2 class="grad">4 · DistributionFormula <span class="model-tag">finops_distribution_formulas</span></h2>
+    <p>The approved prorrateo rule behind every factorizable (<code>*-FAC/*-TRV/REG-FAC/CLI-FAC</code>) cost — the SEK standard's <code>formula_ref</code> (§8). A formula must be <code>APPROVED</code> by Finance before it is applied; <code>CostItem.formulaId</code> and <code>CostAllocation.formulaId</code> both reference it.</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr><td><code>name / description</code></td><td class="t-type">String / String?</td><td>Label and how the distribution is computed.</td></tr>
+          <tr><td><code>criterion</code></td><td class="t-type">enum DistributionCriterion</td><td><code>CONSUMO</code> (EPS/GB) | <code>TICKETS</code> | <code>HEADCOUNT</code> | <code>AD_HOC</code> (§8).</td></tr>
+          <tr><td><code>status</code></td><td class="t-type">enum DistributionFormulaStatus = DRAFT</td><td><code>DRAFT</code> | <code>APPROVED</code> | <code>ARCHIVED</code>.</td></tr>
+          <tr><td><code>approvedByUserId / approvedAt</code></td><td class="t-type">String? / DateTime?</td><td>Finance approver + stamp, set by the approve action.</td></tr>
+          <tr><td><code>createdAt / updatedAt</code></td><td class="t-type">DateTime</td><td>Audit timestamps.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <p>Not read by the aggregation reports directly — it is a governance/reference entity. It is managed through <code>/api/v3/finops/distribution-formulas</code> (Finance-admin gated, with an <code>approve</code> action) and referenced by cost items and allocations to evidence that every factorizable split uses an approved, documented criterion.</p>
+  </section>
+
+  <!-- ═══ §4 REALSPENDRECORD ═══ -->
+  <section class="section">
+    <h2 class="grad">5 · RealSpendRecord <span class="model-tag">finops_real_spend_records</span></h2>
+    <p>The <strong>actual transaction</strong> — money that was really spent. It carries full provenance, a frozen base amount, deduplication and reconciliation state, and the same dimension tags as <code>CostItem</code> so the two can be compared head-to-head. Provenance is deliberately split into <em>business origin</em> (how it was paid) and <em>ingestion channel</em> (how the data entered).</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr class="summary"><td colspan="3">Amount &amp; frozen FX</td></tr>
+          <tr><td><code>amount</code></td><td class="t-type">Decimal(18,4)</td><td>Transaction amount in its original <code>currency</code>.</td></tr>
+          <tr><td><code>currency</code></td><td class="t-type">VarChar(3)</td><td>ISO currency of the transaction.</td></tr>
+          <tr><td><code>baseAmount</code></td><td class="t-type">Decimal(18,4)?</td><td>Frozen base-currency value (all reports sum this).</td></tr>
+          <tr><td><code>fxRate / fxRateDate</code></td><td class="t-type">Decimal(18,8)? / DateTime?</td><td>Rate/date used at freeze time (rate on/before <code>spendDate</code>).</td></tr>
+          <tr><td><code>spendDate</code></td><td class="t-type">DateTime</td><td>When the spend occurred (date filters / windows).</td></tr>
+          <tr><td><code>periodMonth</code></td><td class="t-type">DateTime</td><td>Month bucket — backs the per-month grouped indexes.</td></tr>
+          <tr class="summary"><td colspan="3">Split provenance (both required)</td></tr>
+          <tr><td><code>paymentOrigin</code></td><td class="t-type">enum PaymentOrigin</td><td>Business origin: <code>SAP·CARD·TRANSFER·AGREEMENT·CLOUD·OTHER</code>.</td></tr>
+          <tr><td><code>ingestionChannel</code></td><td class="t-type">enum IngestionChannel</td><td>Data path: <code>MANUAL·EXCEL·EMAIL·API</code>.</td></tr>
+          <tr><td><code>sourceRef / invoiceId</code></td><td class="t-type">String?</td><td>External references; part of the dedup fingerprint.</td></tr>
+          <tr><td><code>rawPayload</code></td><td class="t-type">Json?</td><td>Original source row, retained for traceability.</td></tr>
+          <tr class="summary"><td colspan="3">Idempotency &amp; reconciliation</td></tr>
+          <tr><td><code>sourceFingerprint</code></td><td class="t-type">String?, unique</td><td>Hash of origin+invoice+ref+amount+currency+date → blocks double-counting.</td></tr>
+          <tr><td><code>reconciliationStatus</code></td><td class="t-type">enum ReconciliationStatus</td><td><code>UNMATCHED·MATCHED·DUPLICATE·IGNORED</code>.</td></tr>
+          <tr><td><code>clientClassification</code></td><td class="t-type">enum ClientClassification = NA</td><td>SEK Dim 3 on the actual transaction: <code>CLI_ESP</code> | <code>CLI_FAC</code> | <code>NA</code>.</td></tr>
+          <tr class="summary"><td colspan="3">Links &amp; dimensions</td></tr>
+          <tr><td><code>costItemId</code></td><td class="t-type">String? (FK)</td><td>Optional link to the planned obligation it reconciles against.</td></tr>
+          <tr><td><code>importBatchId</code></td><td class="t-type">String? (FK)</td><td>The import batch that created it (plumbing).</td></tr>
+          <tr><td><code>provider/product/country/costCenter/category/service/businessUnit/clientId</code></td><td class="t-type">String? (FK)</td><td>The same eight catalog dimensions as CostItem (incl. <code>clientId</code> → ClientCatalog).</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <ul>
+      <li><strong>Accumulated:</strong> sum of <code>baseAmount</code> over a window, optionally grouped by dimension.</li>
+      <li><strong>GAP (real side):</strong> actual spend per dimension vs the projected total.</li>
+      <li><strong>New-spend &amp; Variance:</strong> compares current vs prior windows to surface new cost keys and threshold-crossing deltas.</li>
+      <li><strong>Savings realization:</strong> actual base spend over linked items in the target period.</li>
+      <li><strong>Overview executed-YTD:</strong> year-to-date base spend KPI.</li>
+    </ul>
+  </section>
+
+  <!-- ═══ §5 EXCHANGERATE ═══ -->
+  <section class="section">
+    <h2 class="grad">6 · ExchangeRate <span class="model-tag">finops_exchange_rates</span></h2>
+    <p>A date-versioned FX table. It is the source for the <strong>transactional-FX freeze</strong>: when any monetary record is written, the system looks up the rate as-of the relevant date and stores the converted base amount on that record — so the rate is captured once and historical totals never move when rates change later.</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr><td><code>baseCurrency</code></td><td class="t-type">VarChar(3)</td><td>Target/base currency of the conversion.</td></tr>
+          <tr><td><code>quoteCurrency</code></td><td class="t-type">VarChar(3)</td><td>Source currency being converted.</td></tr>
+          <tr><td><code>rate</code></td><td class="t-type">Decimal(18,8)</td><td>Conversion rate.</td></tr>
+          <tr><td><code>rateDate</code></td><td class="t-type">DateTime</td><td>Effective date — lookups pick the rate on/before a record's date.</td></tr>
+          <tr><td><code>source</code></td><td class="t-type">String?</td><td>Where the rate came from.</td></tr>
+          <tr><td colspan="3"><em>Unique on <code>(baseCurrency, quoteCurrency, rateDate)</code>; indexed on <code>(quoteCurrency, rateDate)</code>.</em></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <p>Indirectly powers <em>every</em> report: because conversion is frozen at write time, projection, GAP, accumulated and savings all simply sum <code>baseAmount</code> — no live conversion, no drift. Savings realization additionally re-freezes baseline/expected amounts as-of the initiative's target-period start for comparability.</p>
+  </section>
+
+  <!-- ═══ §6 SAVINGS ═══ -->
+  <section class="section">
+    <h2 class="grad">7 · SavingsInitiative &amp; SavingsInitiativeItem</h2>
+    <p>Tracks cost-reduction initiatives and proves they landed. The core formula is <code>realized = baseline − actual</code>, measured over the actual spend of the linked cost items during the target period. The join table links an initiative to the specific obligations it intends to reduce.</p>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr class="summary"><td colspan="3">SavingsInitiative <code>finops_savings_initiatives</code></td></tr>
+          <tr><td><code>id</code></td><td class="t-type">String (uuid)</td><td>Primary key.</td></tr>
+          <tr><td><code>title / description</code></td><td class="t-type">String / String?</td><td>Label and notes.</td></tr>
+          <tr><td><code>expectedSavingsAmount</code></td><td class="t-type">Decimal(18,4)</td><td>Target saving (the goal).</td></tr>
+          <tr><td><code>baselineAmount</code></td><td class="t-type">Decimal(18,4)?</td><td>Pre-initiative spend baseline.</td></tr>
+          <tr><td><code>realizedSavingsAmount</code></td><td class="t-type">Decimal(18,4)?</td><td>Cached <code>baseline − actual</code> result.</td></tr>
+          <tr><td><code>currency</code></td><td class="t-type">VarChar(3)</td><td>ISO currency of the amounts.</td></tr>
+          <tr><td><code>status</code></td><td class="t-type">enum SavingsStatus</td><td><code>IDENTIFIED·IN_PROGRESS·REALIZED·CANCELLED</code>.</td></tr>
+          <tr><td><code>targetPeriodStart / End</code></td><td class="t-type">DateTime</td><td>Window over which savings are measured / frozen.</td></tr>
+          <tr><td><code>countryId / serviceId / businessUnitId / clientId</code></td><td class="t-type">String? (FK)</td><td>"Área afectada" when no specific item applies (incl. the client dimension).</td></tr>
+          <tr class="summary"><td colspan="3">SavingsInitiativeItem <code>finops_savings_initiative_items</code></td></tr>
+          <tr><td><code>initiativeId</code></td><td class="t-type">String (FK)</td><td>Parent initiative (cascade delete).</td></tr>
+          <tr><td><code>costItemId</code></td><td class="t-type">String (FK)</td><td>A targeted cost item. Unique on <code>(initiativeId, costItemId)</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>Used in reports</h3>
+    <p><strong>Savings realization</strong> sums actual base spend over the linked items in the target period, computes <code>realized = baseline − actual</code> and a compliance percent vs <code>expected</code>, and caches the result on the initiative. The <strong>Overview</strong> dashboard rolls up <code>realizedSavingsAmount</code> across initiatives into the savings-goal progress.</p>
+  </section>
+
+  <!-- ═══ §7 PLUMBING NOTE ═══ -->
+  <div class="note">
+    <strong>Operational plumbing (not part of the reporting model).</strong> Four tables support the import pipeline and audit but are <em>not</em> read by any report: <code>SpendImportBatch</code> (file upload + row counts), <code>ExecutionTracker</code> (async upload→Airflow→agent-fix→insert orchestration state), <code>SpendBatchAttempt</code> (idempotency ledger for batch inserts), and <code>FinopsAuditEvent</code> (immutable change trail). They <em>populate and protect</em> <code>RealSpendRecord</code>; they don't appear in projection, GAP, variance or savings outputs. Intentionally omitted from the field-level detail above.
+  </div>
+
+  <hr class="separator" />
+
+  <!-- ═══ DATA FLOW DIAGRAM ═══ -->
+  <section class="section">
+    <h2 class="grad">Data flow — ingestion → freeze → storage → serving</h2>
+    <p>Two write paths converge on a single rule: <strong>freeze the base amount on write</strong>. Actual spend is deduplicated by fingerprint before insert; planned obligations are authored directly. Both then feed the aggregation services that back the API.</p>
+    <div class="diagram full-width">
+      <pre class="mermaid">
+flowchart LR
+    subgraph ING["Ingestion"]
+      M["Manual entry"]
+      X["Excel / file import"]
+      A["External API / Cloud"]
+    end
+    subgraph PLAN["Planning"]
+      CI_AUTHOR["Author CostItem"]
+    end
+
+    M --> DEDUP
+    X --> DEDUP
+    A --> DEDUP
+    DEDUP["Fingerprint dedup"] --> FX
+    CI_AUTHOR --> FX
+    FX["FX freeze<br/>(ExchangeRate lookup)"] --> RSR[("RealSpendRecord")]
+    FX --> CI[("CostItem")]
+
+    RSR --> AGG
+    CI --> AGG
+    FORM[("DistributionFormula")] --> ALLOC[("CostAllocation")]
+    ALLOC --> AGG
+    SAV[("SavingsInitiative")] --> AGG
+    AGG["Aggregation services"] --> API["/api/v3/finops/*"]
+    API --> UI["FinOps dashboards"]
+
+    classDef ingest fill:#1e293b,stroke:#38bdf8,color:#f1f5f9;
+    classDef fx fill:#1e293b,stroke:#64FF7C,color:#f1f5f9;
+    classDef store fill:#253349,stroke:#00E77C,color:#f1f5f9;
+    classDef serve fill:#1e293b,stroke:#c084fc,color:#f1f5f9;
+    class M,X,A,CI_AUTHOR,DEDUP ingest;
+    class FX fx;
+    class RSR,CI,ALLOC,SAV,FORM store;
+    class AGG,API,UI serve;
+      </pre>
+      <div class="cap">Both write paths freeze a base amount; reports read only the frozen values.</div>
+    </div>
+  </section>
+
+  <!-- ═══ REPORT CONSUMPTION DIAGRAM ═══ -->
+  <section class="section">
+    <h2 class="grad">Report consumption — which models feed which report</h2>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart TD
+    CI[("CostItem")]
+    AL[("CostAllocation")]
+    RS[("RealSpendRecord")]
+    SV[("SavingsInitiative")]
+    EX[("ExchangeRate")]
+
+    CI --> OV["Overview / Breakdown"]
+    RS --> OV
+    SV --> OV
+    CI --> PR["Projection / Cash-flow"]
+    AL --> PR
+    RS --> PR
+    CI --> GP["GAP"]
+    AL --> GP
+    RS --> GP
+    RS --> NV["New-spend / Variance"]
+    SV --> SR["Savings realization"]
+    CI --> SR
+    RS --> SR
+    EX --> SR
+    RS --> AC["Accumulated"]
+
+    classDef model fill:#253349,stroke:#00E77C,color:#f1f5f9;
+    classDef report fill:#1e293b,stroke:#019F61,color:#f1f5f9;
+    class CI,AL,RS,SV,EX model;
+    class OV,PR,GP,NV,SR,AC report;
+      </pre>
+      <div class="cap">Edges = "is read by". CostItem and RealSpendRecord are the most-consumed; ExchangeRate is read explicitly only by savings re-freezing.</div>
+    </div>
+  </section>
+
+  <!-- ═══ REPORT MATRIX TABLE ═══ -->
+  <section class="section">
+    <h2 class="grad">Reference — Report → Models → Metric</h2>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Report / Endpoint</th><th>Models read</th><th>Metric computed</th></tr></thead>
+        <tbody>
+          <tr><td>Overview <code>/finops/overview</code></td><td>CostItem · RealSpendRecord · SavingsInitiative</td><td>Executed-YTD, projected-year/remaining, recurring-monthly, annual-licenses, investment-budget, realized-savings, renewals.</td></tr>
+          <tr><td>Breakdown <code>/overview/breakdown</code></td><td>CostItem (+ country/category/client)</td><td>Annual/monthly planned base per accounting type · tipo-costo · country · category · client.</td></tr>
+          <tr><td>Projection <code>/finops/projection</code></td><td>CostItem</td><td>Period totals (base currency) from recurrence/vigencia expansion.</td></tr>
+          <tr><td>Cash-flow <code>/projection/cash-flow</code></td><td>CostItem · RealSpendRecord</td><td>Projection + actual overlay + upcoming renewals.</td></tr>
+          <tr><td>GAP <code>/analysis/gap</code></td><td>CostItem · CostAllocation · RealSpendRecord</td><td>projected − real, gap % per dimension (service/country/client grouping uses allocation spread).</td></tr>
+          <tr><td>New-spend <code>/analysis/new-spend</code></td><td>RealSpendRecord</td><td>Cost keys present in current window but absent in comparison.</td></tr>
+          <tr><td>Variance <code>/analysis/variances</code></td><td>RealSpendRecord · CostItem</td><td>current − comparison delta &amp; % per item, above threshold.</td></tr>
+          <tr><td>Savings realization <code>/savings/:id/realization</code></td><td>SavingsInitiative · Item · RealSpendRecord · ExchangeRate</td><td>realized = baseline − actual; compliance % vs expected.</td></tr>
+          <tr><td>Accumulated <code>/spend/accumulated</code></td><td>RealSpendRecord</td><td>Total base + count, optionally per dimension (incl. client).</td></tr>
+          <tr><td>Distribution formulas <code>/finops/distribution-formulas</code></td><td>DistributionFormula</td><td>CRUD + approve for factorizable prorrateo rules (governance; not an aggregation).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr class="separator" />
+
+  <!-- ═══ DESIGN PRINCIPLES TIER STRIP ═══ -->
+  <section class="section">
+    <h2 class="grad">Design principles that make the reports trustworthy</h2>
+    <div class="tier-strip">
+      <div class="tier-card"><h4>Planned vs Actual</h4><p>CostItem (obligation, no provenance) and RealSpendRecord (transaction, full provenance) never blend — the GAP report depends on this split.</p></div>
+      <div class="tier-card"><h4>Transactional FX</h4><p>Base amount is frozen on write with the rate &amp; date captured. Historical totals never drift when FX changes.</p></div>
+      <div class="tier-card"><h4>Split provenance</h4><p><code>paymentOrigin</code> (how it was paid) is distinct from <code>ingestionChannel</code> (how data arrived) — two independent lenses.</p></div>
+      <div class="tier-card"><h4>Multi-dimension allocation</h4><p>Transversal costs spread across services, countries or clients by weighted <code>CostAllocation</code> (polymorphic <code>dimension</code>+<code>targetId</code>); un-allocated costs stay whole.</p></div>
+      <div class="tier-card"><h4>Fingerprint idempotency</h4><p>A unique <code>sourceFingerprint</code> blocks double-counting; batch attempts are idempotent on replay.</p></div>
+      <div class="tier-card"><h4>Derived accounting &amp; tipo-costo</h4><p>Accounting type derives <code>CAPEX → COGS → SG&amp;A</code>; cost type <code>investment → licenses → recurring</code>; SEK tipo-costo <code>CAPEX → OPEX-INV → OPEX-GST</code> — all from existing fields.</p></div>
+      <div class="tier-card"><h4>SEK four-dimension standard</h4><p>Servicio · país · cliente · tipo de costo. Client is a first-class catalog keyed on the Service Operation Hub ID; factorizable costs carry an approved <code>DistributionFormula</code>.</p></div>
+      <div class="tier-card"><h4>Investment governance</h4><p>OPEX-INV/CAPEX needs a C-Level approval reference or it is coerced to OPEX-GST; CAPEX/OPEX-INV forces cliente = N/A unless a Finance-approved exception.</p></div>
+    </div>
+  </section>
+
+  <!-- ═══ ENUM REFERENCE ═══ -->
+  <section class="section">
+    <h2 class="grad">Enum reference</h2>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Enum</th><th>Values</th><th>Where used</th></tr></thead>
+        <tbody>
+          <tr><td><code>CostAmountPeriod</code></td><td>MONTHLY · ANNUAL</td><td>CostItem.amountPeriod</td></tr>
+          <tr><td><code>CostFrequency</code></td><td>MONTHLY · QUARTERLY · SEMIANNUAL · ANNUAL · ONE_TIME · OTHER</td><td>CostItem.frequency</td></tr>
+          <tr><td><code>CostValueType</code></td><td>FIXED · ESTIMATED</td><td>CostItem.valueType</td></tr>
+          <tr><td><code>CostNature</code></td><td>OPEX · CAPEX</td><td>CostItem.costNature</td></tr>
+          <tr><td><code>PaymentOrigin</code></td><td>SAP · CARD · TRANSFER · AGREEMENT · CLOUD · OTHER</td><td>RealSpendRecord.paymentOrigin</td></tr>
+          <tr><td><code>IngestionChannel</code></td><td>MANUAL · EXCEL · EMAIL · API</td><td>RealSpendRecord.ingestionChannel</td></tr>
+          <tr><td><code>ReconciliationStatus</code></td><td>UNMATCHED · MATCHED · DUPLICATE · IGNORED</td><td>RealSpendRecord.reconciliationStatus</td></tr>
+          <tr><td><code>SavingsStatus</code></td><td>IDENTIFIED · IN_PROGRESS · REALIZED · CANCELLED</td><td>SavingsInitiative.status</td></tr>
+          <tr><td><code>ClientClassification</code></td><td>CLI_ESP · CLI_FAC · NA</td><td>CostItem / RealSpendRecord .clientClassification</td></tr>
+          <tr><td><code>AllocationDimension</code></td><td>SERVICE · COUNTRY · CLIENT</td><td>CostAllocation.dimension</td></tr>
+          <tr><td><code>DistributionCriterion</code></td><td>CONSUMO · TICKETS · HEADCOUNT · AD_HOC</td><td>DistributionFormula.criterion</td></tr>
+          <tr><td><code>DistributionFormulaStatus</code></td><td>DRAFT · APPROVED · ARCHIVED</td><td>DistributionFormula.status</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">All monetary fields are <code>Decimal(18,4)</code> and FX rates <code>Decimal(18,8)</code> — money is kept at full precision end-to-end and only rounded for display. Currencies are 3-char ISO codes.</div>
+  </section>
+
+  <footer>
+    Helena FinOps — Data Model Architecture · 2026
+  </footer>
+
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1e293b',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#00E77C',
+      lineColor: '#94a3b8',
+      fontFamily: 'Inter',
+      fontSize: '16px',
+      clusterBkg: 'rgba(255,255,255,0.02)',
+      clusterBorder: 'rgba(255,255,255,0.1)',
+      /* erDiagram: dark attribute-row fills so the light attribute text stays readable */
+      attributeBackgroundColorOdd: '#253349',
+      attributeBackgroundColorEven: '#1e293b',
+      nodeTextColor: '#f1f5f9',
+      textColor: '#f1f5f9'
+    },
+    flowchart: { curve: 'basis', nodeSpacing: 60, rankSpacing: 65, padding: 20 }
+  });
+</script>
+</body>
+</html>

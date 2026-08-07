@@ -19,6 +19,8 @@ from starlette.responses import Response
 import asyncio
 
 from .auth.cognito import get_current_user, scoped_thread_id
+from .auth.machine import require_system_key
+from .finops.spend_fix import fix_spend_file
 from .agents.backend_client import (
     fetch_active_code_names,
     fetch_agent_credentials,
@@ -232,6 +234,17 @@ class ChatResumeRequest(BaseModel):
     agent_code_name: str = ""
     agent_version: int = 1
     agent_type: str = "sales"
+
+
+class FixSpendFileRequest(BaseModel):
+    """Machine request to repair a rejected FinOps spend import."""
+
+    tenantId: str
+    s3Bucket: str
+    s3Key: str
+    batchId: str
+    errors: list[dict] = []
+    expectedSchema: str = "NormalizedSpendRecord"
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +463,51 @@ async def health() -> dict:
 async def metrics() -> Response:
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/agent/fix-spend-file")
+async def fix_spend_file_endpoint(
+    req: FixSpendFileRequest,
+    _: Annotated[None, Depends(require_system_key)],
+) -> dict:
+    """Machine-to-machine: repair a malformed spend file in S3 (non-SSE JSON).
+
+    Reads the original from S3, maps/coerces toward NormalizedSpendRecord, writes a
+    corrected file back under the same tenant prefix, and returns
+    {correctedS3Key, fixedRowCount, unfixableRows}. No interrupt/approval — this is
+    called by a service, not a user.
+    """
+    logger.info(
+        "fix_spend_file_start",
+        tenant_id=req.tenantId,
+        batch_id=req.batchId,
+        s3_key=req.s3Key,
+        error_count=len(req.errors),
+    )
+    try:
+        result = await fix_spend_file(
+            tenant_id=req.tenantId,
+            s3_bucket=req.s3Bucket,
+            s3_key=req.s3Key,
+            batch_id=req.batchId,
+            errors=req.errors,
+            expected_schema=req.expectedSchema,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:
+        logger.error("fix_spend_file_failed", error=str(exc), batch_id=req.batchId)
+        record_tool_error("fix_spend_file", "finops")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Spend-file repair failed: {exc}",
+        )
+    logger.info(
+        "fix_spend_file_done",
+        batch_id=req.batchId,
+        **{k: result[k] for k in ("correctedS3Key", "fixedRowCount")},
+    )
+    return result
 
 
 @app.post("/chat/stream")

@@ -21,6 +21,9 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "anthropic>=0.40",
     "google-cloud-aiplatform>=1.60",
+    "boto3>=1.34",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

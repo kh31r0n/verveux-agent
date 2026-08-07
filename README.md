@@ -189,6 +189,29 @@ Returns `{"status": "ok"}`.
 
 Prometheus metrics endpoint.
 
+### `POST /agent/fix-spend-file`
+
+Machine-to-machine (no Cognito JWT, no SSE): repairs a malformed FinOps spend
+workbook in S3. Guarded by `X-System-Key` — see [FinOps spend-file repair](#finops-spend-file-repair).
+
+```jsonc
+// Request
+{
+  "tenantId": "...",
+  "s3Bucket": "...",
+  "s3Key": "finops/imports/{tenantId}/{batchId}/spend.xlsx",
+  "batchId": "...",
+  "errors": [],                              // rows the batch insert rejected
+  "expectedSchema": "NormalizedSpendRecord"
+}
+// Response
+{
+  "correctedS3Key": "finops/imports/{tenantId}/{batchId}/corrected-a1b2c3d4.xlsx",
+  "fixedRowCount": 42,
+  "unfixableRows": [{ "rowIndex": 7, "reason": "missing required field(s): ['amount']" }]
+}
+```
+
 ## Configuration
 
 All settings are loaded from environment variables (or a `.env` file).
@@ -199,6 +222,38 @@ All settings are loaded from environment variables (or a `.env` file).
 | `COGNITO_ISSUER` | Yes | -- | Cognito issuer URL |
 | `COGNITO_JWKS_URL` | Yes | -- | JWKS endpoint for token validation |
 | `NESTJS_BASE_URL` | No | -- | Backend base URL for credential fetching |
+| `WEBHOOK_API_KEY` | No | `dev-webhook-secret` | Shared machine secret — `X-System-Key` inbound, `X-Agent-Key` outbound |
+| `AWS_S3_BUCKET` | No | -- | Bucket for spend-file repair (same bucket as the backend's uploads) |
+| `AWS_S3_REGION` | No | `us-east-1` | Region for the above |
+| `AGENT_MACHINE_HMAC_SECRET` | No | -- | When set, machine callers must also send `x-hmac-signature` |
+| `SPEND_FIX_MODEL` | No | `gpt-5.6-luna` | Model for spend-file column-mapping inference |
+
+## FinOps spend-file repair
+
+`POST /agent/fix-spend-file` normalizes a rejected spend workbook toward the
+canonical `NormalizedSpendRecord` shape and writes a corrected file back to S3.
+Mapping is deterministic first (an ES/EN alias map over the headers) with an LLM
+column-mapping pass layered on top; value coercion handles European vs US decimal
+separators, six date formats, and payment-origin synonyms.
+
+It is **aggressive by design**: non-identifying fields are defaulted
+(`ingestionChannel`→`EXCEL`, unknown `paymentOrigin`→`OTHER`), but the identifying
+fields — `amount`, `currency`, `spendDate` — are never fabricated. Rows still
+missing one of those are reported in `unfixableRows` **and kept in the corrected
+file**, so an all-or-nothing batch keeps failing rather than silently dropping data.
+
+Corrected objects land under `finops/imports/{tenantId}/{batchId}/` — the same
+tenant-scoped prefix the backend writes originals to, so one tenant's output is
+never reachable under another's.
+
+Auth is `X-System-Key` matched constant-time against `WEBHOOK_API_KEY`, with an
+optional HMAC-SHA256 body signature (`x-hmac-signature`) when
+`AGENT_MACHINE_HMAC_SECRET` is set. It fails **closed**: an unset `WEBHOOK_API_KEY`
+returns 503 rather than accepting any caller.
+
+> Ported from `helena-agent`, where it served the Airflow `finops_spend_import`
+> DAG. The backend's `SpendImportService` currently parses in-request, so nothing
+> calls this endpoint yet — it is here for the async import path.
 
 ## Running Locally
 
@@ -258,8 +313,13 @@ src/
   observability.py       # Prometheus counters
   auth/
     cognito.py           # JWT validation, get_current_user, scoped_thread_id
+    machine.py           # X-System-Key (+ optional HMAC) guard for machine callers
   db/
     postgres.py          # asyncpg pool init/close + migration runner
+  finops/
+    spend_fix.py         # Spend-file repair: alias/LLM column mapping + coercion
+  integrations/
+    s3.py                # Lazy boto3 read/write for the spend-file repair
   agents/
     triage.py            # Intent classification
     sales_collect.py     # Product selection + cart management

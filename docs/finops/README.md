@@ -29,5 +29,6 @@ yet.
 | `OPS_REALSPEND_IMPORT.md` | Operator runbook for that workflow |
 | `PRS_REALSPEND_IMPORT.md` | Per-repo PR descriptions for the same work |
 | `FINOPS_DATA_ARCHITECTURE.html` | Data-architecture reference (rendered) |
+| `sek-catalog-taxonomy.md` | SEK's concrete catalog codes, rescued from helena-backend's seed |
 
 A happy-path sample workbook lives at `tests/fixtures/realspend-test-happy-usd.xlsx`.

@@ -74,6 +74,15 @@ query_normalizations_total = Counter(
     ["outcome"],
 )
 
+# Reasons: no_credentials | invalid_token | caller_not_allowed |
+# email_unverified | token_decode_error | jwks_unavailable |
+# allowlist_unconfigured
+service_auth_rejects_total = Counter(
+    "service_auth_rejects_total",
+    "Rejected service-to-service authentication attempts",
+    ["reason"],
+)
+
 
 def record_node_invocation(node: str, agent_code_name: str = "unknown") -> None:
     agent_node_invocations_total.labels(

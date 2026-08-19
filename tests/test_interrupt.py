@@ -146,7 +146,7 @@ class TestSalesFlow:
             patch("src.graphs.sales_graph.execute_node", new=mock_execute),
             patch("src.providers.openai.OpenAIProvider.stream_chat", new=mock_stream_chat),
             patch("src.providers.anthropic.AnthropicProvider.stream_chat", new=mock_stream_chat),
-            patch("src.providers.vertex.VertexProvider.stream_chat", new=mock_stream_chat),        ):
+            patch("src.providers.gemini.GeminiProvider.stream_chat", new=mock_stream_chat),        ):
             graph = build_graph(MemorySaver())
             chunks = []
             async for chunk in graph.astream(

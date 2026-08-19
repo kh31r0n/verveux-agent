@@ -35,8 +35,9 @@ Helena Agent is a **LangGraph-based multi-agent service** for WhatsApp customer 
 ### Request Flow
 
 ```
-NestJS → POST /chat/stream (JWT + message body)
-  → FastAPI (src/main.py): validate Cognito JWT, scope thread_id as "{cognito_sub}:{client_thread_id}"
+NestJS → POST /chat/stream (service credential + message body)
+  → FastAPI (src/main.py): authenticate the calling service, scope thread_id as
+    "{tenantId}:system:{conversationId}:{agentCodeName}:v{agentVersion}"
   → per-thread coalescing (_coalesced_stream): serialize runs, merge rapid message bursts
   → LangGraph graph.astream() → PostgreSQL checkpointer
   → SSE events streamed back: token | step_progress | execute_workflow | node_update | interrupt_detected | done | error
@@ -88,9 +89,18 @@ START → triage
 
 `resolve_api_key(config)` extracts the key from `config["configurable"]["openai_api_key"]` (set per-request) or falls back to `settings.openai_api_key`. Each agent node calls this independently — there is no shared client instance.
 
-### Authentication (`src/auth/cognito.py`)
+### Authentication (`src/auth/service_auth.py`)
 
-RS256 JWT validation via AWS Cognito JWKS (cached 5 min). JWKS URL and issuer are constructed automatically from `COGNITO_USER_POOL_ID` and `COGNITO_REGION`. Validates `token_use` claim (`access` or `id`) and optionally `client_id`/`aud` against `COGNITO_APP_CLIENT_ID`. Thread IDs are scoped per user (`{sub}:{thread_id}`) to prevent cross-user state leaks. API keys from the request body are stripped before emitting `node_update` SSE events.
+Every caller is another service — the NestJS backend and its schedulers — never an end user. There is no browser or mobile client on the other end, which is why this verifies *workload* identity rather than user identity. It replaced the AWS Cognito verifier, whose JWT branch was dead on every production request.
+
+Two accepted credentials, both handled by the single `verify_service_caller` dependency (all four authenticated routes share it):
+
+1. **Google OIDC ID token** on `Authorization: Bearer`. RS256 against Google's JWKS (`https://www.googleapis.com/oauth2/v3/certs`, cached 5 min), issuer `https://accounts.google.com`, `aud` pinned to `SERVICE_AUTH_AUDIENCE` (this service's own Cloud Run URL), then `email_verified == true` and `email` in `SERVICE_AUTH_ALLOWED_SERVICE_ACCOUNTS`. Fails closed when the audience is set but the allowlist is empty. Cloud Run's IAM layer already validates this at the edge (`allow_unauthenticated = false`) and forwards it, so verifying here is defence in depth — which matters because the same image runs under `docker compose` with no Cloud Run in front.
+2. **Shared secret** (`WEBHOOK_API_KEY`) on `X-System-Key` or `x-agent-key`, gated by `ALLOW_SHARED_SECRET_AUTH`. A *present but wrong* key does not short-circuit: during the migration the backend sends both credentials, and a stale secret must not veto a valid token.
+
+`get_current_user` always returns the literal `"system"`. **That value is persisted data, not an auth detail** — it is the second segment of every LangGraph thread id in Postgres (`{tenantId}:system:{conversationId}:{codeName}:v{n}`), so returning a service-account email or a numeric `sub` instead would orphan every live conversation's checkpoint history. `tests/test_service_auth.py` guards it.
+
+Rejections funnel through one helper that increments `service_auth_rejects_total{reason}` and logs `service_auth_reject`; the detail returned to the caller stays coarse. API keys from the request body are stripped before emitting `node_update` SSE events.
 
 ### Database (`src/db/postgres.py`, `migrations/init.sql`)
 
@@ -108,14 +118,13 @@ Copy `.env.example` to `.env`. Required vars:
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string |
-| `COGNITO_USER_POOL_ID` | AWS Cognito User Pool ID (e.g., `us-east-1_abc123`) |
-| `COGNITO_REGION` | AWS region (e.g., `us-east-1`) |
+| `SERPER_API_KEY` | Web search for the prospecting agent — a startup validator refuses to boot without it. It checks PRESENCE only: a set-but-invalid key boots fine and then gets `403 Unauthorized` on every `/search` and `/places` call, which `_serper_post` now turns into a fatal `SerperAuthError` so the run ends FAILED instead of reporting `found: 0` (as it silently did before 2026-08-18) |
 
-Optional: `COGNITO_APP_CLIENT_ID` (audience validation), `OPENAI_API_KEY` (fallback; per-request key preferred), `LANGFUSE_*`.
+Optional: `SERVICE_AUTH_AUDIENCE` / `SERVICE_AUTH_ALLOWED_SERVICE_ACCOUNTS` / `ALLOW_SHARED_SECRET_AUTH` (see Authentication — leave the audience empty locally), `WEBHOOK_API_KEY`, `NESTJS_BASE_URL`, `OPENAI_API_KEY` (fallback; per-request key preferred), `GEMINI_*` (absent, the Gemini provider falls back to Application Default Credentials — which is the only auth Agent Platform accepts; it rejects API keys), `LANGFUSE_*`.
 
 ## Testing
 
-Tests use `MemorySaver` (no database needed). `conftest.py` sets dummy env vars (`DATABASE_URL`, `COGNITO_USER_POOL_ID`, `COGNITO_REGION`) before any app modules import. `asyncio_mode = "auto"` in `pyproject.toml` — no need to mark individual tests with `@pytest.mark.asyncio`.
+Tests use `MemorySaver` (no database needed). `conftest.py` sets dummy env vars (`DATABASE_URL`, `SERPER_API_KEY`) and an empty `SERVICE_AUTH_AUDIENCE` before any app modules import, so the suite runs against the shared-secret path without reaching Google's JWKS endpoint. `asyncio_mode = "auto"` in `pyproject.toml` — no need to mark individual tests with `@pytest.mark.asyncio`.
 
 Key test patterns: mock individual agent nodes (e.g., `patch("src.graphs.main_graph.triage_node")`), build a fresh graph with `build_graph(MemorySaver())`, stream with `graph.astream()`, and inspect chunks. Tests verify routing logic, API key security (no leaks into state/interrupts), and auto-chaining flows.
 

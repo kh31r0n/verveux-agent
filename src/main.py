@@ -3,7 +3,7 @@ import logging
 import traceback
 import uuid
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Annotated
 
 import structlog
@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # used in lifespan
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.store.postgres.aio import AsyncPostgresStore  # long-term prospecting memory
 from langgraph.types import Command
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
@@ -19,13 +20,20 @@ from starlette.responses import Response
 
 import asyncio
 
-from .auth.cognito import get_current_user, scoped_thread_id
+from .auth.service_auth import (
+    get_current_user,
+    scoped_thread_id,
+    verify_service_caller,
+)
 from .agents.backend_client import (
     fetch_active_code_names,
     fetch_agent_credentials,
     fetch_in_use_code_names,
+    report_enrichment_attempt,
     report_prospecting_run,
 )
+from .agents.prospecting_nodes import DEFAULT_LOCATION
+from .services.serper import serper_call_count, start_serper_accounting
 from .config import settings
 from .db.postgres import (
     close_pool,
@@ -40,6 +48,7 @@ from .graphs.registry import (
     known_code_names,
     resolve_legacy_agent_type,
     set_checkpointer,
+    set_store,
     warm_up,
 )
 from .observability import (
@@ -115,11 +124,27 @@ async def lifespan(app: FastAPI):
             ("src.schemas.intent", "StructuredIntent"),
         ]
     )
-    async with AsyncPostgresSaver.from_conn_string(
-        settings.database_url, serde=legacy_serde
-    ) as checkpointer:
+    async with AsyncExitStack() as stack:
+        checkpointer = await stack.enter_async_context(
+            AsyncPostgresSaver.from_conn_string(
+                settings.database_url, serde=legacy_serde
+            )
+        )
         await checkpointer.setup()
         set_checkpointer(checkpointer)
+
+        # Long-term store for the prospecting agent's cross-run strategy memory.
+        # Separate from the checkpointer (which is per-run/per-thread). Best
+        # effort: if it can't initialise, aurora falls back to stateless runs.
+        try:
+            store = await stack.enter_async_context(
+                AsyncPostgresStore.from_conn_string(settings.database_url)
+            )
+            await store.setup()
+            set_store(store)
+            logger.info("prospecting_store_ready")
+        except Exception as exc:  # noqa: BLE001 — store is optional; never block boot
+            logger.error("prospecting_store_init_failed", error=str(exc))
 
         registry = known_code_names()
 
@@ -212,9 +237,9 @@ class ChatStreamRequest(BaseModel):
     llm_provider: str = "openai"
     llm_model: str = ""
     anthropic_api_key: str = ""
-    vertex_credentials: dict = {}
-    vertex_project_id: str = ""
-    vertex_location: str = ""
+    gemini_credentials: dict = {}
+    gemini_project_id: str = ""
+    gemini_location: str = ""
     # ── Multi-agent versioning ───────────────────────────────────────────────
     # `agent_code_name` is the canonical routing key (e.g. "helena"). Phase-1
     # callers may omit it; we fall back to `agent_type` via the registry shim
@@ -271,10 +296,10 @@ class ChatResumeRequest(BaseModel):
 class ProspectingRunRequest(BaseModel):
     """Backend-scheduler trigger for one autonomous prospecting run (aurora).
 
-    Unlike the chat endpoints this is not authenticated with a Cognito JWT —
-    it's a service-to-service call gated by the shared X-Agent-Key. Credentials
-    are NOT forwarded here; the agent resolves the tenant's LLM key itself via
-    fetch_agent_credentials, exactly as /chat/stream does after receiving one.
+    Authenticated like every other route, by verify_service_caller — a Google
+    OIDC ID token or the shared secret (here usually spelled x-agent-key).
+    Credentials are NOT forwarded; the agent resolves the tenant's LLM key
+    itself via fetch_agent_credentials, exactly as /chat/stream does.
     """
 
     tenant_id: str
@@ -282,18 +307,58 @@ class ProspectingRunRequest(BaseModel):
     run_date: str = ""
     agent_code_name: str = "aurora"
     prompts: dict[str, PromptPayload] = {}
+    # Tenant-configurable targeting.
+    # niche:    {key, label, search_terms: [...]}          — WHAT to search for
+    # location: {country, gl?, hl?, cities: [...]}          — WHERE to search
+    #
+    # `niche` is REQUIRED (validated below): aurora is industry-agnostic, and a
+    # built-in fallback would silently prospect an industry the tenant never
+    # asked for. `location` stays optional — a country default is a reach
+    # setting, not a claim about the tenant's business.
+    niche: dict | None = None
+    location: dict | None = None
 
 
-def require_agent_key(
-    x_agent_key: Annotated[str | None, Header(alias="x-agent-key")] = None,
-) -> None:
-    """FastAPI dependency: the shared internal service key (WEBHOOK_API_KEY).
+class EnrichmentRunRequest(BaseModel):
+    """Backend-scheduler trigger for one contact website enrichment (sherlock).
 
-    First non-Cognito auth surface in this service — used only by internal
-    service-to-service endpoints (the prospecting trigger).
+    Like the prospecting trigger this is a service-to-service call authenticated
+    by verify_service_caller, and credentials are resolved by the agent itself
+    via fetch_agent_credentials.
+
+    `website_url` is a tenant-editable field, so every fetch derived from it goes
+    through the SSRF-hardened `services.web_fetch`. `contact_country` is passed
+    through untouched — the backend uses it to validate phone candidates as
+    E.164, the agent never normalizes numbers itself.
     """
-    if not x_agent_key or x_agent_key != settings.webhook_api_key:
-        raise HTTPException(status_code=401, detail="Invalid agent key")
+
+    tenant_id: str
+    attempt_id: str
+    contact_id: str
+    # Empty when the contact has no website on file. The graph then discovers one
+    # from `contact_name` + `contact_city`/`contact_country` and reports it back;
+    # the backend writes it onto the contact.
+    website_url: str = ""
+    contact_country: str = ""
+    contact_city: str = ""
+    contact_name: str = ""
+    # Output language for the generated description/strategy, from
+    # TenantSettings.language. Defaults to Spanish when the backend omits it.
+    language: str = "es"
+    agent_code_name: str = "sherlock"
+    prompts: dict[str, PromptPayload] = {}
+    # The TENANT'S own commercial profile (TenantSettings.enrichmentIcp):
+    # {industry, business_description, ideal_customer, disqualifiers[]}. Used to
+    # judge the prospect's FIT and to write the sales strategy against what this
+    # tenant actually sells — the prompts used to hardcode one offering for
+    # everyone. Deliberately carries NO prices: the backend alone maps fit
+    # drivers onto a price tier. Empty for older backends, which degrades to the
+    # prompt's own generic wording rather than failing.
+    icp: dict = {}
+    # Serper geo hints from the tenant's prospecting configuration
+    # ({country, gl, hl}). A prospect row carries a city but never a country, so
+    # this is the only country signal website discovery has.
+    discovery_location: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -436,8 +501,8 @@ async def _coalesced_stream(
 _SECRET_KEYS = {
     "openai_api_key",
     "anthropic_api_key",
-    "vertex_credentials",
-    "vertex_service_account_json",
+    "gemini_credentials",
+    "gemini_service_account_json",
     "llm_credentials",
 }
 
@@ -678,6 +743,10 @@ async def _run_prospecting(
     released and the (bounded) usage that did happen is not lost. The backend
     reaper is the final backstop if even this report never lands.
     """
+    # Install the run-scoped Serper credit counter HERE, in the parent
+    # coroutine: LangGraph node tasks each get a copy of the context, so a
+    # ContextVar set inside a node would never be visible to `report_node`.
+    start_serper_accounting()
     try:
         await graph.ainvoke(inputs, config)
     except Exception as exc:  # noqa: BLE001 — background task must not crash the loop
@@ -689,22 +758,61 @@ async def _run_prospecting(
         )
         try:
             await report_prospecting_run(
-                run_id, "FAILED", metrics={"reason": f"agent_error: {exc}"}
+                run_id,
+                "FAILED",
+                # Serper credits were spent even though the run failed, so the
+                # platform cost report must still see them.
+                metrics={
+                    "reason": f"agent_error: {exc}",
+                    "serper_calls": serper_call_count(),
+                },
             )
         except Exception:  # noqa: BLE001
             logger.error("prospecting_fail_report_failed", run_id=run_id)
 
 
+def prospecting_thread_id(tenant_id: str, run_id: str, run_date: str) -> str:
+    """Checkpoint thread for one prospecting run — keyed on run_id, NOT run_date.
+
+    `candidates`, `searched_queries` and `seen_urls` are `operator.add` channels:
+    they accumulate and persist, and an input value cannot reset a reduced
+    channel. Keying the thread by day therefore made every second run of the same
+    date inherit the previous run's candidates — re-posting them to the CRM,
+    re-inflating `found`/`duplicates`, and replaying stale rows extracted by an
+    older agent build. Observed live: found 147 → 231 → 304 across three runs of
+    one day, with an unchanging 26 create_errors.
+
+    run_id is the right key because `retryFailedRun` re-arms the SAME run row, so
+    a genuine resume still finds its checkpoint while a distinct run starts
+    clean. run_date is the fallback for older backends that omit run_id.
+    """
+    return f"prospecting:{tenant_id}:{run_id or run_date}"
+
+
 @app.post("/prospecting/run", status_code=202)
 async def prospecting_run(
     req: ProspectingRunRequest,
-    _auth: Annotated[None, Depends(require_agent_key)],
+    _auth: Annotated[dict, Depends(verify_service_caller)],
 ) -> dict:
     code_name = (req.agent_code_name or "aurora").strip().lower()
     try:
         graph = await get_or_compile_graph(code_name)
     except UnknownCodeNameError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # Reject before claiming any work: with no niche the graph has nothing to
+    # search for, and the alternative — a built-in fallback — would prospect an
+    # industry the tenant never configured. The backend's scheduler skips these
+    # tenants (`niche_not_configured`), so this is the contract's backstop.
+    niche_terms = (req.niche or {}).get("search_terms")
+    if not (req.niche or {}).get("key") or not (
+        isinstance(niche_terms, list)
+        and any(isinstance(t, str) and t.strip() for t in niche_terms)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="niche requires a non-empty 'key' and at least one 'search_terms' entry",
+        )
 
     # Resolve LLM credentials ourselves — there is no NestJS-forwarded key on a
     # scheduler-triggered run (mirrors the /chat/stream credential fetch).
@@ -719,10 +827,10 @@ async def prospecting_run(
             provider_config["openai_api_key"] = creds.get("apiKey", "")
         elif llm_provider == "anthropic":
             provider_config["anthropic_api_key"] = creds.get("apiKey", "")
-        elif llm_provider == "vertex":
-            provider_config["vertex_credentials"] = creds.get("vertexCredentials", {})
-            provider_config["vertex_project_id"] = creds.get("vertexProjectId", "")
-            provider_config["vertex_location"] = creds.get("vertexLocation", "")
+        elif llm_provider == "gemini":
+            provider_config["gemini_credentials"] = creds.get("geminiCredentials", {})
+            provider_config["gemini_project_id"] = creds.get("geminiProjectId", "")
+            provider_config["gemini_location"] = creds.get("geminiLocation", "")
     except Exception as exc:
         logger.warning(
             "prospecting_credentials_fetch_failed",
@@ -734,8 +842,7 @@ async def prospecting_run(
     prompts_dict = (
         {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
     )
-    # One checkpoint thread per (tenant, day) so a crashed run resumes.
-    thread_id = f"prospecting:{req.tenant_id}:{req.run_date or req.run_id}"
+    thread_id = prospecting_thread_id(req.tenant_id, req.run_id, req.run_date)
     config: dict = {
         "configurable": {
             "thread_id": thread_id,
@@ -745,15 +852,22 @@ async def prospecting_run(
             **provider_config,
         }
     }
-    # Bound the extract_and_enrich Send fan-out ONLY for Vertex, whose per-model
+    # Bound the extract_and_enrich Send fan-out ONLY for Gemini, whose per-model
     # RPM quota the ~90-way parallel burst exhausts (429 RESOURCE_EXHAUSTED).
     # openai/anthropic keep LangGraph's default unbounded parallelism.
-    if llm_provider == "vertex":
-        config["max_concurrency"] = settings.prospecting_vertex_extract_concurrency
+    if llm_provider == "gemini":
+        config["max_concurrency"] = settings.prospecting_gemini_extract_concurrency
+    # The refinement loop adds ~5 supersteps per extra iteration on top of the
+    # base flow; lift the recursion limit so a high max_iterations can't trip
+    # LangGraph's default of 25.
+    config["recursion_limit"] = 15 + settings.prospecting_max_iterations * 8
     inputs: dict = {
         "tenant_id": req.tenant_id,
         "run_id": req.run_id,
         "run_date": req.run_date,
+        "niche": req.niche,
+        # Location alone keeps a default — see ProspectingRunRequest.
+        "location": req.location or DEFAULT_LOCATION,
     }
 
     # Fire-and-forget: the run streams no reply, and the scheduler already holds
@@ -769,6 +883,134 @@ async def prospecting_run(
         code_name=code_name,
     )
     return {"accepted": True, "run_id": req.run_id}
+
+
+# Strong references to in-flight background enrichment runs (asyncio.create_task
+# only holds a weak ref, so without this the task can be GC'd mid-run).
+_enrichment_tasks: set[asyncio.Task] = set()
+
+
+async def _run_enrichment(
+    graph, inputs: dict, config: dict, attempt_id: str
+) -> None:
+    """Run one enrichment graph to completion in the background.
+
+    The graph's ``report`` node reports COMPLETED/NO_RESULT on success. If the run
+    raises before reaching it, mark the attempt FAILED here so the backend does
+    not have to wait for its stale reaper. The reaper remains the final backstop
+    if even this report never lands.
+    """
+    # Must be installed BEFORE ainvoke: each node runs in a child task with a
+    # COPY of the context, so a counter created inside a node would be invisible
+    # here and in `report_node` (see services.serper).
+    start_serper_accounting()
+    try:
+        await graph.ainvoke(inputs, config)
+    except Exception as exc:  # noqa: BLE001 — background task must not crash the loop
+        logger.error(
+            "enrichment_run_failed",
+            attempt_id=attempt_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        try:
+            await report_enrichment_attempt(
+                attempt_id,
+                "FAILED",
+                error=f"agent_error: {exc}",
+                # Website discovery may already have spent Serper credits before
+                # the run died; the attempt row is where that is accounted for.
+                metrics={"serperCalls": serper_call_count()},
+            )
+        except Exception:  # noqa: BLE001
+            logger.error("enrichment_fail_report_failed", attempt_id=attempt_id)
+
+
+@app.post("/enrichment/run", status_code=202)
+async def enrichment_run(
+    req: EnrichmentRunRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    code_name = (req.agent_code_name or "sherlock").strip().lower()
+    try:
+        graph = await get_or_compile_graph(code_name)
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Resolve LLM credentials ourselves — there is no NestJS-forwarded key on a
+    # scheduler-triggered run (mirrors the prospecting credential fetch).
+    llm_provider = "openai"
+    llm_model = ""
+    provider_config: dict = {}
+    try:
+        creds = await fetch_agent_credentials(req.tenant_id)
+        llm_provider = creds.get("provider", "OPENAI").lower()
+        llm_model = creds.get("model") or ""
+        if llm_provider == "openai":
+            provider_config["openai_api_key"] = creds.get("apiKey", "")
+        elif llm_provider == "anthropic":
+            provider_config["anthropic_api_key"] = creds.get("apiKey", "")
+        elif llm_provider == "gemini":
+            provider_config["gemini_credentials"] = creds.get("geminiCredentials", {})
+            provider_config["gemini_project_id"] = creds.get("geminiProjectId", "")
+            provider_config["gemini_location"] = creds.get("geminiLocation", "")
+    except Exception as exc:
+        logger.warning(
+            "enrichment_credentials_fetch_failed",
+            tenant_id=req.tenant_id,
+            error=str(exc),
+        )
+        provider_config["openai_api_key"] = settings.openai_api_key
+
+    prompts_dict = (
+        {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
+    )
+    # One checkpoint thread per attempt. Attempts are one-shot by design, so the
+    # thread is effectively single-use; keying on the attempt id means a crashed
+    # run that the backend re-dispatches would resume rather than restart.
+    thread_id = f"enrichment:{req.tenant_id}:{req.attempt_id}"
+    config: dict = {
+        "configurable": {
+            "thread_id": thread_id,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "prompts": prompts_dict,
+            **provider_config,
+        }
+    }
+    # The refinement loop adds ~3 supersteps per extra iteration on top of the
+    # base flow; lift the recursion limit so a high max_iterations can't trip
+    # LangGraph's default of 25.
+    # +2 supersteps for the discovery branch (route + node) on top of the base.
+    config["recursion_limit"] = 14 + settings.sherlock_max_iterations * 6
+    inputs: dict = {
+        "tenant_id": req.tenant_id,
+        "attempt_id": req.attempt_id,
+        "contact_id": req.contact_id,
+        "website_url": req.website_url,
+        "contact_country": req.contact_country,
+        "contact_city": req.contact_city,
+        "contact_name": req.contact_name,
+        "language": req.language or "es",
+        "icp": req.icp or {},
+        "discovery_location": req.discovery_location or {},
+    }
+
+    # Fire-and-forget: the run streams no reply and the scheduler already holds
+    # the claim, so return 202 immediately and work in the background.
+    task = asyncio.create_task(
+        _run_enrichment(graph, inputs, config, req.attempt_id)
+    )
+    _enrichment_tasks.add(task)
+    task.add_done_callback(_enrichment_tasks.discard)
+    logger.info(
+        "enrichment_run_accepted",
+        attempt_id=req.attempt_id,
+        tenant_id=req.tenant_id,
+        contact_id=req.contact_id,
+        code_name=code_name,
+    )
+    return {"accepted": True, "attempt_id": req.attempt_id}
 
 
 @app.post("/chat/stream")
@@ -827,10 +1069,10 @@ async def chat_stream(
                 provider_config["openai_api_key"] = creds.get("apiKey", "")
             elif llm_provider == "anthropic":
                 provider_config["anthropic_api_key"] = creds.get("apiKey", "")
-            elif llm_provider == "vertex":
-                provider_config["vertex_credentials"] = creds.get("vertexCredentials", {})
-                provider_config["vertex_project_id"] = creds.get("vertexProjectId", "")
-                provider_config["vertex_location"] = creds.get("vertexLocation", "")
+            elif llm_provider == "gemini":
+                provider_config["gemini_credentials"] = creds.get("geminiCredentials", {})
+                provider_config["gemini_project_id"] = creds.get("geminiProjectId", "")
+                provider_config["gemini_location"] = creds.get("geminiLocation", "")
         except Exception as exc:
             logger.warning(
                 "agent_credentials_fetch_failed",
@@ -841,18 +1083,18 @@ async def chat_stream(
             provider_config = {
                 "openai_api_key": req.openai_api_key,
                 "anthropic_api_key": req.anthropic_api_key,
-                "vertex_credentials": req.vertex_credentials,
-                "vertex_project_id": req.vertex_project_id,
-                "vertex_location": req.vertex_location,
+                "gemini_credentials": req.gemini_credentials,
+                "gemini_project_id": req.gemini_project_id,
+                "gemini_location": req.gemini_location,
             }
     else:
         # No tenantId — use legacy per-request keys
         provider_config = {
             "openai_api_key": req.openai_api_key,
             "anthropic_api_key": req.anthropic_api_key,
-            "vertex_credentials": req.vertex_credentials,
-            "vertex_project_id": req.vertex_project_id,
-            "vertex_location": req.vertex_location,
+            "gemini_credentials": req.gemini_credentials,
+            "gemini_project_id": req.gemini_project_id,
+            "gemini_location": req.gemini_location,
         }
 
     prompts_dict = {k: v.model_dump() for k, v in req.prompts.items()} if req.prompts else {}
@@ -1020,13 +1262,12 @@ async def chat_resume(
             detail=f"Interrupt already resolved: {row['status']}",
         )
 
-    # Verify ownership: scoped thread_id already contains user_sub prefix
-    expected_prefix = f"{user_sub}:"
-    if not thread_id.startswith(expected_prefix):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Thread does not belong to the authenticated user",
-        )
+    # No caller-identity check here on purpose. The interrupt lookup above
+    # already pins the row to this exact thread_id, and every authenticated
+    # caller is the same service principal — there is no second user to defend
+    # against. (The check that used to sit here compared thread_id against a
+    # `{user_sub}:` prefix, which `scoped_thread_id` never produces: tenant_id
+    # is the first segment, so it could not match.)
 
     # Mark as resolved
     resolved_status = "approved" if req.approved else "rejected"

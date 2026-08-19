@@ -17,7 +17,7 @@ import tldextract
 # tldextract normally fetches (and caches) the public-suffix list over the
 # network on first use. In our container that call may be blocked, so pin it to
 # the bundled snapshot — no network, deterministic in tests.
-_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
+_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
 _WS_RE = re.compile(r"\s+")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]+")

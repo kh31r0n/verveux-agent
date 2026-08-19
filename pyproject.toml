@@ -20,7 +20,10 @@ dependencies = [
     "sse-starlette>=2.1",
     "psycopg[binary]>=3.1",
     "anthropic>=0.40",
-    "google-cloud-aiplatform>=1.60",
+    # The Gemini provider imports google.genai directly. It used to arrive only
+    # as a transitive dependency of google-cloud-aiplatform, whose `vertexai`
+    # namespace is the deprecated SDK and is not imported anywhere here.
+    "google-genai>=2.7",
     "tldextract>=5.1",
 ]
 

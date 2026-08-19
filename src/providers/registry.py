@@ -2,12 +2,12 @@ from langgraph.types import RunnableConfig
 from .base import ChatProvider
 from .openai import OpenAIProvider
 from .anthropic import AnthropicProvider
-from .vertex import VertexProvider
+from .gemini import GeminiProvider
 
 _DEFAULT_MODELS = {
     "openai": "gpt-4o",
     "anthropic": "claude-sonnet-4-5",
-    "vertex": "gemini-2.5-flash",
+    "gemini": "gemini-3.5-flash",
 }
 
 def get_provider(config: RunnableConfig) -> ChatProvider:
@@ -18,8 +18,8 @@ def get_provider(config: RunnableConfig) -> ChatProvider:
         return OpenAIProvider(config)
     elif provider_name == "anthropic":
         return AnthropicProvider(config)
-    elif provider_name == "vertex":
-        return VertexProvider(config)
+    elif provider_name == "gemini":
+        return GeminiProvider(config)
     else:
         raise ValueError(f"Unknown provider: {provider_name}")
 

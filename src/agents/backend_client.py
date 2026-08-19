@@ -115,7 +115,7 @@ async def fetch_agent_credentials(tenant_id: str) -> dict:
     Returns the decrypted runtime credentials for the tenant's effective LLM provider.
     Response shape:
       { provider, model, apiKey? } for OpenAI/Anthropic
-      { provider, model, vertexCredentials, vertexProjectId, vertexLocation } for Vertex
+      { provider, model, geminiCredentials, geminiProjectId, geminiLocation } for Gemini
     """
     return await _get(
         "/api/v1/internal/agent/credentials",
@@ -261,6 +261,24 @@ async def create_prospect_contact(tenant_id: str, contact: dict) -> dict:
     )
 
 
+async def get_prospect_feedback(
+    tenant_id: str, niche_key: str, limit: int = 12
+) -> list[dict]:
+    """GET /internal/prospecting/feedback — recent human good/bad verdicts.
+
+    Returns a list of ``{verdict, note, customName, website, city}`` for the
+    niche, newest first, so the agent can inject concrete examples into the
+    extraction prompt. Best-effort: callers treat any failure as "no feedback".
+    """
+    data = await _get(
+        "/api/v1/internal/prospecting/feedback",
+        params={"tenantId": tenant_id, "niche": niche_key, "limit": limit},
+    )
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    return data if isinstance(data, list) else []
+
+
 async def report_prospecting_run(
     run_id: str,
     status: str,
@@ -279,6 +297,96 @@ async def report_prospecting_run(
     if usage:
         body["usage"] = usage
     return await _patch(f"/api/v1/internal/prospecting/runs/{run_id}", json=body)
+
+
+# ─── Enrichment (sherlock — /internal/enrichment/*) ──────────────────────────
+
+
+async def get_enrichment_feedback(tenant_id: str, limit: int = 12) -> list[dict]:
+    """GET /internal/enrichment/feedback — recent human good/bad verdicts.
+
+    Each row carries the verdict, the reviewer's note, and the enrichment it
+    refers to (website + description + offerings + strategy), so the agent can
+    inject concrete examples into its prompts. Best-effort: callers treat any
+    failure as "no feedback".
+    """
+    data = await _get(
+        "/api/v1/internal/enrichment/feedback",
+        params={"tenantId": tenant_id, "limit": limit},
+    )
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    return data if isinstance(data, list) else []
+
+
+async def report_enrichment_attempt(
+    attempt_id: str,
+    status: str,
+    *,
+    phone_candidates: list[dict] | None = None,
+    description: str | None = None,
+    offerings_summary: str | None = None,
+    sales_strategy: str | None = None,
+    source_urls: list[str] | None = None,
+    language: str | None = None,
+    qualification: dict | None = None,
+    website_unreachable: bool | None = None,
+    website_discovery: dict | None = None,
+    error: str | None = None,
+    metrics: dict | None = None,
+    usage: list[dict] | None = None,
+) -> dict:
+    """PATCH /internal/enrichment/attempts/:id — terminal attempt report.
+
+    ``status`` is ``COMPLETED``, ``NO_RESULT`` or ``FAILED``. The backend derives
+    the tenant and contact from the attempt row (never from this body), validates
+    each phone candidate as E.164 before persisting any of them, and settles
+    ``usage`` against AI credits keyed on ``enrichment:{attempt_id}`` so a retry
+    never double-debits.
+
+    Phone candidates are sent as-is, exactly as they appeared on the page —
+    normalization is the backend's job, since it holds the contact's country.
+
+    ``qualification`` carries FIT DRIVERS (vertical, size band, locations,
+    estimated message volume) and never a score: the conversion probability and
+    the bill-size range are computed deterministically in NestJS from these
+    facts plus the tenant's own price tiers, which the agent never sees.
+
+    ``website_unreachable`` tells the backend we never got into the site at all
+    (zero pages fetched). It tags the contact "Sitio web inaccesible" and sorts it
+    last in the CRM prospect list. Sent explicitly rather than left to be inferred
+    from ``metrics``, which is a free-form counter bag.
+    """
+    body: dict = {"status": status}
+    if phone_candidates:
+        body["phoneCandidates"] = phone_candidates
+    if description:
+        body["description"] = description
+    if offerings_summary:
+        body["offeringsSummary"] = offerings_summary
+    if sales_strategy:
+        body["salesStrategy"] = sales_strategy
+    if source_urls:
+        body["sourceUrls"] = source_urls
+    if language:
+        body["language"] = language
+    if qualification:
+        body["qualification"] = qualification
+    if website_unreachable is not None:
+        body["websiteUnreachable"] = website_unreachable
+    if website_discovery:
+        # Only sent when the contact had NO website and one was confirmed: the
+        # backend writes it onto the contact, so an empty dict must never travel.
+        body["websiteDiscovery"] = website_discovery
+    if error:
+        body["error"] = error
+    if metrics is not None:
+        body["metrics"] = metrics
+    if usage:
+        body["usage"] = usage
+    return await _patch(
+        f"/api/v1/internal/enrichment/attempts/{attempt_id}", json=body
+    )
 
 
 # ─── Appointments (/internal/appointments/*) ────────────────────────────────

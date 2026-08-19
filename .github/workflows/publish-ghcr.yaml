@@ -32,8 +32,8 @@ jobs:
         working-directory: .
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
-      KEYCLOAK_ISSUER: https://keycloak.example.com/realms/test
-      KEYCLOAK_JWKS_URL: https://keycloak.example.com/realms/test/protocol/openid-connect/certs
+      # config.py refuses to boot without this one; tests import the app.
+      SERPER_API_KEY: test-serper-key
 
     steps:
       - name: Checkout

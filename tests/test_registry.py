@@ -40,6 +40,7 @@ class TestRegistryShape:
             "marco",
             "veronica",
             "aurora",
+            "sherlock",
         }
 
     def test_legacy_fallback_maps_each_agent_type(self):
@@ -49,6 +50,7 @@ class TestRegistryShape:
         assert resolve_legacy_agent_type("appointments") == "marco"
         assert resolve_legacy_agent_type("leads") == "veronica"
         assert resolve_legacy_agent_type("prospecting") == "aurora"
+        assert resolve_legacy_agent_type("enrichment") == "sherlock"
 
     def test_legacy_fallback_returns_none_for_unknown(self):
         assert resolve_legacy_agent_type("ghost") is None

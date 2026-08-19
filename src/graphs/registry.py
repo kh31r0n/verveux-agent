@@ -25,6 +25,7 @@ import structlog
 
 from .appointments_graph import build_appointments_graph
 from .camila_graph import build_camila_graph
+from .enrichment_graph import build_enrichment_graph
 from .leads_graph import build_leads_graph
 from .prospecting_graph import build_prospecting_graph
 from .restaurant_graph import build_restaurant_graph
@@ -47,6 +48,7 @@ CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "marco": build_appointments_graph,
     "veronica": build_leads_graph,
     "aurora": build_prospecting_graph,
+    "sherlock": build_enrichment_graph,
 }
 
 
@@ -83,6 +85,7 @@ AGENT_TYPE_FALLBACK: Mapping[str, str] = {
     "appointments": "marco",
     "leads": "veronica",
     "prospecting": "aurora",
+    "enrichment": "sherlock",
 }
 
 
@@ -102,6 +105,7 @@ class UnknownCodeNameError(Exception):
 _compiled_graphs: dict[str, object] = {}
 _compile_lock = asyncio.Lock()
 _checkpointer: object | None = None
+_store: object | None = None
 
 
 def set_checkpointer(checkpointer: object) -> None:
@@ -110,6 +114,26 @@ def set_checkpointer(checkpointer: object) -> None:
     injection plumbing."""
     global _checkpointer
     _checkpointer = checkpointer
+
+
+def set_store(store: object) -> None:
+    """Cache the long-term ``BaseStore`` captured at lifespan startup.
+
+    Used ONLY by the prospecting graph (aurora) for cross-run strategy memory.
+    Deliberately NOT compiled into any graph via ``graph.compile(store=...)`` —
+    the aurora nodes read it directly via :func:`get_store_or_none`, so the other
+    graph builders (single-arg ``builder(ckpt)``) stay untouched. ``None`` when
+    the store failed to initialise; callers must degrade gracefully."""
+    global _store
+    _store = store
+
+
+def get_store_or_none() -> object | None:
+    """Return the cached long-term store, or ``None`` if unavailable.
+
+    Prospecting memory is best-effort: a missing store degrades the agent to its
+    stateless behaviour rather than failing the run."""
+    return _store
 
 
 def known_code_names() -> set[str]:

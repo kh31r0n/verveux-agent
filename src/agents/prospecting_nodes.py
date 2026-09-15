@@ -39,6 +39,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 
 from ..config import settings
+from ..providers.errors import ProviderConfigError, is_provider_config_error
 from ..providers.registry import get_provider, resolve_model
 from ..services.serper import (
     PLACES_ENDPOINT,
@@ -747,6 +748,16 @@ async def extract_and_enrich_node(state: dict, config: RunnableConfig) -> dict:
             error=str(exc),
             error_type=type(exc).__name__,
         )
+        # A bad page is per-item; a bad credential, a disabled provider or a
+        # model that is not served from the configured location is not — it
+        # fails all ~130 fan-out calls identically and leaves a COMPLETED run
+        # that "found nothing", which also takes the day's slot and blocks the
+        # retry path. Same judgement `_serper_post` makes for SerperAuthError.
+        if is_provider_config_error(exc):
+            raise ProviderConfigError(
+                f"El proveedor LLM rechazó la petición por configuración "
+                f"({type(exc).__name__}): {exc}"
+            ) from exc
         return {}
 
     usage = dict(
@@ -981,6 +992,14 @@ async def refine_queries_node(
     except Exception as exc:  # provider failure — advance iteration so the loop
         # guard can terminate instead of retrying the same empty query set.
         logger.warning("prospecting_refine_failed", error=str(exc))
+        # Reachable with a broken provider only when every page also failed to
+        # fetch, so no extract call got to raise first — rare, but it would
+        # otherwise still end in a COMPLETED run that found nothing.
+        if is_provider_config_error(exc):
+            raise ProviderConfigError(
+                f"El proveedor LLM rechazó la petición por configuración "
+                f"({type(exc).__name__}): {exc}"
+            ) from exc
         return {"iteration": iteration, "queries": [], "search_results": []}
 
     usage = dict(

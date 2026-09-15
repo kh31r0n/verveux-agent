@@ -38,6 +38,10 @@ from src.agents.prospecting_nodes import (
     web_search_node,
 )
 from src.config import settings
+from src.providers.errors import (
+    ProviderConfigError,
+    is_provider_config_error,
+)
 from src.graphs import registry
 from src.graphs.prospecting_graph import build_prospecting_graph
 
@@ -1060,3 +1064,97 @@ class TestMemoryStaysOnNiche:
         assert "colegios en Chía" in best
         # Yielded a prospect, but must not occupy a scarce best_queries slot.
         assert "gimnasios en Cajicá" not in best
+
+
+# ── Provider config errors must fail the run, not the item ──────────────────
+
+
+class TestProviderConfigErrorIsFatal:
+    """A broken credential/model must end the run FAILED, never COMPLETED-empty.
+
+    Twice on 2026-09-14 a misconfiguration made every fan-out call fail the same
+    way and the run still reported success with `found: 0` — which additionally
+    consumed the day's (tenantId, runDate) slot while `retryFailedRun` accepts
+    only a FAILED run, locking the tenant out until the next day.
+    """
+
+    def _failing_provider(self, exc: Exception):
+        class FakeProvider:
+            name = "gemini"
+            last_usage = SimpleNamespace(
+                input_tokens=0, output_tokens=0,
+                cached_input_tokens=0, reasoning_tokens=0,
+            )
+
+            async def stream_chat(self, model, messages):
+                raise exc
+                yield ""  # pragma: no cover — generator shape only
+
+        return FakeProvider()
+
+    async def _extract_with(self, exc: Exception):
+        with (
+            patch("src.agents.prospecting_nodes._fetch_page_text",
+                  AsyncMock(return_value="contenido")),
+            patch("src.agents.prospecting_nodes.get_provider",
+                  return_value=self._failing_provider(exc)),
+            patch("src.agents.prospecting_nodes.resolve_model",
+                  return_value="gemini-3.5-flash"),
+        ):
+            return await extract_and_enrich_node(
+                {
+                    "result": {"url": "https://x.com.co"},
+                    "tenant_id": "t1",
+                    "niche_label": "industria",
+                    "query": "q",
+                },
+                {"configurable": {}},
+            )
+
+    async def test_vertex_404_wrong_location_raises(self):
+        """The 2026-09-14 20:23 run: gemini-3.5-flash against us-central1."""
+        exc = Exception(
+            "404 NOT_FOUND. {'error': {'code': 404, 'message': 'Publisher model "
+            "`projects/p/locations/us-central1/publishers/google/models/"
+            "gemini-3.5-flash` was not found or your project does not have "
+            "access to it.'}}"
+        )
+        with pytest.raises(ProviderConfigError):
+            await self._extract_with(exc)
+
+    async def test_openai_exhausted_credits_raises(self):
+        """The 2026-09-14 16:56 run: 429, but an account verdict, not a rate limit."""
+        exc = Exception(
+            "Error code: 429 - {'error': {'message': 'You have no credits "
+            "remaining.', 'type': 'insufficient_quota', 'code': "
+            "'credit_balance_exhausted'}}"
+        )
+        with pytest.raises(ProviderConfigError):
+            await self._extract_with(exc)
+
+    async def test_transient_failure_still_skips_the_item(self):
+        """A timeout is per-page and must NOT sink a run of 130 good results."""
+        out = await self._extract_with(httpx.ReadTimeout("timed out"))
+        assert out == {}
+
+    async def test_plain_rate_limit_still_skips_the_item(self):
+        """A bare 429 is transient — the Gemini provider already backs off."""
+        out = await self._extract_with(Exception("429 RESOURCE_EXHAUSTED"))
+        assert out == {}
+
+
+class TestIsProviderConfigError:
+    @pytest.mark.parametrize("exc", [
+        SimpleNamespace(status_code=404),
+        SimpleNamespace(code=403),
+        SimpleNamespace(response=SimpleNamespace(status_code=401)),
+    ])
+    def test_status_shapes(self, exc):
+        # Duck-typed across three SDKs that disagree on where the status lives.
+        assert is_provider_config_error(exc) is True
+
+    def test_plain_429_is_not_config(self):
+        assert is_provider_config_error(Exception("429 too many requests")) is False
+
+    def test_network_error_is_not_config(self):
+        assert is_provider_config_error(httpx.ConnectError("boom")) is False

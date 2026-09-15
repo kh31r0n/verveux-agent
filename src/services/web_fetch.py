@@ -71,6 +71,31 @@ ALLOWED_CONTENT_TYPES = frozenset(
 
 USER_AGENT = "VerveuxEnrichment/1.0 (+https://verveux.com/bot)"
 
+# Reasons that mean NOTHING CAME BACK — the URL is dead for a human with a
+# browser too, which is what the CRM's "Sitio web inaccesible" tag claims.
+#
+# Everything NOT listed here is a case where the server answered and we chose
+# not to use the response: `http_error` (a status, including a 403 from a
+# bot-protection WAF), `bad_content_type` (a PDF where a homepage was expected)
+# and the redirect reasons. Those must not carry the tag — a reviewer who opens
+# such a link sees a working site and stops trusting every other tag.
+#
+# An allow-list rather than a deny-list so an unrecognised future reason
+# defaults to NOT flagged: mislabelling a live site is the failure that costs.
+UNREACHABLE_REASONS = frozenset(
+    {
+        "dns_failure",
+        "transport_error",  # connect refused, TLS failure, read timeout, reset
+        "budget_timeout",  # not one byte of the landing page inside the budget
+        "unparseable_address",
+        "blocked_ip",  # resolves into a blocked range — dead from anywhere useful
+        "blocked_hostname",
+        "malformed_url",
+        "bad_scheme",
+        "no_host",
+    }
+)
+
 # Explicit network block-list rather than ``ip.is_private``/``is_global``.
 # Those properties changed semantics for 0.0.0.0/8, 100.64.0.0/10, 192.0.0.0/24
 # and IPv4-mapped IPv6 across CPython patch releases (gh-113171, fixed in 3.11.9
@@ -576,13 +601,21 @@ async def fetch_page(
             if content_type not in ALLOWED_CONTENT_TYPES:
                 raise FetchBlocked("bad_content_type", content_type or "(none)")
 
-            declared = response.headers.get("content-length")
-            if declared and declared.isdigit() and int(declared) > max_bytes:
-                raise FetchBlocked("oversize", declared)
-
+            # NOT refused on the declared `content-length`. The streaming cap
+            # below is the real bound (and the only honest one — the header is
+            # advisory and a hostile server lies), so refusing here bought no
+            # safety and threw away live sites: with `Accept-Encoding: identity`
+            # these are UNCOMPRESSED bytes, and a mainstream landing page that
+            # ships ~190 KB gzipped declares ~1.9 MB here. Truncating keeps the
+            # part we can use; refusing reported the site as unreachable.
             buffer, truncated = await _read_capped(response, max_bytes)
             if truncated:
-                logger.info("web_fetch_truncated", url=key, cap=max_bytes)
+                logger.info(
+                    "web_fetch_truncated",
+                    url=key,
+                    cap=max_bytes,
+                    declared=response.headers.get("content-length"),
+                )
 
             html = bytes(buffer[:max_bytes]).decode(
                 response.encoding or "utf-8", errors="replace"
@@ -640,6 +673,36 @@ class SiteFetchResult:
     @property
     def urls(self) -> list[str]:
         return [p.url for p in self.pages]
+
+    @property
+    def failure_reasons(self) -> list[str]:
+        """Every distinct reason this fetch gave up on a URL.
+
+        The total-budget timeout is folded in as ``budget_timeout`` when it
+        fired before a single page landed: ``asyncio.timeout`` cancels the fetch
+        mid-flight, so nothing reaches ``blocked`` and the caller would
+        otherwise see no evidence at all.
+        """
+        reasons = set(self.blocked)
+        if self.timed_out and not self.pages:
+            reasons.add("budget_timeout")
+        return sorted(reasons)
+
+    @property
+    def never_answered(self) -> bool:
+        """True only when the HOST itself did not answer.
+
+        Distinct from "we read nothing": a 403 from a WAF, a PDF where a
+        homepage was expected and a page too big for the byte cap are all
+        answers, and reporting them to the CRM as an unreachable website sends
+        a reviewer to a link that opens fine. No recorded reason at all is left
+        UNCLAIMED on purpose — mislabelling a live site is worse than missing
+        the label.
+        """
+        reasons = self.failure_reasons
+        if self.pages or not reasons:
+            return False
+        return all(reason in UNREACHABLE_REASONS for reason in reasons)
 
 
 # Link text / path fragments worth crawling, best first.
@@ -736,6 +799,20 @@ async def fetch_site(
                     detail=exc.detail[:200],
                 )
                 return
+            except Exception as exc:  # noqa: BLE001
+                # Connect refused, TLS failure, read timeout, reset. These used
+                # to escape to the outer handler, which recorded NO reason at
+                # all — so the caller saw zero pages and an empty `blocked` and
+                # could not tell a dead host from a refusal of ours. httpx
+                # timeout exceptions stringify to "", hence the class name.
+                note_blocked("transport_error")
+                logger.info(
+                    "web_fetch_transport_error",
+                    url=start_url,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:200],
+                )
+                return
             result.pages.append(first)
 
             # Candidate order: caller hints first (the refinement loop has already
@@ -766,6 +843,17 @@ async def fetch_site(
                         url=candidate,
                         reason=exc.reason,
                         detail=exc.detail[:200],
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    # One bad sub-page must not abort the crawl, which is what
+                    # letting this reach the outer handler did.
+                    note_blocked("transport_error")
+                    logger.info(
+                        "web_fetch_transport_error",
+                        url=candidate,
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:200],
                     )
                     continue
                 result.pages.append(page)

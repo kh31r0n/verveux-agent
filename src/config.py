@@ -113,7 +113,15 @@ class Settings(BaseSettings):
     #
     # `sherlock_max_pages` bounds the same-site crawl (landing page + the
     # contact/about pages discovered on it). `sherlock_max_bytes` is a WIRE-byte
-    # cap per page (compression is disabled so a gzip bomb cannot expand past it).
+    # cap per page (compression is disabled so a gzip bomb cannot expand past it)
+    # and is a TRUNCATION point, not a rejection: a page over it is read up to
+    # the cap, never refused. It sits at 2 MB because disabling compression is
+    # what makes these uncompressed bytes — a mainstream landing page that ships
+    # ~190 KB gzipped arrives as ~1.9 MB here, and the old 512 KB cap cut it in
+    # the middle of `<head>`: colegioaleman.dscali.edu.co yielded 47 characters
+    # of text and zero links at 512 KB versus 5,283 characters, 202 links and
+    # the phone number at 2 MB. Memory is bounded by ONE page's buffer, since
+    # the raw bytes are discarded as soon as the text is extracted.
     # `sherlock_total_budget_seconds` is the wall-clock ceiling for ALL fetching
     # in one run — httpx timeouts are per-operation, so this is what actually
     # stops a slow-trickle server. `sherlock_max_iterations` bounds the in-run
@@ -126,7 +134,7 @@ class Settings(BaseSettings):
     # somewhere to fit. Cost is bounded elsewhere — per-tenant daily limits and
     # the `aiCreditsBalance > 0` claim predicate — not by these numbers.
     sherlock_max_pages: int = 6
-    sherlock_max_bytes: int = 512 * 1024
+    sherlock_max_bytes: int = 2 * 1024 * 1024
     sherlock_max_page_chars: int = 6000
     sherlock_fetch_timeout_seconds: float = 8.0
     sherlock_total_budget_seconds: float = 60.0

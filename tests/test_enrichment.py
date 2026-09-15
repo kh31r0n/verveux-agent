@@ -337,13 +337,16 @@ class TestFetchPage:
                 )
             assert exc.value.reason == "bad_content_type"
 
-    async def test_oversize_body_rejected(self) -> None:
+    async def test_oversize_body_is_truncated_not_rejected(self) -> None:
+        # A page bigger than the cap is READ UP TO the cap. Refusing it reported
+        # live sites as unreachable — with compression disabled, a mainstream
+        # landing page declares megabytes.
         async with self._client() as client:
-            with pytest.raises(FetchBlocked) as exc:
-                await wf.fetch_page(
-                    client, "https://good.test/big", max_bytes=1_000, max_chars=500
-                )
-            assert exc.value.reason == "oversize"
+            page = await wf.fetch_page(
+                client, "https://good.test/big", max_bytes=1_000, max_chars=500
+            )
+            assert page.bytes_read <= 1_000 + 8192
+            assert page.url == "https://good.test/big"
 
     async def test_http_error_surfaces_as_blocked(self) -> None:
         async with self._client() as client:
@@ -384,6 +387,47 @@ class TestFetchSite:
             )
         assert result.timed_out is True
         assert result.pages == []
+        # The cancellation leaves `blocked` empty, so the timeout is what has to
+        # carry the evidence — otherwise the caller sees no reason at all and
+        # (correctly, given no evidence) declines to call the site unreachable.
+        assert result.failure_reasons == ["budget_timeout"]
+        assert result.never_answered is True
+
+    async def test_a_site_that_answered_is_not_never_answered(self) -> None:
+        # 403 from a bot-protection WAF: unreadable, but emphatically not down.
+        async def forbidden(*args, **kwargs):
+            raise wf.FetchBlocked("http_error", "403")
+
+        with patch.object(wf, "fetch_page", forbidden):
+            result = await wf.fetch_site(
+                "https://acme.com/",
+                max_pages=1,
+                max_bytes=1000,
+                max_chars=100,
+                per_request_timeout=1.0,
+                total_budget_seconds=5.0,
+            )
+        assert result.pages == []
+        assert result.blocked == {"http_error": 1}
+        assert result.never_answered is False
+
+    async def test_a_transport_failure_is_recorded_as_a_reason(self) -> None:
+        # httpx timeout exceptions stringify to "", and these used to escape the
+        # per-page handler entirely: zero pages, zero recorded reasons.
+        async def boom(*args, **kwargs):
+            raise httpx.ConnectTimeout("")
+
+        with patch.object(wf, "fetch_page", boom):
+            result = await wf.fetch_site(
+                "https://acme.com/",
+                max_pages=2,
+                max_bytes=1000,
+                max_chars=100,
+                per_request_timeout=1.0,
+                total_budget_seconds=5.0,
+            )
+        assert result.blocked == {"transport_error": 1}
+        assert result.never_answered is True
 
 
 # ── Tier 2: individual nodes ─────────────────────────────────────────────────
@@ -883,14 +927,83 @@ class TestReportNode:
             )
         assert out["status"] == "COMPLETED"
 
-    async def test_flags_an_unreachable_site(self) -> None:
+    async def test_flags_a_site_that_never_answered(self) -> None:
+        report = AsyncMock(return_value={"ok": True})
+        with patch.object(en.backend_client, "report_enrichment_attempt", report):
+            await en.report_node(
+                {
+                    "attempt_id": "a1",
+                    "website_url": "https://acme.com/",
+                    "fetch_failures": ["dns_failure"],
+                },
+                {"configurable": {}},
+            )
+        assert report.await_args.kwargs["website_unreachable"] is True
+
+    @pytest.mark.parametrize(
+        "reason", ["http_error", "bad_content_type", "redirect_loop"]
+    )
+    async def test_a_site_that_answered_is_not_called_unreachable(
+        self, reason: str
+    ) -> None:
+        # A 403 from a bot-protection WAF, a PDF where the contact's "website"
+        # pointed, a redirect loop: the server answered. Tagging these
+        # "Sitio web inaccesible" sends the reviewer to a link that opens fine.
+        report = AsyncMock(return_value={"ok": True})
+        with patch.object(en.backend_client, "report_enrichment_attempt", report):
+            await en.report_node(
+                {
+                    "attempt_id": "a1",
+                    "website_url": "https://acme.com/",
+                    "fetch_failures": [reason],
+                },
+                {"configurable": {}},
+            )
+        assert report.await_args.kwargs["website_unreachable"] is False
+        assert report.await_args.kwargs["metrics"]["fetchFailures"] == [reason]
+
+    async def test_one_answered_failure_is_enough_to_withhold_the_flag(self) -> None:
+        # Mixed evidence: the host resolved and answered at least once, so it is
+        # not down — whatever else failed.
+        report = AsyncMock(return_value={"ok": True})
+        with patch.object(en.backend_client, "report_enrichment_attempt", report):
+            await en.report_node(
+                {
+                    "attempt_id": "a1",
+                    "website_url": "https://acme.com/",
+                    "fetch_failures": ["transport_error", "http_error"],
+                },
+                {"configurable": {}},
+            )
+        assert report.await_args.kwargs["website_unreachable"] is False
+
+    async def test_a_budget_timeout_with_nothing_read_counts_as_unreachable(
+        self,
+    ) -> None:
+        # asyncio.timeout cancels the fetch mid-flight, so `blocked` stays empty;
+        # fetch_pages folds the timeout in as its own reason instead.
+        report = AsyncMock(return_value={"ok": True})
+        with patch.object(en.backend_client, "report_enrichment_attempt", report):
+            await en.report_node(
+                {
+                    "attempt_id": "a1",
+                    "website_url": "https://acme.com/",
+                    "fetch_failures": ["budget_timeout"],
+                },
+                {"configurable": {}},
+            )
+        assert report.await_args.kwargs["website_unreachable"] is True
+
+    async def test_no_recorded_reason_is_never_claimed_unreachable(self) -> None:
+        # No evidence either way (a crash before the fetch node ran). Silence is
+        # not proof a site is dead, and the tag is sticky: sherlock never retries.
         report = AsyncMock(return_value={"ok": True})
         with patch.object(en.backend_client, "report_enrichment_attempt", report):
             await en.report_node(
                 {"attempt_id": "a1", "website_url": "https://acme.com/"},
                 {"configurable": {}},
             )
-        assert report.await_args.kwargs["website_unreachable"] is True
+        assert report.await_args.kwargs["website_unreachable"] is False
 
     async def test_a_run_with_no_website_at_all_is_not_unreachable(self) -> None:
         # Discovery found nothing, so there was never a site to fail to read.
@@ -934,6 +1047,7 @@ class TestReportNode:
                     "attempt_id": "a1",
                     "website_url": "https://acme.com/",
                     "website_discovery": {"url": "https://acme.com/"},
+                    "fetch_failures": ["transport_error"],
                 },
                 {"configurable": {}},
             )

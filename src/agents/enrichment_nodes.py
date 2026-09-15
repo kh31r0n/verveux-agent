@@ -47,7 +47,7 @@ from ..services.serper import (
     serper_call_count,
     serper_post,
 )
-from ..services.web_fetch import fetch_site
+from ..services.web_fetch import UNREACHABLE_REASONS, fetch_site
 from ..usage import make_usage_record
 from . import backend_client
 from . import website_discovery as wd
@@ -232,6 +232,12 @@ class EnrichmentState(TypedDict, total=False):
     extra_paths: list[str]
     # Reduced across loop iterations (each fetch returns only its new items).
     visited_urls: Annotated[list[str], operator.add]
+    # Every block reason seen across every fetch pass, for the same reason
+    # `visited_urls` is cumulative: `blocked` (and `metrics.blockedReasons`) are
+    # OVERWRITTEN by each pass, so a refinement iteration would erase the reason
+    # the landing page failed with — which is exactly what the unreachable
+    # verdict is computed from.
+    fetch_failures: Annotated[list[str], operator.add]
     discovered_links: list[str]
 
     # Fetch + extraction results (last-write-wins within a run).
@@ -560,6 +566,7 @@ async def fetch_pages_node(state: EnrichmentState, config: RunnableConfig) -> di
         "source_urls": result.urls,
         "detected_phone_candidates": _clean_candidates(detected_candidates),
         "visited_urls": result.urls,
+        "fetch_failures": result.failure_reasons,
         "discovered_links": all_links[:200],
         "blocked": result.blocked,
         "metrics": {
@@ -1080,21 +1087,35 @@ async def report_node(state: EnrichmentState, config: RunnableConfig) -> dict:
     metrics["isMatch"] = bool(state.get("is_match", True))
     metrics["qualified"] = bool(qualification)
 
-    # "We never got into the site": every fetch attempt across every iteration
-    # failed (DNS, timeout, blocked host, HTTP error, non-HTML body). Reported as
-    # its own flag because it is orthogonal to the COMPLETED/NO_RESULT axis — the
-    # backend tags the contact "Sitio web inaccesible" and demotes it to the end
-    # of the CRM prospect list so reviewers stop opening dead links.
-    # Keyed on the CUMULATIVE `visited_urls` (an `operator.add` channel), not on
-    # `metrics["pagesFetched"]` — the latter is overwritten by each fetch pass, so
-    # a refinement iteration that came back empty would mislabel a site we did read.
+    # "The site never answered." Reported as its own flag because it is
+    # orthogonal to the COMPLETED/NO_RESULT axis — the backend tags the contact
+    # "Sitio web inaccesible" and demotes it to the end of the CRM prospect list
+    # so reviewers stop opening dead links.
+    #
+    # Reading nothing is NOT the same as the site being down, and conflating the
+    # two is what put the tag on live sites: of 18 flagged runs in one week, 3
+    # were really dead (DNS) while the rest were a 403 from a bot-protection
+    # WAF, a PDF where the contact's "website" pointed, or a landing page over
+    # the byte cap. A reviewer who opens those sees a working site. So the flag
+    # now needs BOTH no pages AND every recorded failure being a host-level one
+    # (`UNREACHABLE_REASONS`); anything the server actually answered is left
+    # unflagged and lives in `metrics.blockedReasons`.
+    #
+    # Keyed on the CUMULATIVE channels (`visited_urls`, `fetch_failures`), not on
+    # `metrics["pagesFetched"]`/`blockedReasons` — the latter are overwritten by
+    # each fetch pass, so a refinement iteration would erase the evidence.
     # `bool(website_url)` guards the discovery path: a run that never resolved a
     # site has nothing to call unreachable, and flagging it would tag a contact
     # with "Sitio web inaccesible" for a website it never had.
-    website_unreachable = bool(state.get("website_url")) and not (
-        state.get("visited_urls") or []
+    failures = state.get("fetch_failures") or []
+    website_unreachable = (
+        bool(state.get("website_url"))
+        and not (state.get("visited_urls") or [])
+        and bool(failures)
+        and all(reason in UNREACHABLE_REASONS for reason in failures)
     )
     metrics["websiteUnreachable"] = website_unreachable
+    metrics["fetchFailures"] = sorted(set(failures))
     metrics["websiteDiscovered"] = bool(discovered)
     metrics["serperCalls"] = serper_call_count()
 

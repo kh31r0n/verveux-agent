@@ -55,7 +55,12 @@ from ..services.serper import (
 from ..services.serper import serper_post as _serper_post
 from ..usage import make_usage_record
 from . import backend_client
-from .dedup import normalize_domain, normalize_name, prospect_external_id
+from .dedup import (
+    identity_domain,
+    normalize_domain,
+    normalize_name,
+    prospect_external_id,
+)
 from .utils import resolve_prompt
 
 logger = structlog.get_logger(__name__)
@@ -823,11 +828,21 @@ async def dedupe_check_node(state: ProspectingState, config: RunnableConfig) -> 
     candidates = state.get("candidates", [])
     tenant_id = state.get("tenant_id", "")
 
-    # 1) Intra-run dedupe by synthetic identity (two pages, same organization).
-    by_id: dict[str, dict] = {}
+    # 1) Intra-run dedupe: two pages of one organization share the synthetic
+    # identity, the normalized name, or the (non-aggregator) website domain.
+    unique: list[dict] = []
+    seen: set[str] = set()
     for c in candidates:
-        by_id.setdefault(c["externalId"], c)
-    unique = list(by_id.values())
+        keys = {f"id:{c['externalId']}"}
+        if c.get("normalizedName"):
+            keys.add(f"name:{c['normalizedName']}")
+        domain = identity_domain(c.get("website"))
+        if domain:
+            keys.add(f"domain:{domain}")
+        if keys & seen:
+            continue
+        seen |= keys
+        unique.append(c)
 
     # 2) Cross-run dedupe against the CRM (bulk backend call).
     survivors: list[dict] = unique
@@ -839,8 +854,12 @@ async def dedupe_check_node(state: ProspectingState, config: RunnableConfig) -> 
                     {
                         "externalId": c["externalId"],
                         "normalizedName": c.get("normalizedName") or "",
+                        "name": c.get("customName") or "",
                         "domain": c.get("domain") or "",
                         "email": c.get("email") or "",
+                        "website": c.get("website") or "",
+                        "sourceUrl": c.get("sourceUrl") or "",
+                        "city": c.get("city") or "",
                     }
                     for c in unique
                 ],

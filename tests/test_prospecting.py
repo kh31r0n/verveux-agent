@@ -301,7 +301,10 @@ class TestGraphFlow:
             "query": "q",
         }
         cand_b = {**cand_a, "externalId": prospect_external_id("Colegio B"),
-                  "customName": "Colegio B"}
+                  "customName": "Colegio B",
+                  "normalizedName": normalize_name("Colegio B"),
+                  "website": "https://b.edu.co", "domain": "b.edu.co",
+                  "sourceUrl": "https://b.edu.co"}
 
         async def fake_extract(state, *args):
             url = (state.get("result") or {}).get("url", "")
@@ -1158,3 +1161,60 @@ class TestIsProviderConfigError:
 
     def test_network_error_is_not_config(self):
         assert is_provider_config_error(httpx.ConnectError("boom")) is False
+
+
+# ── dedupe_check: intra-run collapse + richer CRM payload ───────────────────
+
+
+class TestDedupeCheck:
+    @staticmethod
+    def _cand(ext, name, website, city="Medellín"):
+        return {
+            "externalId": ext,
+            "customName": name,
+            "normalizedName": pn.normalize_name(name),
+            "website": website,
+            "domain": pn.normalize_domain(website),
+            "sourceUrl": website,
+            "email": None,
+            "city": city,
+        }
+
+    async def test_collapses_same_domain_and_skips_aggregators(self):
+        cands = [
+            self._cand("prospector:a", "Tornillos Medellín PROTOR", "https://www.tornillosprotor.com/"),
+            # Name variant, same site → same organization.
+            self._cand("prospector:b", "Tornillos PROTOR", "https://tornillosprotor.com/contacto"),
+            # Two different businesses that only share Facebook stay apart.
+            self._cand("prospector:c", "Ferretería Uno", "https://www.facebook.com/uno"),
+            self._cand("prospector:d", "Ferretería Dos", "https://www.facebook.com/dos"),
+        ]
+        dedup = AsyncMock(return_value={})
+        with patch(
+            "src.agents.prospecting_nodes.backend_client.check_prospect_duplicates",
+            dedup,
+        ):
+            out = await pn.dedupe_check_node(
+                {"candidates": cands, "tenant_id": "t-1"}, {"configurable": {}}
+            )
+        ids = [c["externalId"] for c in out["deduped_candidates"]]
+        assert ids == ["prospector:a", "prospector:c", "prospector:d"]
+
+        sent = dedup.await_args.args[1][0]
+        # The backend needs name/site/city to match phone-confirmed contacts
+        # and name variants — not just the synthetic hash.
+        assert sent["name"] == "Tornillos Medellín PROTOR"
+        assert sent["website"] == "https://www.tornillosprotor.com/"
+        assert sent["city"] == "Medellín"
+
+    async def test_backend_exists_verdict_drops_candidate(self):
+        cands = [self._cand("prospector:a", "Tornillos PROTOR", "https://tornillosprotor.com/")]
+        with patch(
+            "src.agents.prospecting_nodes.backend_client.check_prospect_duplicates",
+            AsyncMock(return_value={"prospector:a": {"exists": True, "reason": "similar"}}),
+        ):
+            out = await pn.dedupe_check_node(
+                {"candidates": cands, "tenant_id": "t-1"}, {"configurable": {}}
+            )
+        assert out["deduped_candidates"] == []
+        assert out["metrics"]["duplicates"] == 1

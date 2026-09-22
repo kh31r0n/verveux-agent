@@ -232,7 +232,8 @@ async def check_prospect_duplicates(
 ) -> dict[str, dict]:
     """POST /internal/prospecting/contacts/dedup — bulk CRM duplicate check.
 
-    ``candidates`` is a list of ``{externalId, normalizedName?, domain?, email?}``.
+    ``candidates`` is a list of ``{externalId, normalizedName?, name?, domain?,
+    email?, website?, sourceUrl?, city?}``.
     Returns a map ``externalId -> {exists: bool, reason?: str}`` for O(1) lookup.
     """
     data = await _post(

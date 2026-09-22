@@ -62,3 +62,25 @@ def normalize_domain(raw: str | None) -> str:
     if ext.suffix:
         return f"{ext.domain}.{ext.suffix}"
     return ext.domain
+
+
+# Hosts that list many businesses — a shared one says nothing about identity.
+# Mirror of AGGREGATOR_DOMAINS in yorchio-backend prospect-duplicate-finder.ts.
+AGGREGATOR_DOMAINS = frozenset(
+    {
+        "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
+        "tiktok.com", "youtube.com", "google.com", "goo.gl", "wa.me",
+        "whatsapp.com", "linktr.ee", "wixsite.com", "blogspot.com",
+        "wordpress.com", "paginasamarillas.com.co", "paginasamarillas.com",
+        "cylex.com.co", "infoisinfo.com.co", "tupaginaamarilla.com",
+        "einforma.co", "empresite.com", "guiaacademica.com",
+        "mercadolibre.com.co", "tripadvisor.com", "tripadvisor.co",
+        "foursquare.com", "yelp.com",
+    }
+)
+
+
+def identity_domain(raw: str | None) -> str:
+    """Registrable domain usable as identity, or "" for aggregators/empty."""
+    domain = normalize_domain(raw)
+    return "" if domain in AGGREGATOR_DOMAINS else domain

@@ -61,6 +61,14 @@ def format_user_context(state) -> str:
         lines.append(f"- Teléfono: {ctx['phone']}")
     if ctx.get("address"):
         lines.append(f"- Dirección: {ctx['address']}")
+    # LMS keys come from a server-attested identity (the Moodle plugin signs
+    # them), so they are facts about the user, not claims made in the chat.
+    if ctx.get("lms_platform"):
+        lines.append(f"- Escribe desde: {ctx['lms_platform']} (usuario autenticado)")
+    if ctx.get("lms_current_course"):
+        lines.append(f"- Curso que está viendo ahora: {ctx['lms_current_course']}")
+    if ctx.get("lms_courses"):
+        lines.append(f"- Cursos matriculados (rol): {ctx['lms_courses']}")
 
     if not lines:
         return ""

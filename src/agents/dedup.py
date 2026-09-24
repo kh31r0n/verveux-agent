@@ -84,3 +84,27 @@ def identity_domain(raw: str | None) -> str:
     """Registrable domain usable as identity, or "" for aggregators/empty."""
     domain = normalize_domain(raw)
     return "" if domain in AGGREGATOR_DOMAINS else domain
+
+
+# Webmail providers: sharing one says nothing about sharing an organization.
+# A sender @gmail.com writing to a mailbox @gmail.com is NOT internal.
+PUBLIC_EMAIL_PROVIDERS = frozenset(
+    {
+        "gmail.com", "googlemail.com", "outlook.com", "outlook.es", "hotmail.com",
+        "hotmail.es", "hotmail.co", "live.com", "live.com.mx", "msn.com",
+        "yahoo.com", "yahoo.es", "yahoo.com.mx", "yahoo.com.co", "ymail.com",
+        "icloud.com", "me.com", "mac.com", "proton.me", "protonmail.com",
+        "aol.com", "gmx.com", "gmx.net", "yandex.com", "zoho.com", "mail.com",
+    }
+)
+
+
+def email_domain(address: str | None) -> str:
+    """Registrable domain of an email address, or ""."""
+    if not address or "@" not in address:
+        return ""
+    return normalize_domain(address.rsplit("@", 1)[1])
+
+
+def is_public_email_domain(domain: str | None) -> bool:
+    return bool(domain) and domain in PUBLIC_EMAIL_PROVIDERS

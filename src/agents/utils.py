@@ -1,3 +1,5 @@
+import hashlib
+
 from langchain_core.runnables import RunnableConfig
 
 _LANGUAGE_NAMES = {
@@ -119,6 +121,34 @@ def resolve_prompt(
     if state is not None and "{persona}" in result:
         result = result.replace("{persona}", resolve_persona(state, "Helena"))
     return result
+
+
+def resolve_prompt_provenance(
+    config: RunnableConfig,
+    prompt_type: str,
+    used_text: str,
+    default_version: str,
+) -> dict:
+    """Which prompt text a call actually used, for usage rows and evals.
+
+    In production the backend always sends text — its own DEFAULT_PROMPTS for a
+    slot no tenant customized — so the code default is rarely what runs. The
+    sha of the text used is therefore the reliable identity: it exposes drift
+    between the backend copy and the code copy. `id` is keyed on because
+    `is_default` never arrives (the backend spells it `isDefault`).
+    """
+    prompts = config.get("configurable", {}).get("prompts", {})
+    payload = prompts.get(prompt_type, {})
+    payload = payload if isinstance(payload, dict) else {}
+    from_payload = bool(payload.get("content"))
+    return {
+        "prompt_key": prompt_type,
+        "prompt_id": str(payload.get("id") or "") if from_payload else "",
+        "prompt_version": (
+            str(payload.get("version") or "") if from_payload else f"code:{default_version}"
+        ),
+        "prompt_sha": hashlib.sha256(used_text.encode("utf-8")).hexdigest()[:12],
+    }
 
 
 def resolve_model_config(config: RunnableConfig, prompt_type: str) -> dict:

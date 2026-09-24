@@ -65,6 +65,21 @@ _CONFIG_STATUS_TEXT = (
 )
 
 
+class StructuredOutputError(RuntimeError):
+    """The model answered, but not with a value the requested schema accepts.
+
+    ``kind`` says why: ``invalid_json`` (not parseable), ``schema_mismatch``
+    (parseable, fails validation), ``truncated`` (the output limit was reached —
+    possibly all on thinking — before the JSON closed) or ``empty`` (no text).
+    Unlike ``ProviderConfigError`` the credential and model are fine, so the same
+    item can succeed on a later attempt.
+    """
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def is_provider_config_error(exc: BaseException) -> bool:
     """True when `exc` is a verdict on the credential/model configuration.
 

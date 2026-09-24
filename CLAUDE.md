@@ -72,6 +72,19 @@ START → triage
 
 **Auto-chaining**: When a node completes all its sub-steps, the next node runs in the same turn — no extra user message needed. This is implemented via conditional edges (`_route_from_sales_collect`, `_route_from_order_summary`, `_route_from_tracking_collect`, `_route_from_complaint_collect`) that check state flags.
 
+### Email agent (`clara`, agent type EMAIL)
+
+Gmail → sanitize → triage → task extraction → reply draft → **human approval in the CRM** → Gmail **draft**. It never sends. Ported from the `emailAi` prototype.
+
+- **Trigger:** the backend's email sweep (Cloud Scheduler) calls `POST /email/sync` (202, background) per mailbox and `POST /email/follow-up` per due thread; `POST /email/drafts` runs synchronously after a human approved/edited a reply. `agent_code_name` is **required** on all three (no default) and must resolve to a graph compiled with `name=EMAIL_GRAPH_NAME`, else 400.
+- **Graph** (`src/graphs/clara_graph.py`, nodes in `src/agents/clara/nodes.py`): `precheck → triage → (extract_task) → draft_reply`, or `draft_follow_up` in follow-up mode. **Tool-free**: each node is pure Python or ONE `generate_structured` call. `precheck` short-circuits only on strong signals (`Auto-Submitted`, bounces, internal sender = same non-public domain as the mailbox) and fails open otherwise. Guards run after every node: parser `security_flags` force human review; `evidence_quote`/`due_date_evidence` must be literal substrings of the email.
+- **Side effects** live only in `src/agents/clara/runner.py`: access token from the backend (scopes must be exactly `gmail.readonly` + `gmail.compose`, checked on every use — `src/services/gmail.py`), history-cursor sync, reports to `/api/v1/internal/email/*`. Idempotency: `alreadyIngested` before any model call, one checkpoint thread per message (`{code}:{tenant}:{mailbox}:{key}`) resumed by `run_graph_once` and **deleted** after the backend confirms, `X-Clara-Approval-Id` header so a retried draft is found instead of duplicated. A message that keeps failing is reported FAILED until the backend answers `giveUp` (3 attempts); a provider config error fails the whole run. Credentials never fall back to the platform OpenAI key.
+- **Parser** (`src/services/email_parser.py`): hidden HTML, quoted history, zero-width/bidi characters (stripped before the injection regexes) and injection phrases are removed or flagged before anything reaches a model. Email text reaches prompts only inside `<<<CORREO … CORREO>>>` fences.
+- **Prompts** (`src/agents/clara/prompts.py`, keys `EMAIL_*`) are mirrored in the backend's `DEFAULT_PROMPTS`; every usage row carries `prompt_key/prompt_id/prompt_version/prompt_sha` and `latency_ms` (optional `InvocationUsage` keys only this agent sets).
+- **Structured output:** `ChatProvider.generate_structured` (prompt-JSON fallback); Gemini overrides it with native `response_schema` + per-node `ThinkingConfig`, folds thinking tokens into `output_tokens` (the backend bills reasoning as a subset of output) and retries once without a budget on models that cannot disable thinking.
+- **Memory:** human-edited replies (last 3 per sender, keyed by approval id) in the existing `AsyncPostgresStore`, namespace `("clara_sender_prefs", tenant_id)`. Written only on a human edit, never by a model.
+- **Eval:** `uv run python scripts/eval_clara.py` (real LLM, costs money) over `tests/fixtures/email/` with a local LLM-as-judge for `draft_criteria`.
+
 ### Key State (`src/graphs/state.py`)
 
 `AgentState` is a `TypedDict` persisted per `thread_id`:

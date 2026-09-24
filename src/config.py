@@ -1,4 +1,4 @@
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -157,6 +157,31 @@ class Settings(BaseSettings):
     sherlock_discovery_max_results: int = 10
     sherlock_discovery_min_confidence: float = 0.7
     sherlock_discovery_margin: float = 0.15
+
+    # ── Email agent (clara) ──────────────────────────────────────────────────
+    # Gmail → triage → task → reply draft, run by the backend's email sweep.
+    # `clara_max_messages_per_sync` bounds one /email/sync run; the cursor only
+    # advances past what was fully handled, so the rest waits for the next sweep.
+    # Thinking budgets are per node and only honoured by Gemini (billed at the
+    # output rate): off for classification/extraction, model default (None) for
+    # drafting — the one judgement call.
+    clara_max_body_chars: int = 12_000
+    clara_max_messages_per_sync: int = 25
+    clara_initial_backfill_query: str = "in:inbox newer_than:1d"
+    clara_thinking_triage: int | None = 0
+    clara_thinking_extract_task: int | None = 0
+    clara_thinking_draft: int | None = None
+    clara_gmail_timeout_seconds: float = 15.0
+
+    @field_validator(
+        "clara_thinking_triage", "clara_thinking_extract_task", "clara_thinking_draft", mode="before"
+    )
+    @classmethod
+    def _empty_budget_means_model_default(cls, value):
+        """`CLARA_THINKING_DRAFT=` (empty) or `default` → None: leave the model's own budget."""
+        if isinstance(value, str) and value.strip().lower() in ("", "default", "none"):
+            return None
+        return value
 
     @model_validator(mode="after")
     def _require_serper_api_key(self) -> "Settings":

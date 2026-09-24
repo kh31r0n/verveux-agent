@@ -25,6 +25,7 @@ dependencies = [
     # namespace is the deprecated SDK and is not imported anywhere here.
     "google-genai>=2.7",
     "tldextract>=5.1",
+    "beautifulsoup4>=4.15.0",
 ]
 
 [project.optional-dependencies]

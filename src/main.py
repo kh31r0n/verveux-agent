@@ -9,6 +9,7 @@ from typing import Annotated
 import structlog
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
+from httpx import HTTPStatusError
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # used in lifespan
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -32,7 +33,11 @@ from .agents.backend_client import (
     report_enrichment_attempt,
     report_prospecting_run,
 )
+from .agents.clara import runner as clara_runner
+from .agents.clara.runner import EmailDraftRequest, EmailFollowUpRequest, EmailSyncRequest
 from .agents.prospecting_nodes import DEFAULT_LOCATION
+from .graphs.clara_graph import EMAIL_GRAPH_NAME
+from .services.gmail import GmailError
 from .services.serper import serper_call_count, start_serper_accounting
 from .config import settings
 from .db.postgres import (
@@ -1011,6 +1016,95 @@ async def enrichment_run(
         code_name=code_name,
     )
     return {"accepted": True, "attempt_id": req.attempt_id}
+
+
+# ---------------------------------------------------------------------------
+# Email agent (clara). The backend's sweep dispatches /email/sync and
+# /email/follow-up; /email/drafts runs synchronously after a human approved a
+# reply in the CRM. The graph is tool-free — every effect is in the runner.
+# ---------------------------------------------------------------------------
+
+_email_tasks: set[asyncio.Task] = set()
+
+# GmailError.kind → HTTP status for /email/drafts refusals.
+_DRAFT_ERROR_STATUS = {
+    "missing_message_id": 422,
+    "gmail_scope": 409,
+    "gmail_auth": 409,
+    "gmail_unavailable": 503,
+}
+
+
+async def _email_graph(code_name: str):
+    """The compiled graph for an email code name; 400 for unknown or non-email ones.
+
+    `agent_code_name` has no default here (versioning invariant 4): the backend
+    always sends the connection's own code name.
+    """
+    try:
+        graph = await get_or_compile_graph(code_name.strip().lower())
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if getattr(graph, "name", None) != EMAIL_GRAPH_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"agent_code_name {code_name!r} is not an email agent",
+        )
+    return graph
+
+
+def _spawn_email_task(coro) -> None:
+    task = asyncio.create_task(coro)
+    _email_tasks.add(task)
+    task.add_done_callback(_email_tasks.discard)
+
+
+@app.post("/email/sync", status_code=202)
+async def email_sync(
+    req: EmailSyncRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    graph = await _email_graph(req.agent_code_name)
+    _spawn_email_task(clara_runner.sync_mailbox(req, graph))
+    logger.info("email_sync_accepted", mailbox_id=req.mailbox_id, tenant_id=req.tenant_id)
+    return {"accepted": True, "mailbox_id": req.mailbox_id}
+
+
+@app.post("/email/follow-up", status_code=202)
+async def email_follow_up(
+    req: EmailFollowUpRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    graph = await _email_graph(req.agent_code_name)
+    _spawn_email_task(clara_runner.generate_follow_up(req, graph))
+    logger.info(
+        "email_follow_up_accepted",
+        email_thread_id=req.email_thread_id,
+        follow_up_number=req.follow_up_number,
+    )
+    return {"accepted": True, "email_thread_id": req.email_thread_id}
+
+
+@app.post("/email/drafts")
+async def email_drafts(
+    req: EmailDraftRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    await _email_graph(req.agent_code_name)
+    try:
+        return await clara_runner.create_approved_draft(req)
+    except GmailError as exc:
+        raise HTTPException(
+            status_code=_DRAFT_ERROR_STATUS.get(exc.kind, 502),
+            detail={"kind": exc.kind, "message": str(exc)},
+        )
+    except HTTPStatusError as exc:
+        # The backend refused the access token (409 = grant revoked, reconnect).
+        kind = "gmail_auth" if exc.response.status_code == 409 else "backend_error"
+        raise HTTPException(
+            status_code=409 if kind == "gmail_auth" else 502,
+            detail={"kind": kind, "message": exc.response.text[:300]},
+        )
 
 
 @app.post("/chat/stream")

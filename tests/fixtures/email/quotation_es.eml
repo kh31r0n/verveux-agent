@@ -1,0 +1,8 @@
+From: Compras Cliente <compras@cliente.example>
+To: ventas@example.test
+Subject: Solicitud de cotización
+Date: Tue, 22 Sep 2026 09:00:00 -0500
+Message-ID: <quotation-es@cliente.example>
+Content-Type: text/plain; charset=utf-8
+
+Buenos días, necesitamos una cotización actualizada para 50 licencias. Por favor envíenla antes del 30 de septiembre de 2026.

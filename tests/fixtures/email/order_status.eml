@@ -1,0 +1,7 @@
+From: Laura Pérez <laura@cliente.example>
+To: ventas@example.test
+Subject: Estado del pedido 8421
+Message-ID: <order-status@cliente.example>
+Content-Type: text/plain; charset=utf-8
+
+Hola, ¿podrían confirmarme el estado del pedido 8421? Gracias.

@@ -41,6 +41,7 @@ class TestRegistryShape:
             "veronica",
             "aurora",
             "sherlock",
+            "clara",
         }
 
     def test_legacy_fallback_maps_each_agent_type(self):

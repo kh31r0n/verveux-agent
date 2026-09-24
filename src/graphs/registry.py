@@ -25,6 +25,7 @@ import structlog
 
 from .appointments_graph import build_appointments_graph
 from .camila_graph import build_camila_graph
+from .clara_graph import build_clara_graph
 from .enrichment_graph import build_enrichment_graph
 from .leads_graph import build_leads_graph
 from .prospecting_graph import build_prospecting_graph
@@ -49,6 +50,7 @@ CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "veronica": build_leads_graph,
     "aurora": build_prospecting_graph,
     "sherlock": build_enrichment_graph,
+    "clara": build_clara_graph,
 }
 
 

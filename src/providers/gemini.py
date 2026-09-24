@@ -7,11 +7,69 @@ import structlog
 from google.genai import Client, types
 from google.oauth2 import service_account
 
-from .base import ChatProvider, UsageInfo
+from .base import ChatProvider, UsageInfo, parse_structured
+from .errors import StructuredOutputError
 from langgraph.types import RunnableConfig
 from ..config import settings
 
 logger = structlog.get_logger(__name__)
+
+
+def _structured_config(
+    system_instruction: str | None,
+    schema,
+    temperature: float | None,
+    thinking_budget: int | None,
+) -> types.GenerateContentConfig:
+    kwargs: dict = {
+        "system_instruction": system_instruction,
+        "response_mime_type": "application/json",
+        "response_schema": schema,
+        "temperature": temperature,
+    }
+    if thinking_budget is not None:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+    return types.GenerateContentConfig(**kwargs)
+
+
+def _is_thinking_config_rejection(exc: Exception) -> bool:
+    """A 400 about the thinking budget: some models (Pro tiers) cannot turn
+    thinking off and reject ``thinking_budget=0`` instead of ignoring it."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return code == 400 and "thinking" in str(exc).lower()
+
+
+def _finish_reason(response) -> str | None:
+    """The finish reason's enum NAME: ``str()`` of the enum reads
+    "FinishReason.MAX_TOKENS" and would never compare equal."""
+    candidates = getattr(response, "candidates", None) or []
+    reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    if reason is None:
+        return None
+    return getattr(reason, "name", None) or str(reason)
+
+
+def _usage_with_thinking(meta) -> UsageInfo:
+    """Token counts with thinking folded into output.
+
+    The backend bills ``input*price + output*price`` and stores reasoning as a
+    SUBSET of output (OpenAI semantics). Gemini reports thoughts apart from
+    ``candidates_token_count``, so they are added back here or they go unbilled.
+    """
+    if meta is None:
+        return UsageInfo()
+    prompt = getattr(meta, "prompt_token_count", 0) or 0
+    visible = getattr(meta, "candidates_token_count", 0) or 0
+    thoughts = getattr(meta, "thoughts_token_count", 0) or 0
+    if not visible and not thoughts:
+        total = getattr(meta, "total_token_count", 0) or 0
+        visible = max(0, total - prompt)
+    return UsageInfo(
+        input_tokens=prompt,
+        output_tokens=visible + thoughts,
+        cached_input_tokens=getattr(meta, "cached_content_token_count", 0) or 0,
+        reasoning_tokens=thoughts,
+    )
 
 
 def _is_gemini_rate_limit(exc: Exception) -> bool:
@@ -231,6 +289,70 @@ class GeminiProvider(ChatProvider):
                     settings.gemini_retry_max_seconds,
                 )
                 delay = random.uniform(0, delay)  # full jitter
+                logger.warning(
+                    "gemini_rate_limited_retry",
+                    attempt=attempt + 1,
+                    max_retries=settings.gemini_max_retries,
+                    delay_seconds=round(delay, 2),
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+
+    async def generate_structured(
+        self,
+        messages: list[dict],
+        model: str,
+        schema,
+        *,
+        thinking_budget: int | None = None,
+        temperature: float | None = 0.0,
+    ):
+        """Native JSON mode: the schema travels with the request.
+
+        Do not set ``max_output_tokens`` here — thinking counts against it, and a
+        cap sized for the answer can be spent entirely on reasoning.
+        """
+        self.last_usage = UsageInfo()
+        contents, system_instruction = self._build_contents(messages)
+        config = _structured_config(system_instruction, schema, temperature, thinking_budget)
+        try:
+            response = await self._generate_with_retry(model, contents, config)
+        except Exception as exc:
+            if thinking_budget is None or not _is_thinking_config_rejection(exc):
+                raise
+            logger.warning("gemini_thinking_budget_rejected", model=model, error=str(exc))
+            config = _structured_config(system_instruction, schema, temperature, None)
+            response = await self._generate_with_retry(model, contents, config)
+
+        self.last_usage = _usage_with_thinking(getattr(response, "usage_metadata", None))
+        if _finish_reason(response) == "MAX_TOKENS":
+            raise StructuredOutputError(
+                f"{schema.__name__}: the model hit its output limit "
+                f"({self.last_usage.reasoning_tokens} thinking tokens) before the JSON closed",
+                kind="truncated",
+            )
+        return parse_structured(response.text or "", schema)
+
+    async def _generate_with_retry(self, model: str, contents: list, config):
+        """``generate_content`` under the same 429 policy as ``stream_chat``."""
+        attempt = 0
+        while True:
+            try:
+                return await self._client.aio.models.generate_content(
+                    model=model or "gemini-3.5-flash",
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as exc:
+                if attempt >= settings.gemini_max_retries or not _is_gemini_rate_limit(exc):
+                    raise
+                delay = random.uniform(
+                    0,
+                    min(
+                        settings.gemini_retry_base_seconds * (2 ** attempt),
+                        settings.gemini_retry_max_seconds,
+                    ),
+                )
                 logger.warning(
                     "gemini_rate_limited_retry",
                     attempt=attempt + 1,

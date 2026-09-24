@@ -1,0 +1,7 @@
+From: Ana Cliente <ana@cliente.example>
+To: ventas@example.test
+Subject: FYI actualización de contacto
+Message-ID: <fyi@cliente.example>
+Content-Type: text/plain; charset=utf-8
+
+FYI: desde ahora Mariana Gómez será la persona de contacto para este proyecto. No se requiere ninguna acción por ahora.

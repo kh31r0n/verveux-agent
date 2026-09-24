@@ -83,6 +83,34 @@ service_auth_rejects_total = Counter(
     ["reason"],
 )
 
+# ── Email agent (clara) ──────────────────────────────────────────────────────
+# outcome: processed | failed | skipped
+email_messages_processed_total = Counter(
+    "email_messages_processed_total",
+    "Inbound emails handled by an email agent",
+    ["agent_code_name", "category", "outcome"],
+)
+
+email_security_flags_total = Counter(
+    "email_security_flags_total",
+    "Security flags raised by the email parser",
+    ["agent_code_name", "flag"],
+)
+
+# outcome: created | already_existed | refused | failed
+email_drafts_created_total = Counter(
+    "email_drafts_created_total",
+    "Approved reply drafts written to Gmail",
+    ["agent_code_name", "outcome"],
+)
+
+# outcome: completed | failed
+email_sync_runs_total = Counter(
+    "email_sync_runs_total",
+    "Mailbox sync runs",
+    ["agent_code_name", "outcome"],
+)
+
 
 def record_node_invocation(node: str, agent_code_name: str = "unknown") -> None:
     agent_node_invocations_total.labels(

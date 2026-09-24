@@ -544,6 +544,67 @@ async def list_active_appointments_for_contact(
     return data if isinstance(data, list) else []
 
 
+# ─── Email (clara — /internal/email/*) ───────────────────────────────────────
+#
+# The backend owns the mailbox's refresh token and all CRM rows; the agent only
+# borrows a short-lived access token and reports what it read and drafted.
+
+
+async def get_email_access_token(tenant_id: str, mailbox_id: str) -> dict:
+    """GET /internal/email/mailboxes/:id/access-token → {accessToken, expiresAt, scopes, emailAddress}.
+
+    The backend refuses unless ``tenant_id`` owns the mailbox, re-checks the
+    refreshed token's scopes, and answers 409 once Google revoked the grant.
+    """
+    return await _get(
+        f"/api/v1/internal/email/mailboxes/{mailbox_id}/access-token",
+        params={"tenantId": tenant_id},
+    )
+
+
+async def get_email_sender_context(
+    tenant_id: str, mailbox_id: str, email: str, gmail_message_id: str
+) -> dict:
+    """GET /internal/email/sender-context → {knownContact, contactId, alreadyIngested, attempts}."""
+    return await _get(
+        "/api/v1/internal/email/sender-context",
+        params={
+            "tenantId": tenant_id,
+            "mailboxId": mailbox_id,
+            "email": email,
+            "gmailMessageId": gmail_message_id,
+        },
+    )
+
+
+async def report_email_message(payload: dict) -> dict:
+    """POST /internal/email/messages — one processed (or failed) inbound email.
+
+    Idempotent on ``idempotencyKey``. A ``FAILED`` report answers ``giveUp``
+    once the message has failed often enough to be skipped.
+    """
+    return await _post("/api/v1/internal/email/messages", json=payload)
+
+
+async def report_email_outbound(payload: dict) -> dict:
+    """POST /internal/email/outbound — a message the mailbox sent (a no-op for untracked threads)."""
+    return await _post("/api/v1/internal/email/outbound", json=payload)
+
+
+async def report_email_follow_up(payload: dict) -> dict:
+    """POST /internal/email/follow-ups — a proposed follow-up (or why none was drafted)."""
+    return await _post("/api/v1/internal/email/follow-ups", json=payload)
+
+
+async def report_email_sync(mailbox_id: str, payload: dict) -> dict:
+    """PATCH /internal/email/mailboxes/:id/sync — end of a sync run.
+
+    The backend applies ``historyId`` only when ``syncClaimToken`` matches the
+    current claim and the id moves forward, then releases the claim.
+    """
+    return await _patch(f"/api/v1/internal/email/mailboxes/{mailbox_id}/sync", json=payload)
+
+
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 

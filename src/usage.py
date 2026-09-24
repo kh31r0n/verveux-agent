@@ -21,6 +21,14 @@ class InvocationUsage(TypedDict, total=False):
     output_tokens: int
     cached_input_tokens: int
     reasoning_tokens: int
+    # Optional provenance, set only by callers that pass it (the email agent).
+    # Existing rows keep their exact shape: the backend's DTOs reject keys they
+    # do not declare.
+    latency_ms: int
+    prompt_key: str
+    prompt_id: str
+    prompt_version: str
+    prompt_sha: str
 
 
 def make_usage_record(
@@ -29,14 +37,17 @@ def make_usage_record(
     provider: ChatProvider,
     model: str,
     usage: UsageInfo | None = None,
+    latency_ms: int | None = None,
+    provenance: dict | None = None,
 ) -> InvocationUsage:
     """Build an InvocationUsage dict from a provider's most recent call.
 
     Pass `usage` explicitly when the provider instance is shared (rare today —
     nodes instantiate per-call). Otherwise reads `provider.last_usage`.
+    `provenance` is the dict from `resolve_prompt_provenance`.
     """
     u = usage or provider.last_usage
-    return InvocationUsage(
+    record = InvocationUsage(
         node=node,
         provider=provider.name,
         model=model,
@@ -45,3 +56,8 @@ def make_usage_record(
         cached_input_tokens=u.cached_input_tokens,
         reasoning_tokens=u.reasoning_tokens,
     )
+    if latency_ms is not None:
+        record["latency_ms"] = latency_ms
+    if provenance:
+        record.update(provenance)  # type: ignore[typeddict-item]
+    return record

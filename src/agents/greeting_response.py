@@ -126,6 +126,14 @@ _AGENT_PROFILES: dict[str, tuple[str, dict[str, str]]] = {
             "pt": "sua assistente virtual",
         },
     ),
+    "ismael": (
+        "Ismael",
+        {
+            "es": "el asistente de teología cristiana",
+            "en": "the Christian theology assistant",
+            "pt": "o assistente de teologia cristã",
+        },
+    ),
 }
 
 _GENERIC_ROLES = {
@@ -142,6 +150,7 @@ _TYPE_ROLE_FALLBACK: dict[str, dict[str, str]] = {
     "restaurant": _AGENT_PROFILES["giulia"][1],
     "appointments": _AGENT_PROFILES["marco"][1],
     "leads": _AGENT_PROFILES["veronica"][1],
+    "theology": _AGENT_PROFILES["ismael"][1],
 }
 
 

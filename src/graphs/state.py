@@ -191,6 +191,14 @@ class AgentState(TypedDict):
     # lead_submission_id.
     lead_submitted: bool
 
+    # ── Theology flow (ismael) ────────────────────────────────────────
+    # {question, pending_question, survey_step, survey_answers} — see
+    # src/agents/ismael/nodes.py. Readers must use .get(): other graphs'
+    # checkpoints never carry it.
+    ismael: dict
+    # Per-turn branch chosen by ismael_triage (written every turn).
+    ismael_route: str
+
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool
 

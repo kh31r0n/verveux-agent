@@ -85,6 +85,17 @@ Gmail → sanitize → triage → task extraction → reply draft → **human ap
 - **Memory:** human-edited replies (last 3 per sender, keyed by approval id) in the existing `AsyncPostgresStore`, namespace `("clara_sender_prefs", tenant_id)`. Written only on a human edit, never by a model.
 - **Eval:** `uv run python scripts/eval_clara.py` (real LLM, costs money) over `tests/fixtures/email/` with a local LLM-as-judge for `draft_criteria`.
 
+### Theology agent (`ismael`, agent type THEOLOGY)
+
+Christian theology Q&A for the MOODLE bubble, answered by **Company Brain** (the cited RAG in `yorch-tauri-backend`, one EC2 host in AWS that is **stopped when idle**).
+
+- **Graph** (`src/graphs/ismael_graph.py`, nodes in `src/agents/ismael/nodes.py`): `ismael_triage → {ismael_survey | ismael_pending | ismael_start | greeting_response | ismael_off_topic} → END`. Triage is deterministic while a survey question is open or a job is running; otherwise ONE `generate_structured` call returns the intent and the question rewritten to stand alone (Brain never sees the conversation). No name capture — MOODLE identity is server-attested.
+- **The answer never comes from the graph.** A cold Brain plus a real question outlasts the backend's 60 s turn, so `ismael_start` replies with a holding message and `rag_job.spawn` runs a background task: `brain.ensure_started` → `wait_healthy` (re-requests the start every 30 s: a host caught mid-stop refuses StartInstances) → `POST /ask` → poll `GET /ask/:id` → `POST /api/v1/internal/conversations/:id/agent-messages` (idempotent on `jobId`; the backend stores, dispatches over the widget SSE and bills `turnUsage`). `answered` is sent **verbatim** plus a References block from `citations`+`evidence` (an LLM rewrite could detach a claim from its source); `insufficient_evidence`/`off_corpus` get a ≤120-word general answer (`THEOLOGY_GENERAL`) with a notice; boot/answer timeout or a failed question gets an apology.
+- **Survey (statistics only, once per contact):** on a new contact's first question `ismael_start` fires the EC2 start in the background and asks 3 fixed questions (`texts.SURVEY`: level, topic, intendedUse — option keys are statistics, never tenant-editable); the answers go to `POST /internal/contacts/:id/ismael-survey` → `profileData.ismael`, and the backend then reports `user_context.ismael_survey_done`. Numbers/labels parse deterministically; an LLM is asked only otherwise; unreadable → `no_answer`, never re-asked; a new question typed instead of an answer replaces the pending one.
+- **One job per conversation:** running state in the shared `AsyncPostgresStore` (`("ismael_jobs", tenant)`, key conversationId, TTL = boot + answer timeout + 2 min) so it holds across Cloud Run instances; an in-process dict is the fallback. A recycled instance loses its job — the entry expires and the student can ask again.
+- **Starting the host** (`src/services/brain.py`): metadata-server ID token (audience `BRAIN_OIDC_AUDIENCE`) → boto3 `AssumeRoleWithWebIdentity` → `ec2:StartInstances`. No AWS key anywhere. `BRAIN_START_MODE=skip` off Cloud Run. Brain auth is `X-Api-Key` (a Brain service key bound to one tenant).
+- Tests: `tests/test_ismael_graph.py`.
+
 ### Key State (`src/graphs/state.py`)
 
 `AgentState` is a `TypedDict` persisted per `thread_id`:
@@ -123,6 +134,40 @@ asyncpg pool + LangGraph's `AsyncPostgresSaver`. Schema runs idempotently on sta
 
 - Prometheus metrics at `GET /metrics` — request counts, node invocations, order/tracking/complaint funnel, errors
 - Optional Langfuse LLM tracing — gracefully disabled if keys not configured
+
+## ⚠️ `agent-migrate` (Cloud Run Job) is broken — known, not yet fixed
+
+Seen 2026-09-29 against `vervux-platform-prod`: its last three executions all
+failed (`agent-migrate-4sqmg`, `-gtvsz` on 2026-09-24, `-2b597` on 2026-09-29),
+and `yorch-gcp-platform/scripts/migrate.sh yorchio` runs it after every backend
+migration, so every such run ends with a failed second job.
+
+Why, from the job's own logs:
+- **It starts the server, not a migration.** `envs/prod/jobs.tf` (`module
+  "agent_migrate"`) sets no `command`/`args` — unlike `rocky-migrate` /
+  `yorchio-migrate` (`npx prisma migrate deploy`) — so it runs this image's
+  `CMD`, which is `uvicorn src.main:app`.
+- **It dies at config validation first:** the job only gets `DATABASE_URL`, and
+  `Settings._require_serper_api_key` refuses to boot without `SERPER_API_KEY`
+  (`Value error, SERPER_API_KEY is not set`), `exit(1)`.
+- Even with the key it would be wrong: uvicorn never exits, so the job would run
+  until its timeout.
+
+Why nothing breaks: this service applies its own schema at startup —
+`lifespan` → `src/db/postgres.py::run_migrations` (`migrations/init.sql`,
+statement by statement) plus the checkpointer/store `setup()`. The job adds
+nothing a deploy does not already do.
+
+One statement also fails at every startup, logged as `migration_statement_failed`:
+`CREATE INDEX IF NOT EXISTS approval_requests_thread_status_idx` → `must be owner
+of table approval_requests`. The runtime role is not the table owner (the
+migrator is), so that index is never created by the service. Harmless today;
+running the migration as the migrator is what would fix it.
+
+To fix (pick one): give the job a real one-shot entrypoint (e.g. a small
+`python -m src.db.migrate` that opens the pool, calls `run_migrations` and
+exits) plus the env `Settings` requires, or delete the job and the
+`agent-migrate` step from `migrate.sh`.
 
 ## Environment
 

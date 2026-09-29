@@ -85,6 +85,17 @@ Gmail → sanitize → triage → task extraction → reply draft → **human ap
 - **Memory:** human-edited replies (last 3 per sender, keyed by approval id) in the existing `AsyncPostgresStore`, namespace `("clara_sender_prefs", tenant_id)`. Written only on a human edit, never by a model.
 - **Eval:** `uv run python scripts/eval_clara.py` (real LLM, costs money) over `tests/fixtures/email/` with a local LLM-as-judge for `draft_criteria`.
 
+### Theology agent (`ismael`, agent type THEOLOGY)
+
+Christian theology Q&A for the MOODLE bubble, answered by **Company Brain** (the cited RAG in `yorch-tauri-backend`, one EC2 host in AWS that is **stopped when idle**).
+
+- **Graph** (`src/graphs/ismael_graph.py`, nodes in `src/agents/ismael/nodes.py`): `ismael_triage → {ismael_survey | ismael_pending | ismael_start | greeting_response | ismael_off_topic} → END`. Triage is deterministic while a survey question is open or a job is running; otherwise ONE `generate_structured` call returns the intent and the question rewritten to stand alone (Brain never sees the conversation). No name capture — MOODLE identity is server-attested.
+- **The answer never comes from the graph.** A cold Brain plus a real question outlasts the backend's 60 s turn, so `ismael_start` replies with a holding message and `rag_job.spawn` runs a background task: `brain.ensure_started` → `wait_healthy` (re-requests the start every 30 s: a host caught mid-stop refuses StartInstances) → `POST /ask` → poll `GET /ask/:id` → `POST /api/v1/internal/conversations/:id/agent-messages` (idempotent on `jobId`; the backend stores, dispatches over the widget SSE and bills `turnUsage`). `answered` is sent **verbatim** plus a References block from `citations`+`evidence` (an LLM rewrite could detach a claim from its source); `insufficient_evidence`/`off_corpus` get a ≤120-word general answer (`THEOLOGY_GENERAL`) with a notice; boot/answer timeout or a failed question gets an apology.
+- **Survey (statistics only, once per contact):** on a new contact's first question `ismael_start` fires the EC2 start in the background and asks 3 fixed questions (`texts.SURVEY`: level, topic, intendedUse — option keys are statistics, never tenant-editable); the answers go to `POST /internal/contacts/:id/ismael-survey` → `profileData.ismael`, and the backend then reports `user_context.ismael_survey_done`. Numbers/labels parse deterministically; an LLM is asked only otherwise; unreadable → `no_answer`, never re-asked; a new question typed instead of an answer replaces the pending one.
+- **One job per conversation:** running state in the shared `AsyncPostgresStore` (`("ismael_jobs", tenant)`, key conversationId, TTL = boot + answer timeout + 2 min) so it holds across Cloud Run instances; an in-process dict is the fallback. A recycled instance loses its job — the entry expires and the student can ask again.
+- **Starting the host** (`src/services/brain.py`): metadata-server ID token (audience `BRAIN_OIDC_AUDIENCE`) → boto3 `AssumeRoleWithWebIdentity` → `ec2:StartInstances`. No AWS key anywhere. `BRAIN_START_MODE=skip` off Cloud Run. Brain auth is `X-Api-Key` (a Brain service key bound to one tenant).
+- Tests: `tests/test_ismael_graph.py`.
+
 ### Key State (`src/graphs/state.py`)
 
 `AgentState` is a `TypedDict` persisted per `thread_id`:

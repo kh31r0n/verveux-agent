@@ -224,6 +224,41 @@ async def request_handoff(
     )
 
 
+# ─── Theology agent (ismael) ─────────────────────────────────────────────────
+
+
+async def save_ismael_survey(contact_id: str, conversation_id: str, answers: dict) -> dict:
+    """POST /internal/contacts/:id/ismael-survey — the three statistics answers.
+
+    Merged into ``Contact.profileData.ismael``; the backend echoes
+    ``ismael_survey_done`` in ``user_context`` from then on, so the survey is
+    asked once per contact, not once per conversation.
+    """
+    return await _post(
+        f"/api/v1/internal/contacts/{contact_id}/ismael-survey",
+        json={"conversationId": conversation_id, **answers},
+    )
+
+
+async def post_agent_message(
+    conversation_id: str,
+    *,
+    job_id: str,
+    text: str,
+    turn_usage: list | None = None,
+) -> dict:
+    """POST /internal/conversations/:id/agent-messages — an out-of-band reply.
+
+    For answers that outlive a chat turn (ismael's Brain job). The backend
+    stores the message, dispatches it on the conversation's channel and bills
+    ``turn_usage``; ``job_id`` makes the whole call idempotent.
+    """
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/agent-messages",
+        json={"jobId": job_id, "text": text, "turnUsage": turn_usage or []},
+    )
+
+
 # ─── Prospecting (aurora — /internal/prospecting/*) ─────────────────────────
 
 

@@ -173,6 +173,33 @@ class Settings(BaseSettings):
     clara_thinking_draft: int | None = None
     clara_gmail_timeout_seconds: float = 15.0
 
+    # ── Theology agent (ismael) → Company Brain RAG ──────────────────────────
+    # Brain runs on ONE EC2 host in AWS that is stopped whenever it is idle, so
+    # ismael starts it on demand: a Google ID token for `brain_oidc_audience`
+    # from the metadata server is exchanged (AssumeRoleWithWebIdentity) for a
+    # role that may only start that instance. `brain_start_mode=skip` turns the
+    # start off (local dev: start the host by hand with deploy-brain.sh start).
+    #
+    # `brain_api_key` is a Brain service credential bound to one tenant — the
+    # tenant is implied by the key, never sent. `brain_library_id` is the
+    # library every question is asked against.
+    brain_api_url: str = "https://brain-api.vervux.com"
+    brain_api_key: str = ""
+    brain_library_id: str = ""
+    brain_ask_effort: str = "standard"
+    brain_start_mode: str = "aws"
+    brain_aws_role_arn: str = ""
+    brain_aws_region: str = "us-west-2"
+    brain_instance_id: str = ""
+    brain_oidc_audience: str = "vervux-brain-starter"
+    # Wall-clock ceilings for the background job: waiting for the host to boot
+    # (~40 s instance + ~1 min containers when cold), then for the answer (a
+    # real question has taken >180 s). A job past either delivers an apology.
+    brain_boot_timeout_seconds: float = 300.0
+    brain_answer_timeout_seconds: float = 420.0
+    brain_poll_interval_seconds: float = 5.0
+    brain_request_timeout_seconds: float = 15.0
+
     @field_validator(
         "clara_thinking_triage", "clara_thinking_extract_task", "clara_thinking_draft", mode="before"
     )

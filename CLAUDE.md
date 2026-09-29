@@ -135,6 +135,40 @@ asyncpg pool + LangGraph's `AsyncPostgresSaver`. Schema runs idempotently on sta
 - Prometheus metrics at `GET /metrics` — request counts, node invocations, order/tracking/complaint funnel, errors
 - Optional Langfuse LLM tracing — gracefully disabled if keys not configured
 
+## ⚠️ `agent-migrate` (Cloud Run Job) is broken — known, not yet fixed
+
+Seen 2026-09-29 against `vervux-platform-prod`: its last three executions all
+failed (`agent-migrate-4sqmg`, `-gtvsz` on 2026-09-24, `-2b597` on 2026-09-29),
+and `yorch-gcp-platform/scripts/migrate.sh yorchio` runs it after every backend
+migration, so every such run ends with a failed second job.
+
+Why, from the job's own logs:
+- **It starts the server, not a migration.** `envs/prod/jobs.tf` (`module
+  "agent_migrate"`) sets no `command`/`args` — unlike `rocky-migrate` /
+  `yorchio-migrate` (`npx prisma migrate deploy`) — so it runs this image's
+  `CMD`, which is `uvicorn src.main:app`.
+- **It dies at config validation first:** the job only gets `DATABASE_URL`, and
+  `Settings._require_serper_api_key` refuses to boot without `SERPER_API_KEY`
+  (`Value error, SERPER_API_KEY is not set`), `exit(1)`.
+- Even with the key it would be wrong: uvicorn never exits, so the job would run
+  until its timeout.
+
+Why nothing breaks: this service applies its own schema at startup —
+`lifespan` → `src/db/postgres.py::run_migrations` (`migrations/init.sql`,
+statement by statement) plus the checkpointer/store `setup()`. The job adds
+nothing a deploy does not already do.
+
+One statement also fails at every startup, logged as `migration_statement_failed`:
+`CREATE INDEX IF NOT EXISTS approval_requests_thread_status_idx` → `must be owner
+of table approval_requests`. The runtime role is not the table owner (the
+migrator is), so that index is never created by the service. Harmless today;
+running the migration as the migrator is what would fix it.
+
+To fix (pick one): give the job a real one-shot entrypoint (e.g. a small
+`python -m src.db.migrate` that opens the pool, calls `run_migrations` and
+exits) plus the env `Settings` requires, or delete the job and the
+`agent-migrate` step from `migrate.sh`.
+
 ## Environment
 
 Copy `.env.example` to `.env`. Required vars:

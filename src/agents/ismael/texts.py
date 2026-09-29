@@ -4,8 +4,9 @@ Deterministic on purpose. These replies are sent while Brain is booting or
 answering, so they must not depend on an LLM call succeeding, and the survey
 options are statistics whose keys must never drift.
 
-Spanish is the default; English covers a Moodle site running in English (the
-widget and ``language`` follow the site).
+The tenant's language (TenantSettings.language, sent as ``language``) decides:
+Spanish, or English for an English-speaking tenant. The Moodle user's own
+language does not.
 """
 
 from __future__ import annotations
@@ -152,16 +153,13 @@ _TEXTS: dict[str, dict[str, str]] = {
 
 
 def lang_of(state_or_lang) -> str:
-    """Reply language: the user's signed Moodle language first (``lms_lang``),
-    then the tenant's. TenantSettings.language defaults to "en" whatever the
-    school speaks, and ismael only ever talks inside Moodle."""
-    if isinstance(state_or_lang, str):
-        raw = state_or_lang
-    else:
-        ctx = state_or_lang.get("user_context") or {}
-        raw = (ctx.get("lms_lang") if isinstance(ctx, dict) else None) or state_or_lang.get(
-            "language"
-        )
+    """Reply language: the tenant's (``language``), like every other agent.
+
+    The signed Moodle language (``user_context.lms_lang``) is deliberately
+    ignored: an admin browsing Moodle in English must still get the school's
+    language. Anything but English — or nothing — is Spanish.
+    """
+    raw = state_or_lang if isinstance(state_or_lang, str) else state_or_lang.get("language")
     lang = (raw or "es").strip().lower()[:2]
     return lang if lang in ("es", "en") else "es"
 

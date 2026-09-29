@@ -209,18 +209,27 @@ class TestOtherBranches:
 
 
 class TestLanguage:
-    def test_moodle_language_wins_over_the_tenant_default(self):
+    def test_the_tenant_language_decides_not_the_moodle_users(self):
         from src.agents.ismael.texts import lang_of
 
-        assert lang_of({"language": "en", "user_context": {"lms_lang": "es"}}) == "es"
-        assert lang_of({"language": "en", "user_context": {}}) == "en"
+        assert lang_of({"language": "es", "user_context": {"lms_lang": "en"}}) == "es"
+        assert lang_of({"language": "en", "user_context": {"lms_lang": "es"}}) == "en"
+        assert lang_of({"language": "es-CO"}) == "es"
         assert lang_of({"language": "pt"}) == "es"  # unsupported → Spanish
+        assert lang_of({}) == "es"
 
-    async def test_replies_follow_lms_lang(self, boundary):
+    async def test_a_moodle_user_in_english_still_gets_the_tenants_spanish(self, boundary):
         graph = build_ismael_graph(MemorySaver())
         _, reply = await _turn(
             graph, "th-lang", "what is grace", language="es",
-            user_context={"name": "Ana", "lms_lang": "en"},
+            user_context={"name": "Admin", "lms_lang": "en"},
+        )
+        assert "¿Cuál es tu rol?" in reply and "What is your role?" not in reply
+
+    async def test_an_english_tenant_gets_english(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        _, reply = await _turn(
+            graph, "th-lang-en", "what is grace", language="en", user_context={"name": "Ana"}
         )
         assert "What is your role?" in reply
 
@@ -264,10 +273,10 @@ class TestQuickReplies:
             "k1", "c1", {"level": "student", "topic": "doctrine", "intendedUse": "curiosity"}
         )
 
-    async def test_buttons_follow_the_moodle_language(self, boundary):
+    async def test_buttons_follow_the_tenant_language(self, boundary):
         graph = build_ismael_graph(MemorySaver())
         _, _, events = await _run(
-            graph, "qr3", "what is grace", user_context={"name": "Ana", "lms_lang": "en"}
+            graph, "qr3", "what is grace", language="en", user_context={"name": "Ana"}
         )
         assert events[0]["options"] == ["Student", "Teacher", "Pastor or church leader", "Other"]
 
@@ -341,8 +350,8 @@ class TestPendingFollowUp:
     async def test_in_english(self, boundary):
         graph = build_ismael_graph(MemorySaver())
         _, events = await _events(
-            graph, "pf4", "what is grace",
-            user_context={"name": "Ana", "lms_lang": "en", "ismael_survey_done": True},
+            graph, "pf4", "what is grace", language="en",
+            user_context={"name": "Ana", "ismael_survey_done": True},
         )
         assert _followups(events)[0]["label"] == "Checking the library…"
 

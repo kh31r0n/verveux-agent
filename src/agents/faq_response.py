@@ -8,6 +8,11 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
 from .utils import format_user_context, language_instruction, resolve_persona, resolve_prompt
+from .business_hours_gate import (
+    DEFAULT_OUTSIDE_HOURS_INSTRUCTION,
+    within_business_hours,
+)
+from .capability_gate import CATALOG_DEGRADED_INSTRUCTION, catalog_allowed
 
 logger = structlog.get_logger(__name__)
 
@@ -87,9 +92,24 @@ async def faq_response_node(
     faq_knowledge_block = _format_faqs_for_prompt(faqs)
 
     # ── Inject product catalog so the LLM can answer product-specific questions
+    # When the tenant has disabled catalog access, the catalog block is replaced
+    # by the degraded instruction (never invent products/prices/orders). FAQ
+    # knowledge above is untouched — FAQs are out of scope for this toggle. This
+    # node is the universal product-question handler across all 6 graphs, so
+    # gating it here covers camila/veronica (whose only catalog read is here).
     catalog = state.get("product_catalog") or []
+    catalog_allowed_now = catalog_allowed(state)
     catalog_block = ""
-    if catalog:
+    if not catalog_allowed_now:
+        catalog_block = CATALOG_DEGRADED_INSTRUCTION
+        logger.info(
+            "capability_block",
+            capability="CATALOG",
+            source="node",
+            node="faq_response",
+            thread_id=thread_id,
+        )
+    elif catalog:
         lines = ["\n\nCatálogo de productos disponibles:"]
         for p in catalog:
             line = (
@@ -99,6 +119,27 @@ async def faq_response_node(
             lines.append(line)
         catalog_block = "\n".join(lines)
 
+    # ── Outside business hours ────────────────────────────────────────────────
+    # The graph routers send every non-urgent turn here on out-of-hours turns,
+    # so this splice is the single place the customer is told the business is
+    # closed and the model is constrained to FAQ-only. Tenant-editable via the
+    # {AGENT_TYPE}_OUTSIDE_HOURS prompt; the constant covers older backends.
+    business_hours_block = ""
+    if not within_business_hours(state):
+        outside_hours_prompt = resolve_prompt(
+            config,
+            f"{agent_type}_OUTSIDE_HOURS",
+            DEFAULT_OUTSIDE_HOURS_INSTRUCTION,
+            state,
+        )
+        business_hours_block = "\n\n" + outside_hours_prompt
+        logger.info(
+            "business_hours_block",
+            source="node",
+            node="faq_response",
+            thread_id=thread_id,
+        )
+
     system_content = (
         faq_prompt.format(
             persona=resolve_persona(state, "Helena"),
@@ -106,6 +147,7 @@ async def faq_response_node(
         )
         + faq_knowledge_block
         + catalog_block
+        + business_hours_block
         + format_user_context(state)
     )
 
@@ -144,8 +186,23 @@ async def faq_response_node(
         faqs_injected=len(faqs),
     )
 
+    # Every FAQ injected into the prompt counts as "used" for analytics.
+    # Ids are passed through from the backend payload verbatim — never
+    # invented — so NestJS can log usage by stable id instead of matching
+    # question text against LLM output.
+    faq_used = [
+        {
+            "id": faq.get("id"),
+            "question": faq.get("question", ""),
+            "confidence": faq.get("score", 0) or 0,
+        }
+        for faq in faqs
+        if faq.get("id") or faq.get("question")
+    ]
+
     return {
         "messages": [AIMessage(content=full_response)],
+        "faq_used": faq_used or None,
         "turn_usage": [
             make_usage_record(node="faq_response", provider=provider, model=model)
         ],

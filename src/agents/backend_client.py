@@ -10,6 +10,20 @@ from ..config import settings
 
 logger = structlog.get_logger(__name__)
 
+
+class CapabilityDisabledError(Exception):
+    """An internal endpoint returned 403 with code CAPABILITY_DISABLED — the
+    tenant disabled a capability (e.g. CATALOG) for this agent. Callers turn
+    this into the degraded reply; it is never retried and never surfaced raw to
+    the customer. Distinct from other 403s (e.g. the inquiries codeName-mismatch
+    check) which stay HTTPStatusError."""
+
+    def __init__(self, capability: str = "", path: str = ""):
+        self.capability = capability
+        self.path = path
+        super().__init__(f"capability disabled: {capability or '?'} ({path})")
+
+
 _BASE = settings.nestjs_base_url.rstrip("/")
 _HEADERS = {
     "Content-Type": "application/json",
@@ -30,30 +44,69 @@ async def upsert_cart_item(
     product_id: str,
     quantity: int,
     conversation_id: str | None = None,
+    notes: str | None = None,
 ) -> dict:
     """POST /internal/carts/:contactId/items — add/update item (quantity=0 removes it)."""
     params = {}
     if conversation_id:
         params["conversationId"] = conversation_id
+    body: dict = {"productId": product_id, "quantity": quantity}
+    if notes:
+        body["notes"] = notes
     return await _post(
         f"/api/v1/internal/carts/{contact_id}/items",
-        json={"productId": product_id, "quantity": quantity},
+        json=body,
         params=params,
     )
 
 
-async def get_order_history(contact_id: str, limit: int = 5) -> list:
-    """GET /internal/orders?contactId=... — returns recent orders."""
-    data = await _get("/api/v1/internal/orders", params={"contactId": contact_id, "limit": limit})
+async def get_order_history(
+    contact_id: str,
+    limit: int = 5,
+    conversation_id: str | None = None,
+) -> list:
+    """GET /internal/orders?contactId=... — returns recent orders.
+
+    ``conversation_id`` lets the backend resolve the per-agent CATALOG policy
+    from the conversation snapshot; without it the tenant-default applies. May
+    raise CapabilityDisabledError when catalog access is off (tracking flow)."""
+    params: dict = {"contactId": contact_id, "limit": limit}
+    if conversation_id:
+        params["conversationId"] = conversation_id
+    data = await _get("/api/v1/internal/orders", params=params)
     return data if isinstance(data, list) else []
 
 
-async def checkout_cart(contact_id: str, conversation_id: str | None = None) -> dict:
-    """POST /internal/orders/checkout — converts active cart into an order."""
+async def checkout_cart(
+    contact_id: str,
+    conversation_id: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """POST /internal/orders/checkout — converts active cart into an order.
+
+    `metadata` is persisted verbatim on Order.metadata (restaurant orders send
+    serviceType / deliveryAddress / specialNotes).
+    """
     body: dict = {"contactId": contact_id}
     if conversation_id:
         body["conversationId"] = conversation_id
+    if metadata:
+        body["metadata"] = metadata
     return await _post("/api/v1/internal/orders/checkout", json=body)
+
+
+async def search_faqs(conversation_id: str, query: str, limit: int = 5) -> list:
+    """GET /internal/faqs/search — conversation-scoped FAQ retrieval.
+
+    Used by query_normalizer to re-run retrieval with a typo-corrected query.
+    The backend resolves the agentCodeName from the conversation snapshot.
+    Returns [{id, question, answer, category, score}]; [] on non-list.
+    """
+    data = await _get(
+        "/api/v1/internal/faqs/search",
+        params={"conversationId": conversation_id, "query": query, "limit": limit},
+    )
+    return data if isinstance(data, list) else []
 
 
 async def fetch_agent_credentials(tenant_id: str) -> dict:
@@ -62,7 +115,7 @@ async def fetch_agent_credentials(tenant_id: str) -> dict:
     Returns the decrypted runtime credentials for the tenant's effective LLM provider.
     Response shape:
       { provider, model, apiKey? } for OpenAI/Anthropic
-      { provider, model, vertexCredentials, vertexProjectId, vertexLocation } for Vertex
+      { provider, model, geminiCredentials, geminiProjectId, geminiLocation } for Gemini
     """
     return await _get(
         "/api/v1/internal/agent/credentials",
@@ -93,12 +146,62 @@ async def fetch_in_use_code_names() -> list[str]:
 
 async def update_contact_name(contact_id: str, name: str, tenant_id: str) -> dict:
     """POST /internal/contacts/:contactId/name — persist the captured contact
-    name (camila's name_capture node). Backend writes Contact.customName and
-    emits a realtime contact:updated event."""
+    name (name_capture node, all graphs). Backend sanitizes, writes
+    Contact.customName (unless a human set it: nameSource=MANUAL) and emits a
+    realtime contact:updated event. Response: {ok, applied, name, contactId} —
+    applied=false means a MANUAL name won; adopt `name` from the response."""
     return await _post(
         f"/api/v1/internal/contacts/{contact_id}/name",
         json={"name": name, "tenantId": tenant_id},
     )
+
+
+async def defer_contact_name_capture(contact_id: str, tenant_id: str) -> dict:
+    """POST /internal/contacts/:contactId/name-capture/defer — the customer
+    declined to give their name. Backend stamps Contact.nameCaptureDeferredAt
+    so no graph re-asks until the deferral window expires."""
+    return await _post(
+        f"/api/v1/internal/contacts/{contact_id}/name-capture/defer",
+        json={"tenantId": tenant_id},
+    )
+
+
+async def submit_inquiry(
+    tenant_id: str,
+    conversation_id: str,
+    idempotency_key: str,
+    lead_data: dict,
+) -> dict:
+    """POST /internal/inquiries — persist a qualified lead (veronica).
+
+    ``idempotency_key`` is the state-backed lead_submission_id: the backend
+    holds a unique index on it, so retries after network failures (and
+    LangGraph node replays) return the original Inquiry instead of inserting
+    a duplicate.
+    """
+    body = {
+        "idempotencyKey": idempotency_key,
+        "conversationId": conversation_id,
+        "tenantId": tenant_id,
+        **{
+            k: v
+            for k, v in lead_data.items()
+            if k
+            in {
+                "fullName",
+                "email",
+                "serviceInterest",
+                "company",
+                "phoneCountryCode",
+                "phoneNumber",
+                "challenge",
+                "comments",
+                "locale",
+            }
+            and v
+        },
+    }
+    return await _post("/api/v1/internal/inquiries", json=body)
 
 
 async def request_handoff(
@@ -118,6 +221,207 @@ async def request_handoff(
             "intents": intents or [],
             "hasAttachments": has_attachments,
         },
+    )
+
+
+# ─── Theology agent (ismael) ─────────────────────────────────────────────────
+
+
+async def save_ismael_survey(contact_id: str, conversation_id: str, answers: dict) -> dict:
+    """POST /internal/contacts/:id/ismael-survey — the three statistics answers.
+
+    Merged into ``Contact.profileData.ismael``; the backend echoes
+    ``ismael_survey_done`` in ``user_context`` from then on, so the survey is
+    asked once per contact, not once per conversation.
+    """
+    return await _post(
+        f"/api/v1/internal/contacts/{contact_id}/ismael-survey",
+        json={"conversationId": conversation_id, **answers},
+    )
+
+
+async def post_agent_message(
+    conversation_id: str,
+    *,
+    job_id: str,
+    text: str,
+    turn_usage: list | None = None,
+) -> dict:
+    """POST /internal/conversations/:id/agent-messages — an out-of-band reply.
+
+    For answers that outlive a chat turn (ismael's Brain job). The backend
+    stores the message, dispatches it on the conversation's channel and bills
+    ``turn_usage``; ``job_id`` makes the whole call idempotent.
+    """
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/agent-messages",
+        json={"jobId": job_id, "text": text, "turnUsage": turn_usage or []},
+    )
+
+
+# ─── Prospecting (aurora — /internal/prospecting/*) ─────────────────────────
+
+
+async def check_prospect_duplicates(
+    tenant_id: str, candidates: list[dict]
+) -> dict[str, dict]:
+    """POST /internal/prospecting/contacts/dedup — bulk CRM duplicate check.
+
+    ``candidates`` is a list of ``{externalId, normalizedName?, name?, domain?,
+    email?, website?, sourceUrl?, city?}``.
+    Returns a map ``externalId -> {exists: bool, reason?: str}`` for O(1) lookup.
+    """
+    data = await _post(
+        "/api/v1/internal/prospecting/contacts/dedup",
+        json={"tenantId": tenant_id, "candidates": candidates},
+    )
+    results = data.get("results", []) if isinstance(data, dict) else []
+    return {
+        r["externalId"]: r
+        for r in results
+        if isinstance(r, dict) and r.get("externalId")
+    }
+
+
+async def create_prospect_contact(tenant_id: str, contact: dict) -> dict:
+    """POST /internal/prospecting/contacts — file one AI-discovered prospect.
+
+    ``contact`` carries ``{externalId, customName?, sourceUrl?, email?, website?,
+    city?, notes?, runId?}``. The backend is idempotent on the synthetic
+    ``externalId``, so a replayed run returns the existing row (``deduped: true``)
+    instead of creating a duplicate. Response: ``{ok, contactId, deduped}``.
+    """
+    return await _post(
+        "/api/v1/internal/prospecting/contacts",
+        json={"tenantId": tenant_id, **contact},
+    )
+
+
+async def get_prospect_feedback(
+    tenant_id: str, niche_key: str, limit: int = 12
+) -> list[dict]:
+    """GET /internal/prospecting/feedback — recent human good/bad verdicts.
+
+    Returns a list of ``{verdict, note, customName, website, city}`` for the
+    niche, newest first, so the agent can inject concrete examples into the
+    extraction prompt. Best-effort: callers treat any failure as "no feedback".
+    """
+    data = await _get(
+        "/api/v1/internal/prospecting/feedback",
+        params={"tenantId": tenant_id, "niche": niche_key, "limit": limit},
+    )
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    return data if isinstance(data, list) else []
+
+
+async def report_prospecting_run(
+    run_id: str,
+    status: str,
+    metrics: dict | None = None,
+    usage: list[dict] | None = None,
+) -> dict:
+    """PATCH /internal/prospecting/runs/:id — terminal run report.
+
+    ``status`` is ``COMPLETED`` or ``FAILED``. ``usage`` is the run's token-usage
+    list (same shape as the SSE ``done`` event); the backend settles it against
+    AI credits, keyed on ``prospecting:{run_id}`` so a retry never double-debits.
+    """
+    body: dict = {"status": status}
+    if metrics is not None:
+        body["metrics"] = metrics
+    if usage:
+        body["usage"] = usage
+    return await _patch(f"/api/v1/internal/prospecting/runs/{run_id}", json=body)
+
+
+# ─── Enrichment (sherlock — /internal/enrichment/*) ──────────────────────────
+
+
+async def get_enrichment_feedback(tenant_id: str, limit: int = 12) -> list[dict]:
+    """GET /internal/enrichment/feedback — recent human good/bad verdicts.
+
+    Each row carries the verdict, the reviewer's note, and the enrichment it
+    refers to (website + description + offerings + strategy), so the agent can
+    inject concrete examples into its prompts. Best-effort: callers treat any
+    failure as "no feedback".
+    """
+    data = await _get(
+        "/api/v1/internal/enrichment/feedback",
+        params={"tenantId": tenant_id, "limit": limit},
+    )
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    return data if isinstance(data, list) else []
+
+
+async def report_enrichment_attempt(
+    attempt_id: str,
+    status: str,
+    *,
+    phone_candidates: list[dict] | None = None,
+    description: str | None = None,
+    offerings_summary: str | None = None,
+    sales_strategy: str | None = None,
+    source_urls: list[str] | None = None,
+    language: str | None = None,
+    qualification: dict | None = None,
+    website_unreachable: bool | None = None,
+    website_discovery: dict | None = None,
+    error: str | None = None,
+    metrics: dict | None = None,
+    usage: list[dict] | None = None,
+) -> dict:
+    """PATCH /internal/enrichment/attempts/:id — terminal attempt report.
+
+    ``status`` is ``COMPLETED``, ``NO_RESULT`` or ``FAILED``. The backend derives
+    the tenant and contact from the attempt row (never from this body), validates
+    each phone candidate as E.164 before persisting any of them, and settles
+    ``usage`` against AI credits keyed on ``enrichment:{attempt_id}`` so a retry
+    never double-debits.
+
+    Phone candidates are sent as-is, exactly as they appeared on the page —
+    normalization is the backend's job, since it holds the contact's country.
+
+    ``qualification`` carries FIT DRIVERS (vertical, size band, locations,
+    estimated message volume) and never a score: the conversion probability and
+    the bill-size range are computed deterministically in NestJS from these
+    facts plus the tenant's own price tiers, which the agent never sees.
+
+    ``website_unreachable`` tells the backend we never got into the site at all
+    (zero pages fetched). It tags the contact "Sitio web inaccesible" and sorts it
+    last in the CRM prospect list. Sent explicitly rather than left to be inferred
+    from ``metrics``, which is a free-form counter bag.
+    """
+    body: dict = {"status": status}
+    if phone_candidates:
+        body["phoneCandidates"] = phone_candidates
+    if description:
+        body["description"] = description
+    if offerings_summary:
+        body["offeringsSummary"] = offerings_summary
+    if sales_strategy:
+        body["salesStrategy"] = sales_strategy
+    if source_urls:
+        body["sourceUrls"] = source_urls
+    if language:
+        body["language"] = language
+    if qualification:
+        body["qualification"] = qualification
+    if website_unreachable is not None:
+        body["websiteUnreachable"] = website_unreachable
+    if website_discovery:
+        # Only sent when the contact had NO website and one was confirmed: the
+        # backend writes it onto the contact, so an empty dict must never travel.
+        body["websiteDiscovery"] = website_discovery
+    if error:
+        body["error"] = error
+    if metrics is not None:
+        body["metrics"] = metrics
+    if usage:
+        body["usage"] = usage
+    return await _patch(
+        f"/api/v1/internal/enrichment/attempts/{attempt_id}", json=body
     )
 
 
@@ -175,12 +479,16 @@ async def create_appointment_hold(
     location_id: str | None = None,
     hold_minutes: int = 10,
     thread_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """POST /internal/appointments/holds — create a PENDING_HOLD appointment.
 
     The backend enforces double-booking via the EXCLUDE constraint, so this
     call may raise HTTP 409 with ``code: SLOT_TAKEN``. The caller is
     responsible for catching that and offering an alternative slot.
+
+    ``conversation_id`` links the resulting audit event to the originating
+    WhatsApp conversation (BD-3) so the CRM can deep-link the booking.
     """
     body: dict = {
         "tenantId": tenant_id,
@@ -197,14 +505,23 @@ async def create_appointment_hold(
         body["customerData"] = customer_data
     if thread_id:
         body["threadId"] = thread_id
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post("/api/v1/internal/appointments/holds", json=body)
 
 
-async def confirm_appointment(appointment_id: str, tenant_id: str) -> dict:
+async def confirm_appointment(
+    appointment_id: str,
+    tenant_id: str,
+    conversation_id: str | None = None,
+) -> dict:
     """POST /internal/appointments/:id/confirm — promote hold to CONFIRMED."""
+    body: dict = {"tenantId": tenant_id}
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post(
         f"/api/v1/internal/appointments/{appointment_id}/confirm",
-        json={"tenantId": tenant_id},
+        json=body,
     )
 
 
@@ -212,11 +529,14 @@ async def cancel_appointment(
     appointment_id: str,
     tenant_id: str,
     reason: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """POST /internal/appointments/:id/cancel — cancel by id."""
     body: dict = {"tenantId": tenant_id}
     if reason:
         body["reason"] = reason
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post(
         f"/api/v1/internal/appointments/{appointment_id}/cancel", json=body
     )
@@ -228,16 +548,20 @@ async def reschedule_appointment(
     starts_at_iso: str,
     ends_at_iso: str,
     resources: list[dict],
+    conversation_id: str | None = None,
 ) -> dict:
     """POST /internal/appointments/:id/reschedule — move to a new slot."""
+    body: dict = {
+        "tenantId": tenant_id,
+        "startsAt": starts_at_iso,
+        "endsAt": ends_at_iso,
+        "resources": resources,
+    }
+    if conversation_id:
+        body["conversationId"] = conversation_id
     return await _post(
         f"/api/v1/internal/appointments/{appointment_id}/reschedule",
-        json={
-            "tenantId": tenant_id,
-            "startsAt": starts_at_iso,
-            "endsAt": ends_at_iso,
-            "resources": resources,
-        },
+        json=body,
     )
 
 
@@ -255,7 +579,92 @@ async def list_active_appointments_for_contact(
     return data if isinstance(data, list) else []
 
 
+# ─── Email (clara — /internal/email/*) ───────────────────────────────────────
+#
+# The backend owns the mailbox's refresh token and all CRM rows; the agent only
+# borrows a short-lived access token and reports what it read and drafted.
+
+
+async def get_email_access_token(tenant_id: str, mailbox_id: str) -> dict:
+    """GET /internal/email/mailboxes/:id/access-token → {accessToken, expiresAt, scopes, emailAddress}.
+
+    The backend refuses unless ``tenant_id`` owns the mailbox, re-checks the
+    refreshed token's scopes, and answers 409 once Google revoked the grant.
+    """
+    return await _get(
+        f"/api/v1/internal/email/mailboxes/{mailbox_id}/access-token",
+        params={"tenantId": tenant_id},
+    )
+
+
+async def get_email_sender_context(
+    tenant_id: str, mailbox_id: str, email: str, gmail_message_id: str
+) -> dict:
+    """GET /internal/email/sender-context → {knownContact, contactId, alreadyIngested, attempts}."""
+    return await _get(
+        "/api/v1/internal/email/sender-context",
+        params={
+            "tenantId": tenant_id,
+            "mailboxId": mailbox_id,
+            "email": email,
+            "gmailMessageId": gmail_message_id,
+        },
+    )
+
+
+async def report_email_message(payload: dict) -> dict:
+    """POST /internal/email/messages — one processed (or failed) inbound email.
+
+    Idempotent on ``idempotencyKey``. A ``FAILED`` report answers ``giveUp``
+    once the message has failed often enough to be skipped.
+    """
+    return await _post("/api/v1/internal/email/messages", json=payload)
+
+
+async def report_email_outbound(payload: dict) -> dict:
+    """POST /internal/email/outbound — a message the mailbox sent (a no-op for untracked threads)."""
+    return await _post("/api/v1/internal/email/outbound", json=payload)
+
+
+async def report_email_follow_up(payload: dict) -> dict:
+    """POST /internal/email/follow-ups — a proposed follow-up (or why none was drafted)."""
+    return await _post("/api/v1/internal/email/follow-ups", json=payload)
+
+
+async def report_email_sync(mailbox_id: str, payload: dict) -> dict:
+    """PATCH /internal/email/mailboxes/:id/sync — end of a sync run.
+
+    The backend applies ``historyId`` only when ``syncClaimToken`` matches the
+    current claim and the id moves forward, then releases the claim.
+    """
+    return await _patch(f"/api/v1/internal/email/mailboxes/{mailbox_id}/sync", json=payload)
+
+
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
+
+
+def _error_body(exc: HTTPStatusError) -> str:
+    """Truncated response body for logging — surfaces backend error messages
+    (e.g. 'Insufficient stock …') that the bare status code hides."""
+    try:
+        return exc.response.text[:500]
+    except Exception:
+        return ""
+
+
+def _capability_disabled(exc: HTTPStatusError) -> str | None:
+    """Return the disabled capability name if this is a CAPABILITY_DISABLED 403,
+    else None. Keyed on the body `code` — NEVER on status alone, so unrelated
+    403s (inquiries codeName mismatch) are not misclassified."""
+    if exc.response.status_code != 403:
+        return None
+    try:
+        body = exc.response.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and body.get("code") == "CAPABILITY_DISABLED":
+        return str(body.get("capability") or "")
+    return None
 
 
 async def _get(path: str, params: dict | None = None) -> dict | list:
@@ -266,7 +675,18 @@ async def _get(path: str, params: dict | None = None) -> dict | list:
             resp.raise_for_status()
             return resp.json()
     except HTTPStatusError as exc:
-        logger.error("backend_get_error", path=path, status=exc.response.status_code)
+        capability = _capability_disabled(exc)
+        if capability is not None:
+            logger.info(
+                "capability_block", capability=capability, source="backstop_403", path=path
+            )
+            raise CapabilityDisabledError(capability, path) from exc
+        logger.error(
+            "backend_get_error",
+            path=path,
+            status=exc.response.status_code,
+            body=_error_body(exc),
+        )
         raise
     except RequestError as exc:
         logger.error("backend_get_network_error", path=path, error=str(exc))
@@ -281,8 +701,39 @@ async def _post(path: str, json: dict | None = None, params: dict | None = None)
             resp.raise_for_status()
             return resp.json()
     except HTTPStatusError as exc:
-        logger.error("backend_post_error", path=path, status=exc.response.status_code)
+        capability = _capability_disabled(exc)
+        if capability is not None:
+            logger.info(
+                "capability_block", capability=capability, source="backstop_403", path=path
+            )
+            raise CapabilityDisabledError(capability, path) from exc
+        logger.error(
+            "backend_post_error",
+            path=path,
+            status=exc.response.status_code,
+            body=_error_body(exc),
+        )
         raise
     except RequestError as exc:
         logger.error("backend_post_network_error", path=path, error=str(exc))
+        raise
+
+
+async def _patch(path: str, json: dict | None = None) -> dict:
+    url = f"{_BASE}{path}"
+    try:
+        async with AsyncClient(timeout=10.0) as client:
+            resp = await client.patch(url, headers=_HEADERS, json=json)
+            resp.raise_for_status()
+            return resp.json()
+    except HTTPStatusError as exc:
+        logger.error(
+            "backend_patch_error",
+            path=path,
+            status=exc.response.status_code,
+            body=_error_body(exc),
+        )
+        raise
+    except RequestError as exc:
+        logger.error("backend_patch_network_error", path=path, error=str(exc))
         raise

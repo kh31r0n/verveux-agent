@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction, resolve_prompt
@@ -86,7 +87,7 @@ async def orchestrator_node(
 
     # Parse JSON response — extract display text and routing decision separately
     try:
-        parsed = json.loads(full_response.strip())
+        parsed = json.loads(strip_json_fences(full_response))
         response_text: str = parsed.get("response", full_response)
         next_node: str = parsed.get("next", "end")
     except (json.JSONDecodeError, AttributeError):

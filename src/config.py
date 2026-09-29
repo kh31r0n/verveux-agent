@@ -1,3 +1,4 @@
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,22 +7,224 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        # Keys in a dotenv FILE that match no field would otherwise abort the
+        # boot (pydantic-settings v2 defaults to extra="forbid" for that source;
+        # unmatched OS env vars are simply never read). Ignoring them lets a
+        # stale local .env — or a Cloud Run revision still sending the retired
+        # COGNITO_* placeholders — start cleanly during a config migration.
+        extra="ignore",
     )
 
     database_url: str
-    cognito_user_pool_id: str
-    cognito_region: str
-    cognito_app_client_id: str = ""
+    # ── Service-to-service authentication (src/auth/service_auth.py) ─────────
+    # `service_auth_audience` is this service's own Cloud Run URL: the `aud`
+    # claim callers must request their ID token for. Empty disables OIDC
+    # verification entirely, which is the local-dev and test posture — the
+    # shared secret is then the only accepted credential.
+    #
+    # `service_auth_allowed_service_accounts` is a comma-separated allowlist of
+    # caller SA emails. Verification fails closed when it is empty but an
+    # audience is set, since an unrestricted audience would accept a token from
+    # any Google identity able to reach the service.
+    #
+    # `allow_shared_secret_auth` keeps the legacy WEBHOOK_API_KEY header path
+    # alive. True through the migration (and always, off Cloud Run); flip to
+    # False in production once every caller sends an ID token.
+    service_auth_audience: str = ""
+    service_auth_allowed_service_accounts: str = ""
+    allow_shared_secret_auth: bool = True
     openai_api_key: str = ""
     anthropic_api_key: str = ""
-    vertex_service_account_json: str = ""
-    vertex_project_id: str = ""
-    vertex_location: str = ""
+    # Gemini Enterprise Agent Platform. All three are optional: with none set
+    # the provider authenticates by ADC, which on Cloud Run is the attached
+    # service account (roles/aiplatform.user). `gemini_location` defaults to
+    # "global" inside the provider — Gemini 3 is not published to regions.
+    gemini_service_account_json: str = ""
+    gemini_project_id: str = ""
+    gemini_location: str = ""
+    # ── Gemini rate-limit handling (429 RESOURCE_EXHAUSTED) ──────────────────
+    # Agent Platform enforces per-model requests-per-minute quotas that the
+    # prospecting fan-out can exhaust. These bound an exponential-backoff retry
+    # that lives ONLY in the Gemini provider (openai/anthropic paths are
+    # untouched). Set gemini_max_retries=0 to disable retrying.
+    gemini_max_retries: int = 5
+    gemini_retry_base_seconds: float = 1.0
+    gemini_retry_max_seconds: float = 30.0
     langfuse_secret_key: str = ""
     langfuse_public_key: str = ""
     langfuse_host: str = "http://localhost:3010"
     nestjs_base_url: str = ""
     webhook_api_key: str = "dev-webhook-secret"
+    # ── Multi-message coalescing ─────────────────────────────────────────────
+    # WhatsApp users often split one thought across several rapid messages.
+    # After a turn acquires its thread's run slot, it waits until no new
+    # fragment has arrived for `message_settle_seconds` (checked in windows of
+    # that size) before invoking the graph, so the burst is answered as ONE
+    # turn. `message_settle_max_seconds` caps the total wait so a steady
+    # stream of fragments can't stall the reply past the backend's timeout.
+    # Set message_settle_seconds=0 to disable the settle wait (runs are still
+    # serialized per thread).
+    message_settle_seconds: float = 2.0
+    message_settle_max_seconds: float = 10.0
+    # ── Query normalization ──────────────────────────────────────────────────
+    # Fleet-wide kill switch for the query_normalizer node. Rollout is driven
+    # per tenant by the backend (TenantSettings.queryNormalizationEnabled,
+    # forwarded on every /chat/stream call); this env var can disable the
+    # feature everywhere regardless of tenant flags.
+    query_normalization_enabled: bool = True
+    # ── Prospecting (aurora) ─────────────────────────────────────────────────
+    # Autonomous discovery agent. Search is done via Serper (Google SERP REST).
+    # `serper_api_key` is REQUIRED — the service refuses to start without it (see
+    # the validator below) so a missing key is caught at boot instead of every
+    # prospecting run silently completing with 0 results.
+    # `prospecting_max_searches` caps SERP calls per run (cost guardrail);
+    # `prospecting_fetch_timeout_seconds` bounds each page fetch.
+    serper_api_key: str = ""
+    prospecting_max_searches: int = 10
+    prospecting_fetch_timeout_seconds: float = 8.0
+    prospecting_max_results_per_search: int = 10
+    # Caps how many extract_and_enrich branches of the Send fan-out run at once.
+    # Applied to the prospecting graph ONLY when the tenant's provider is Gemini
+    # (its RPM quota is the tight one); other providers keep unbounded fan-out.
+    prospecting_gemini_extract_concurrency: int = 5
+    # ── Prospecting self-improvement ─────────────────────────────────────────
+    # In-run refinement loop: when a run's quality survivors fall short of
+    # `prospecting_min_quality_prospects`, the graph refines its own queries and
+    # searches again, up to `prospecting_max_iterations` TOTAL passes (>=1). A
+    # value of 1 disables the loop (single pass, today's behaviour). Cross-run
+    # strategy memory (best/avoid queries per niche) is read at run start and
+    # updated at run end via a LangGraph PostgresStore. Human good/bad feedback
+    # is injected into the extraction prompt, capped at
+    # `prospecting_feedback_examples` per verdict.
+    prospecting_max_iterations: int = 2
+    prospecting_min_quality_prospects: int = 5
+    prospecting_places_enabled: bool = True
+    prospecting_feedback_examples: int = 6
+    # Send Serper's `location` param (derived from the city named in each query)
+    # so the SERP is geo-biased to the tenant's cities instead of the whole
+    # country — `gl`/`hl` only pin the country, which lets national directory
+    # pages outrank local ones. A located search that comes back empty (Google
+    # doesn't know the municipality) is retried nationally, so this can only add
+    # results, never remove them. Set false to fall back to country-only search.
+    prospecting_geo_targeting_enabled: bool = True
+    # ── Enrichment (sherlock) ────────────────────────────────────────────────
+    # One-time website enrichment of a single claimed contact, triggered by the
+    # backend scheduler. No search involved — the URL comes from the contact.
+    #
+    # `sherlock_max_pages` bounds the same-site crawl (landing page + the
+    # contact/about pages discovered on it). `sherlock_max_bytes` is a WIRE-byte
+    # cap per page (compression is disabled so a gzip bomb cannot expand past it)
+    # and is a TRUNCATION point, not a rejection: a page over it is read up to
+    # the cap, never refused. It sits at 2 MB because disabling compression is
+    # what makes these uncompressed bytes — a mainstream landing page that ships
+    # ~190 KB gzipped arrives as ~1.9 MB here, and the old 512 KB cap cut it in
+    # the middle of `<head>`: colegioaleman.dscali.edu.co yielded 47 characters
+    # of text and zero links at 512 KB versus 5,283 characters, 202 links and
+    # the phone number at 2 MB. Memory is bounded by ONE page's buffer, since
+    # the raw bytes are discarded as soon as the text is extracted.
+    # `sherlock_total_budget_seconds` is the wall-clock ceiling for ALL fetching
+    # in one run — httpx timeouts are per-operation, so this is what actually
+    # stops a slow-trickle server. `sherlock_max_iterations` bounds the in-run
+    # refinement loop (>=1; 1 disables it).
+    #
+    # The page budget went 4 → 6 when qualification was added. Finding a phone
+    # number needs the contact page; judging SIZE needs the services, locations
+    # and pricing pages too, and a size estimate the model had no evidence for is
+    # worse than none. The time budget moved with it so the extra pages have
+    # somewhere to fit. Cost is bounded elsewhere — per-tenant daily limits and
+    # the `aiCreditsBalance > 0` claim predicate — not by these numbers.
+    sherlock_max_pages: int = 6
+    sherlock_max_bytes: int = 2 * 1024 * 1024
+    sherlock_max_page_chars: int = 6000
+    sherlock_fetch_timeout_seconds: float = 8.0
+    sherlock_total_budget_seconds: float = 60.0
+    sherlock_max_iterations: int = 2
+    sherlock_feedback_examples: int = 6
+
+    # ── Website discovery (sherlock, contacts that arrive with no website) ───
+    # An aurora prospect whose extractor found no domain is unreachable by
+    # enrichment, so discovery resolves one from the business name via Serper
+    # before the crawl. Cost is bounded here (queries x 2 endpoints per run) on
+    # top of the backend's one-claim-per-tenant-per-tick and daily limits.
+    #
+    # `min_confidence` is the bar the confirming LLM must clear, and `margin` is
+    # how far ahead of the runner-up domain the winner must score: raising either
+    # buys precision at the cost of prospects left without a website, which is
+    # the trade we want — a wrong site is written onto the contact and read as
+    # fact by a human.
+    sherlock_discovery_enabled: bool = True
+    sherlock_discovery_max_queries: int = 2
+    sherlock_discovery_max_results: int = 10
+    sherlock_discovery_min_confidence: float = 0.7
+    sherlock_discovery_margin: float = 0.15
+
+    # ── Email agent (clara) ──────────────────────────────────────────────────
+    # Gmail → triage → task → reply draft, run by the backend's email sweep.
+    # `clara_max_messages_per_sync` bounds one /email/sync run; the cursor only
+    # advances past what was fully handled, so the rest waits for the next sweep.
+    # Thinking budgets are per node and only honoured by Gemini (billed at the
+    # output rate): off for classification/extraction, model default (None) for
+    # drafting — the one judgement call.
+    clara_max_body_chars: int = 12_000
+    clara_max_messages_per_sync: int = 25
+    clara_initial_backfill_query: str = "in:inbox newer_than:1d"
+    clara_thinking_triage: int | None = 0
+    clara_thinking_extract_task: int | None = 0
+    clara_thinking_draft: int | None = None
+    clara_gmail_timeout_seconds: float = 15.0
+
+    # ── Theology agent (ismael) → Company Brain RAG ──────────────────────────
+    # Brain runs on ONE EC2 host in AWS that is stopped whenever it is idle, so
+    # ismael starts it on demand: a Google ID token for `brain_oidc_audience`
+    # from the metadata server is exchanged (AssumeRoleWithWebIdentity) for a
+    # role that may only start that instance. `brain_start_mode=skip` turns the
+    # start off (local dev: start the host by hand with deploy-brain.sh start).
+    #
+    # `brain_api_key` is a Brain service credential bound to one tenant — the
+    # tenant is implied by the key, never sent. `brain_library_id` is the
+    # library every question is asked against.
+    brain_api_url: str = "https://brain-api.vervux.com"
+    brain_api_key: str = ""
+    brain_library_id: str = ""
+    brain_ask_effort: str = "standard"
+    brain_start_mode: str = "aws"
+    brain_aws_role_arn: str = ""
+    brain_aws_region: str = "us-west-2"
+    brain_instance_id: str = ""
+    brain_oidc_audience: str = "vervux-brain-starter"
+    # Wall-clock ceilings for the background job: waiting for the host to boot
+    # (~40 s instance + ~1 min containers when cold), then for the answer (a
+    # real question has taken >180 s). A job past either delivers an apology.
+    brain_boot_timeout_seconds: float = 300.0
+    brain_answer_timeout_seconds: float = 420.0
+    brain_poll_interval_seconds: float = 5.0
+    brain_request_timeout_seconds: float = 15.0
+
+    @field_validator(
+        "clara_thinking_triage", "clara_thinking_extract_task", "clara_thinking_draft", mode="before"
+    )
+    @classmethod
+    def _empty_budget_means_model_default(cls, value):
+        """`CLARA_THINKING_DRAFT=` (empty) or `default` → None: leave the model's own budget."""
+        if isinstance(value, str) and value.strip().lower() in ("", "default", "none"):
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _require_serper_api_key(self) -> "Settings":
+        """Fail fast at startup when the Serper key is absent.
+
+        Without it the prospecting agent's web_search node returns nothing and
+        every run completes with 0 found — a silent misconfiguration. We refuse
+        to boot instead so the problem surfaces immediately on deploy.
+        """
+        if not self.serper_api_key.strip():
+            raise ValueError(
+                "SERPER_API_KEY is not set. The prospecting agent (aurora) "
+                "requires it for web search; refusing to start. Set "
+                "SERPER_API_KEY in the environment."
+            )
+        return self
 
 
 settings = Settings()

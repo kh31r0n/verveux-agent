@@ -1,6 +1,6 @@
 ---
 name: multi-agent-versioning-guardrails
-description: "INVOKE THIS SKILL when editing anything that touches the multi-agent versioning system: agent code names (helena/sofia/giulia/marco), agent assignments, conversation agentCodeName/agentVersion snapshots, the Python CODE_NAME_REGISTRY, the scoped thread ID format, the /chat/stream + /chat/resume request schemas, or the NestJS /channel-connections/:id/agent-assignments endpoints. Specific files: verveux-agent/src/graphs/registry.py, verveux-agent/src/main.py (lifespan + chat endpoints), verveux-agent/src/auth/cognito.py (scoped_thread_id), verveux-agent/src/graphs/state.py, verveux-agent/src/observability.py, verveux-backend/prisma/schema.prisma (AgentCodeName, AgentAssignment, ChannelConnection.agentCodeName, Conversation.agentCodeName/agentAssignmentId/agentVersion), verveux-backend/src/agent-assignments/**, verveux-backend/src/conversations/conversations.service.ts (findOrCreateForContact), verveux-backend/src/channels/channel-connections.service.ts (create + update), verveux-backend/src/prisma/prisma.service.ts (conversation snapshot guard), and the frontend channels/switch-agent flow."
+description: "INVOKE THIS SKILL when editing anything that touches the multi-agent versioning system: agent code names (helena/sofia/giulia/marco), agent assignments, conversation agentCodeName/agentVersion snapshots, the Python CODE_NAME_REGISTRY, the scoped thread ID format, the /chat/stream + /chat/resume request schemas, or the NestJS /channel-connections/:id/agent-assignments endpoints. Specific files: verveux-agent/src/graphs/registry.py, verveux-agent/src/main.py (lifespan + chat endpoints), verveux-agent/src/auth/service_auth.py (scoped_thread_id), verveux-agent/src/graphs/state.py, verveux-agent/src/observability.py, verveux-backend/prisma/schema.prisma (AgentCodeName, AgentAssignment, ChannelConnection.agentCodeName, Conversation.agentCodeName/agentAssignmentId/agentVersion), verveux-backend/src/agent-assignments/**, verveux-backend/src/conversations/conversations.service.ts (findOrCreateForContact), verveux-backend/src/channels/channel-connections.service.ts (create + update), verveux-backend/src/prisma/prisma.service.ts (conversation snapshot guard), and the frontend channels/switch-agent flow."
 ---
 
 <overview>
@@ -72,7 +72,7 @@ These are the non-negotiable rules. Each one corresponds to a class of bug that 
 - **`registry.py`** holds `CODE_NAME_REGISTRY: dict[str, GraphBuilder]`. Lookups go through `get_or_compile_graph(code_name, checkpointer)`, never directly. The compile path is guarded by `asyncio.Lock()` with a double-checked entry — do not rewrite this without preserving the lock semantics or the `graph_compile_duration` histogram observation.
 - **Unknown code names raise `UnknownCodeNameError`**, never fall through to a default. The FastAPI handler turns this into HTTP 400.
 - **`main.py` lifespan** validates backend↔registry before warming up, in that order. Both calls go through `src/agents/backend_client.py` (`fetch_active_code_names()` and `fetch_in_use_code_names()`), which hit `GET /api/v1/internal/agent-versioning/*` on the NestJS backend. Warm-up must be scoped to `fetch_in_use_code_names()` (i.e. only code names currently assigned somewhere). Do not warm up the full registry — that's wasted memory for staged code names not yet rolled out. Do not move the validation back into a direct DB query; the agent and backend may live in different Postgres databases.
-- **`scoped_thread_id`** in `src/auth/cognito.py` takes exactly five arguments. Adding a sixth argument or changing the separator silently invalidates every existing checkpoint. If the format must change, write a migration plan that includes thread-ID rewriting or accept that checkpoints will be lost.
+- **`scoped_thread_id`** in `src/auth/service_auth.py` takes exactly five arguments. Adding a sixth argument or changing the separator silently invalidates every existing checkpoint. If the format must change, write a migration plan that includes thread-ID rewriting or accept that checkpoints will be lost.
 - **`AgentState`** in `src/graphs/state.py` carries `agent_code_name` and `agent_version` for observability only. Nodes must not branch on these fields — routing is the graph's job, encoded by which graph was selected.
 - **Observability counters** (`agent_requests_total`, `agent_node_invocations_total`, `agent_tool_errors_total`, `graph_compile_duration`) all carry the `agent_code_name` label. Adding new counters? Carry the label. Removing the label collapses all agents into one row in Grafana — never do this.
 
@@ -190,8 +190,8 @@ grep -rn "CODE_NAME_REGISTRY.get\|registry.get" verveux-agent/src
 
 # 9. Thread IDs only built via the helper
 grep -rn "scoped_thread_id" verveux-agent/src \
-  | grep -v "auth/cognito.py"
-# expect: only callers; the definition is in cognito.py
+  | grep -v "auth/service_auth.py"
+# expect: only callers; the definition is in service_auth.py
 
 grep -rn 'f".*:.*:.*:.*:v' verveux-agent/src
 # expect: zero hits — no hand-built five-segment thread IDs
@@ -309,7 +309,7 @@ Auto-invoke whenever you are editing any of:
 
 - `verveux-agent/src/graphs/registry.py`
 - `verveux-agent/src/main.py` (lifespan, `/chat/stream`, `/chat/resume`)
-- `verveux-agent/src/auth/cognito.py` (`scoped_thread_id`)
+- `verveux-agent/src/auth/service_auth.py` (`scoped_thread_id`)
 - `verveux-agent/src/graphs/state.py`
 - `verveux-agent/src/observability.py`
 - `verveux-backend/prisma/schema.prisma` (the four affected models)

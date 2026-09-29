@@ -136,6 +136,7 @@ async def reschedule_execute_node(
     record_node_invocation("reschedule_execute")
 
     tenant_id = state.get("tenant_id", "")
+    conversation_id = state.get("conversation_id", "")
     source_id = state.get("reschedule_source_id")
     chosen = state.get("chosen_slot") or {}
 
@@ -161,6 +162,7 @@ async def reschedule_execute_node(
             starts_at_iso=chosen.get("startsAt", ""),
             ends_at_iso=chosen.get("endsAt", ""),
             resources=resources,
+            conversation_id=conversation_id,
         )
     except HTTPStatusError as exc:
         body: dict = {}

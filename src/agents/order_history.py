@@ -7,7 +7,8 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from .utils import language_instruction, resolve_persona
-from .backend_client import get_order_history
+from .backend_client import CapabilityDisabledError, get_order_history
+from .capability_gate import catalog_allowed, emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -57,10 +58,24 @@ async def order_history_node(
 ) -> dict:
     record_node_invocation("order_history")
 
+    thread_id: str = state.get("thread_id", "unknown")
+    # CATALOG gate: order lookups (the tracking flow) are part of the fully
+    # gated orders domain. Deflect politely when access is off — never claim the
+    # customer has no orders.
+    if not catalog_allowed(state):
+        logger.info(
+            "capability_block",
+            capability="CATALOG",
+            source="node",
+            node="order_history",
+            thread_id=thread_id,
+        )
+        return emit_degraded_catalog_reply(state)
+
     provider = get_provider(config)
     model = resolve_model(config)
-    thread_id: str = state.get("thread_id", "unknown")
     contact_id: str = state.get("contact_id", "")
+    conversation_id: str = state.get("conversation_id", "")
 
     langfuse = get_langfuse()
     trace = langfuse.trace(
@@ -74,7 +89,20 @@ async def order_history_node(
     orders = []
     if contact_id:
         try:
-            orders = await get_order_history(contact_id=contact_id, limit=5)
+            orders = await get_order_history(
+                contact_id=contact_id, limit=5, conversation_id=conversation_id or None
+            )
+        except CapabilityDisabledError:
+            # Backstop: the flag said allowed but the backend denied (stale
+            # cache / race). Deflect — do NOT fall through to "no orders found".
+            logger.info(
+                "capability_block",
+                capability="CATALOG",
+                source="backstop_403",
+                node="order_history",
+                thread_id=thread_id,
+            )
+            return emit_degraded_catalog_reply(state)
         except Exception as exc:
             logger.warning("order_history_fetch_failed", thread_id=thread_id, error=str(exc))
 

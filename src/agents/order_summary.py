@@ -7,8 +7,9 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import language_instruction, resolve_persona, resolve_prompt
-from .backend_client import get_or_create_cart
+from .utils import language_instruction, latest_user_text, resolve_persona, resolve_prompt
+from .backend_client import CapabilityDisabledError, get_or_create_cart
+from .capability_gate import emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -114,6 +115,15 @@ async def order_summary_node(
                 item_count=len(cart.get("items", [])),
                 grand_total=cart.get("grandTotal"),
             )
+        except CapabilityDisabledError:
+            logger.info(
+                "capability_block",
+                capability="CATALOG",
+                source="backstop_403",
+                node="order_summary",
+                thread_id=thread_id,
+            )
+            return emit_degraded_catalog_reply(state)
         except Exception as exc:
             logger.warning(
                 "order_summary_cart_fetch_failed",
@@ -149,10 +159,13 @@ async def order_summary_node(
 
     # ── Determine user intent ──────────────────────────────────────────────────
     has_new_message = bool(state["messages"]) and getattr(state["messages"][-1], "type", "") == "human"
+    # Join the trailing burst of user messages so a confirmation or correction
+    # split across rapid WhatsApp messages is evaluated as one turn.
+    user_turn_text = latest_user_text(state)
     order_confirmed = False
 
     if has_new_message:
-        user_text = (state["messages"][-1].content or "").strip().lower()
+        user_text = user_turn_text.strip().lower()
         if any(kw in user_text for kw in _CONFIRM_KEYWORDS):
             order_confirmed = True
             logger.info("order_confirmed_by_user", thread_id=thread_id)
@@ -172,9 +185,9 @@ async def order_summary_node(
             }
         ]
     elif has_new_message and not any(
-        kw in (state["messages"][-1].content or "").strip().lower() for kw in _CONFIRM_KEYWORDS
+        kw in user_turn_text.strip().lower() for kw in _CONFIRM_KEYWORDS
     ):
-        correction_text = state["messages"][-1].content or ""
+        correction_text = user_turn_text
         correction_prompt = resolve_prompt(config, "ORDER_CORRECTION", _CORRECTION_SYSTEM_PROMPT, state)
         messages_payload = [
             {

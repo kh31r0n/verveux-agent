@@ -9,7 +9,7 @@ from ..graphs.state import AgentState
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
-from .utils import language_instruction, resolve_prompt, format_user_context
+from .utils import language_instruction, latest_user_messages, resolve_prompt, format_user_context
 
 logger = structlog.get_logger(__name__)
 
@@ -84,14 +84,12 @@ async def booking_confirm_node(
         full_response += chunk
     generation.end(output=full_response)
 
-    # Check if user confirmed
-    last_user_msg = ""
-    for msg in reversed(state["messages"]):
-        if getattr(msg, "type", "") == "human":
-            last_user_msg = msg.content.lower().strip()
-            break
-
-    confirmed = last_user_msg in ("confirmar", "sí", "si", "yes", "confirm")
+    # Check if user confirmed — the confirmation keyword may be any fragment
+    # of a multi-message burst ("mmm ok" / "confirmar"), so check each one.
+    confirmed = any(
+        fragment.lower().strip() in ("confirmar", "sí", "si", "yes", "confirm")
+        for fragment in latest_user_messages(state)
+    )
 
     return {
         "messages": [AIMessage(content=full_response)],

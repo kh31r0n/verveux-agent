@@ -138,7 +138,8 @@ class TestCamilaRouting:
         )
         mock_name = AsyncMock(
             return_value={
-                "messages": [AIMessage(content="¿Cuál es tu nombre completo?")]
+                "messages": [AIMessage(content="¿Cuál es tu nombre completo?")],
+                "name_capture_reply_sent": True,
             }
         )
         mock_handoff = AsyncMock(return_value={})
@@ -272,3 +273,151 @@ class TestIdentityValidator:
             HumanMessage(content="Perdón, la correcta es 1023456789"),
         ]
         assert detect_identity_conflict(msgs) is True
+
+
+class TestIdentityConflictNormalizationGuardrails:
+    """Typo-aware identity guardrails in camila_triage.
+
+    A normalized typo ("Neiva Cortez" corrected to "Neiva Cortés") must not
+    count as a second identity; a genuine second identity must still
+    short-circuit even when a normalization was applied.
+    """
+
+    @staticmethod
+    def _provider(reply: str):
+        from src.providers.base import UsageInfo
+
+        class _P:
+            name = "fake"
+            last_usage = UsageInfo(input_tokens=5, output_tokens=5)
+
+            def stream_chat(self, *, model, messages):
+                async def _gen():
+                    yield reply
+
+                return _gen()
+
+        return _P()
+
+    @staticmethod
+    def _conflict_messages():
+        return [
+            HumanMessage(content="Mi nombre es Neiva Cortés, quiero un certificado"),
+            HumanMessage(content="perdón, escribí mal: Neiva Cortez"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_typo_correction_suppresses_deterministic_shortcircuit(self):
+        from src.agents.camila_triage import camila_triage_node
+
+        provider = self._provider(
+            '{"intent": "faq", "confidence": 0.9, "raw_text": "certificado"}'
+        )
+        state = _base_state("perdón, escribí mal: Neiva Cortez")
+        state["messages"] = self._conflict_messages()
+        # The normalizer corrected the typo'd surname back to the original.
+        state["normalization"] = {
+            "applied": True,
+            "corrected_text": "perdón, escribí mal: Neiva Cortés",
+        }
+        state["original_text"] = "perdón, escribí mal: Neiva Cortez"
+
+        with (
+            patch("src.agents.camila_triage.get_provider", return_value=provider),
+            patch("src.agents.camila_triage.resolve_model", return_value="m"),
+            patch(
+                "src.agents.camila_triage.get_stream_writer",
+                return_value=lambda e: None,
+            ),
+        ):
+            update = await camila_triage_node(state, _config())
+
+        assert update["intent"] == IntentType.FAQ.value
+
+    @pytest.mark.asyncio
+    async def test_shortcircuit_preserved_without_normalization(self):
+        from src.agents.camila_triage import camila_triage_node
+
+        state = _base_state("perdón, escribí mal: Neiva Cortez")
+        state["messages"] = self._conflict_messages()
+
+        with patch(
+            "src.agents.camila_triage.get_stream_writer",
+            return_value=lambda e: None,
+        ):
+            update = await camila_triage_node(state, _config())
+
+        assert update["intent"] == IntentType.IDENTITY_CONFLICT.value
+        assert update["handoff_reason"] == "identity_conflict"
+
+    @pytest.mark.asyncio
+    async def test_shortcircuit_preserved_when_conflict_persists_on_corrected(self):
+        from src.agents.camila_triage import camila_triage_node
+
+        # The correction does NOT unify the names — a real second identity.
+        state = _base_state("el documento dice Neiva Torres")
+        state["messages"] = [
+            HumanMessage(content="Mi nombre es Neiva Cortés"),
+            HumanMessage(content="el documento dice Neiba Torres"),
+        ]
+        state["normalization"] = {
+            "applied": True,
+            "corrected_text": "el documento dice Neiva Torres",
+        }
+
+        with patch(
+            "src.agents.camila_triage.get_stream_writer",
+            return_value=lambda e: None,
+        ):
+            update = await camila_triage_node(state, _config())
+
+        assert update["intent"] == IntentType.IDENTITY_CONFLICT.value
+
+    @pytest.mark.asyncio
+    async def test_weak_llm_identity_conflict_downgraded_to_faq(self):
+        from src.agents.camila_triage import camila_triage_node
+
+        provider = self._provider(
+            '{"intent": "identity_conflict", "confidence": 0.5, "raw_text": "x"}'
+        )
+        state = _base_state("quales son los orarios de secretaria?")
+        state["normalization"] = {
+            "applied": True,
+            "corrected_text": "¿cuáles son los horarios de secretaría?",
+        }
+        state["original_text"] = "quales son los orarios de secretaria?"
+
+        with (
+            patch("src.agents.camila_triage.get_provider", return_value=provider),
+            patch("src.agents.camila_triage.resolve_model", return_value="m"),
+            patch(
+                "src.agents.camila_triage.get_stream_writer",
+                return_value=lambda e: None,
+            ),
+        ):
+            update = await camila_triage_node(state, _config())
+
+        assert update["intent"] == IntentType.FAQ.value
+        assert "handoff_reason" not in update
+
+    @pytest.mark.asyncio
+    async def test_confident_llm_identity_conflict_not_downgraded(self):
+        from src.agents.camila_triage import camila_triage_node
+
+        provider = self._provider(
+            '{"intent": "identity_conflict", "confidence": 0.9, "raw_text": "x"}'
+        )
+        state = _base_state("hay dos nombres en mi expediente")
+        state["normalization"] = {"applied": True, "corrected_text": "..."}
+
+        with (
+            patch("src.agents.camila_triage.get_provider", return_value=provider),
+            patch("src.agents.camila_triage.resolve_model", return_value="m"),
+            patch(
+                "src.agents.camila_triage.get_stream_writer",
+                return_value=lambda e: None,
+            ),
+        ):
+            update = await camila_triage_node(state, _config())
+
+        assert update["intent"] == IntentType.IDENTITY_CONFLICT.value

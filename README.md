@@ -7,12 +7,12 @@ LangGraph multi-agent service for the Verveux/RockyBot platform. Receives chat m
 ```
 NestJS backend
       |  POST /chat/stream { agent_type: "sales", ... }
-      |  Bearer <Cognito JWT>
+      |  Bearer <Google OIDC ID token> (+ X-System-Key)
       v
 +--------------------------------------------------+
 |  FastAPI  (uvicorn, port 8000)                   |
 |                                                  |
-|  JWT validation --> Graph Registry               |
+|  Service auth   --> Graph Registry               |
 |                       |                          |
 |                  resolve agent_type               |
 |                       |                          |
@@ -138,7 +138,10 @@ Events are emitted as `data: <json>\n\n` lines on the `/chat/stream` response.
 
 Stream a user message through the appropriate agent graph.
 
-**Headers:** `Authorization: Bearer <cognito_token>`
+**Headers:** `Authorization: Bearer <google_oidc_id_token>`, or
+`X-System-Key: <WEBHOOK_API_KEY>` while the shared secret is still accepted.
+Both `/prospecting/run` and `/enrichment/run` take the same credentials, and
+also accept the secret spelled `x-agent-key`.
 
 **Request body:**
 ```json
@@ -196,9 +199,12 @@ All settings are loaded from environment variables (or a `.env` file).
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
-| `COGNITO_ISSUER` | Yes | -- | Cognito issuer URL |
-| `COGNITO_JWKS_URL` | Yes | -- | JWKS endpoint for token validation |
+| `SERPER_API_KEY` | Yes | -- | Web-search key for the prospecting agent; the service refuses to start without it |
 | `NESTJS_BASE_URL` | No | -- | Backend base URL for credential fetching |
+| `WEBHOOK_API_KEY` | No | `dev-webhook-secret` | Shared secret with the backend, both directions |
+| `SERVICE_AUTH_AUDIENCE` | No | -- | This service's own Cloud Run URL. Empty disables OIDC verification (local dev) |
+| `SERVICE_AUTH_ALLOWED_SERVICE_ACCOUNTS` | No | -- | Comma-separated caller service-account emails. Fails closed if empty while an audience is set |
+| `ALLOW_SHARED_SECRET_AUTH` | No | `true` | Accept `WEBHOOK_API_KEY` on `X-System-Key` / `x-agent-key` |
 
 ## Running Locally
 
@@ -257,7 +263,7 @@ src/
   config.py              # Pydantic settings
   observability.py       # Prometheus counters
   auth/
-    cognito.py           # JWT validation, get_current_user, scoped_thread_id
+    service_auth.py      # Google OIDC verification, get_current_user, scoped_thread_id
   db/
     postgres.py          # asyncpg pool init/close + migration runner
   agents/

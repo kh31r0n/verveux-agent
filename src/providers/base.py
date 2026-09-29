@@ -1,6 +1,13 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, TypeVar
+
+from pydantic import BaseModel, ValidationError
+
+from ..json_utils import strip_json_fences
+from .errors import StructuredOutputError
+
+Schema = TypeVar("Schema", bound=BaseModel)
 
 
 @dataclass
@@ -56,6 +63,44 @@ class ChatProvider(ABC):
             response += chunk
         return response
 
+    async def generate_structured(
+        self,
+        messages: list[dict],
+        model: str,
+        schema: type[Schema],
+        *,
+        thinking_budget: int | None = None,
+        temperature: float | None = 0.0,
+    ) -> Schema:
+        """One completion validated against ``schema``; ``last_usage`` holds its tokens.
+
+        This default asks for JSON through the prompt and validates the text, so
+        every provider supports it. Providers with a native schema mode (Gemini)
+        override it; ``thinking_budget`` is ignored by providers without one.
+        """
+        text = await self.chat(messages, model)
+        return parse_structured(text, schema)
+
     async def embed(self, texts: list[str], model: str) -> list[list[float]]:
         """Generate embeddings. Optional; raises NotImplementedError by default."""
         raise NotImplementedError("Embedding not supported by this provider")
+
+
+def parse_structured(text: str, schema: type[Schema]) -> Schema:
+    """Validate model text as ``schema``, classifying every failure."""
+    body = strip_json_fences(text or "")
+    if not body:
+        raise StructuredOutputError(
+            f"the model returned no text for {schema.__name__}", kind="empty"
+        )
+    try:
+        return schema.model_validate_json(body)
+    except ValidationError as exc:
+        kind = (
+            "invalid_json"
+            if any(err.get("type") == "json_invalid" for err in exc.errors())
+            else "schema_mismatch"
+        )
+        raise StructuredOutputError(
+            f"the model's JSON does not match {schema.__name__}: {exc}", kind=kind
+        ) from exc

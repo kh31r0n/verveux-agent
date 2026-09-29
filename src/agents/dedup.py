@@ -1,0 +1,110 @@
+"""Normalization utilities for prospecting dedupe.
+
+The synthetic contact identity is derived purely from the institution's name so
+that the same school found via two different pages (or on two different days)
+collapses to one CRM contact. Domains are normalized with ``tldextract`` so
+``www.colegio.edu.co`` and ``colegio.edu.co/inicio`` compare equal.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import unicodedata
+
+import tldextract
+
+# tldextract normally fetches (and caches) the public-suffix list over the
+# network on first use. In our container that call may be blocked, so pin it to
+# the bundled snapshot — no network, deterministic in tests.
+_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+
+_WS_RE = re.compile(r"\s+")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]+")
+
+
+def normalize_name(raw: str | None) -> str:
+    """Fold accents/case/punctuation so name variants compare equal.
+
+    "Colegio San José" and "colegio san jose!!" both normalize to
+    "colegio san jose".
+    """
+    if not raw:
+        return ""
+    # Decompose accents (NFKD) then drop the combining marks.
+    decomposed = unicodedata.normalize("NFKD", raw)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    lowered = stripped.casefold()
+    cleaned = _NON_ALNUM_RE.sub(" ", lowered)
+    return _WS_RE.sub(" ", cleaned).strip()
+
+
+def prospect_external_id(raw_name: str | None) -> str:
+    """Stable synthetic identity for a prospect: ``prospector:<sha256>``.
+
+    Derived from the normalized name only, so the identity is idempotent across
+    runs and pages. Returns "" for an empty name (caller must skip it).
+    """
+    normalized = normalize_name(raw_name)
+    if not normalized:
+        return ""
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"prospector:{digest}"
+
+
+def normalize_domain(raw: str | None) -> str:
+    """Return the lowercased registrable domain (eTLD+1) of a URL/host, or ""."""
+    if not raw:
+        return ""
+    ext = _EXTRACT(raw.strip().lower())
+    if not ext.domain:
+        return ""
+    if ext.suffix:
+        return f"{ext.domain}.{ext.suffix}"
+    return ext.domain
+
+
+# Hosts that list many businesses — a shared one says nothing about identity.
+# Mirror of AGGREGATOR_DOMAINS in yorchio-backend prospect-duplicate-finder.ts.
+AGGREGATOR_DOMAINS = frozenset(
+    {
+        "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
+        "tiktok.com", "youtube.com", "google.com", "goo.gl", "wa.me",
+        "whatsapp.com", "linktr.ee", "wixsite.com", "blogspot.com",
+        "wordpress.com", "paginasamarillas.com.co", "paginasamarillas.com",
+        "cylex.com.co", "infoisinfo.com.co", "tupaginaamarilla.com",
+        "einforma.co", "empresite.com", "guiaacademica.com",
+        "mercadolibre.com.co", "tripadvisor.com", "tripadvisor.co",
+        "foursquare.com", "yelp.com",
+    }
+)
+
+
+def identity_domain(raw: str | None) -> str:
+    """Registrable domain usable as identity, or "" for aggregators/empty."""
+    domain = normalize_domain(raw)
+    return "" if domain in AGGREGATOR_DOMAINS else domain
+
+
+# Webmail providers: sharing one says nothing about sharing an organization.
+# A sender @gmail.com writing to a mailbox @gmail.com is NOT internal.
+PUBLIC_EMAIL_PROVIDERS = frozenset(
+    {
+        "gmail.com", "googlemail.com", "outlook.com", "outlook.es", "hotmail.com",
+        "hotmail.es", "hotmail.co", "live.com", "live.com.mx", "msn.com",
+        "yahoo.com", "yahoo.es", "yahoo.com.mx", "yahoo.com.co", "ymail.com",
+        "icloud.com", "me.com", "mac.com", "proton.me", "protonmail.com",
+        "aol.com", "gmx.com", "gmx.net", "yandex.com", "zoho.com", "mail.com",
+    }
+)
+
+
+def email_domain(address: str | None) -> str:
+    """Registrable domain of an email address, or ""."""
+    if not address or "@" not in address:
+        return ""
+    return normalize_domain(address.rsplit("@", 1)[1])
+
+
+def is_public_email_domain(domain: str | None) -> bool:
+    return bool(domain) and domain in PUBLIC_EMAIL_PROVIDERS

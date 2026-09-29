@@ -34,6 +34,9 @@ class IntentType(str, Enum):
     APPOINTMENT_CANCEL = "appointment_cancel"
     APPOINTMENT_RESCHEDULE = "appointment_reschedule"
 
+    # Leads-specific (veronica)
+    LEAD_CAPTURE = "lead_capture"
+
 class CartItemIntent(BaseModel):
     product_identifier: str
     quantity: int = 1

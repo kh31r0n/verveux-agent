@@ -32,13 +32,27 @@ def _reset_registry_state():
 
 class TestRegistryShape:
     def test_seeded_code_names(self):
-        assert known_code_names() == {"helena", "sofia", "camila", "giulia", "marco"}
+        assert known_code_names() == {
+            "helena",
+            "sofia",
+            "camila",
+            "giulia",
+            "marco",
+            "veronica",
+            "aurora",
+            "sherlock",
+            "clara",
+            "ismael",
+        }
 
     def test_legacy_fallback_maps_each_agent_type(self):
         assert resolve_legacy_agent_type("sales") == "helena"
         assert resolve_legacy_agent_type("school") == "sofia"
         assert resolve_legacy_agent_type("restaurant") == "giulia"
         assert resolve_legacy_agent_type("appointments") == "marco"
+        assert resolve_legacy_agent_type("leads") == "veronica"
+        assert resolve_legacy_agent_type("prospecting") == "aurora"
+        assert resolve_legacy_agent_type("enrichment") == "sherlock"
 
     def test_legacy_fallback_returns_none_for_unknown(self):
         assert resolve_legacy_agent_type("ghost") is None

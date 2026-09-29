@@ -10,6 +10,7 @@ from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..usage import make_usage_record
 from .utils import language_instruction, resolve_prompt, format_user_context
+from .capability_gate import catalog_allowed, emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -49,6 +50,17 @@ async def course_inquiry_node(
     config: RunnableConfig,
 ) -> dict:
     record_node_invocation("course_inquiry")
+
+    # CATALOG gate: the course list arrives via product_catalog. Deflect when off.
+    if not catalog_allowed(state):
+        logger.info(
+            "capability_block",
+            capability="CATALOG",
+            source="node",
+            node="course_inquiry",
+            thread_id=state.get("thread_id", "unknown"),
+        )
+        return emit_degraded_catalog_reply(state)
 
     provider = get_provider(config)
     model = resolve_model(config)

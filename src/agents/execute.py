@@ -4,7 +4,8 @@ from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
 from ..observability import record_node_invocation
-from .backend_client import checkout_cart
+from .backend_client import CapabilityDisabledError, checkout_cart
+from .capability_gate import emit_degraded_catalog_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -22,12 +23,26 @@ async def execute_node(
 
     write = get_stream_writer()
 
-    if intent == "sales" and contact_id:
+    if intent in ("sales", "order") and contact_id:
+        # Restaurant orders carry order-level context onto Order.metadata;
+        # helena sends none (backward compatible).
+        metadata = None
+        if intent == "order":
+            rod = state.get("restaurant_order_data") or {}
+            metadata = {
+                "source": "restaurant_agent",
+                "serviceType": rod.get("service_type"),
+                "deliveryAddress": rod.get("delivery_address"),
+                "specialNotes": rod.get("special_notes"),
+            }
+            metadata = {k: v for k, v in metadata.items() if v} or None
+
         # Checkout the backend cart into an immutable order
         try:
             order = await checkout_cart(
                 contact_id=contact_id,
                 conversation_id=conversation_id or None,
+                metadata=metadata,
             )
             logger.info(
                 "cart_checked_out",
@@ -48,6 +63,17 @@ async def execute_node(
                     "items": order.get("items", []),
                 },
             })
+        except CapabilityDisabledError:
+            # Backstop: catalog access was revoked between the payload build and
+            # checkout. Deflect politely, no retry, no raw error to the customer.
+            logger.info(
+                "capability_block",
+                capability="CATALOG",
+                source="backstop_403",
+                node="execute",
+                thread_id=thread_id,
+            )
+            return {**emit_degraded_catalog_reply(state), "execute_confirmed": True}
         except Exception as exc:
             logger.error("checkout_failed", thread_id=thread_id, error=str(exc))
             write({

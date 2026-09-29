@@ -4,7 +4,6 @@ from typing import Annotated, List, Optional
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
-from ..schemas.intent import StructuredIntent
 from ..usage import InvocationUsage
 
 
@@ -31,6 +30,18 @@ class AgentState(TypedDict):
     tenant_id: str
     conversation_id: str
     product_catalog: list    # [{product_id, name, description, price, stock}]
+    # Tenant-admin CATALOG capability toggle, forwarded per turn by the backend.
+    # When False, nodes that read product_catalog emit the degraded instruction
+    # instead of catalog data, and cart/order backend calls 403. Absent (old
+    # checkpoints) => treated as True by catalog_allowed().
+    catalog_access_enabled: bool
+    # Business-hours flag, resolved fresh by the backend every turn from the
+    # tenant's WorkingHours schedule (TenantSettings.agentBusinessHoursEnabled;
+    # always True when the tenant hasn't opted in). When False, graphs route
+    # every non-urgent turn to faq_response, which splices the per-agent
+    # OUTSIDE_HOURS prompt. Absent (old checkpoints) => treated as True by
+    # business_hours_gate.within_business_hours().
+    within_business_hours: bool
     knowledge: Optional[List[dict]]  # Unified knowledge payload
     user_context: dict       # {name, email, phone, address}
     contact_id: str
@@ -46,7 +57,12 @@ class AgentState(TypedDict):
 
     # ── Triage ─────────────────────────────────────────────────────────
     intent: str              # "sales" | "tracking" | "complaint" | "faq"
-    structured_intent: Optional[StructuredIntent]
+    # StructuredIntent serialized via model_dump(mode="json") — checkpoints
+    # must only carry JSON-native values so LangGraph can deserialize them
+    # without allow-listing custom Python classes. Legacy checkpoints written
+    # before 2026-07 may still yield StructuredIntent instances (allow-listed
+    # in main.py); readers handle both shapes.
+    structured_intent: Optional[dict]
 
     # ── Sales — explicit phase machine ─────────────────────────────────
     #
@@ -106,8 +122,20 @@ class AgentState(TypedDict):
     admissions_complete: bool
 
     # ── Restaurant flow ───────────────────────────────────────────────
+    # restaurant_order_data holds ONLY order-level fields collected in
+    # conversation (service_type, delivery_address, special_notes) — the
+    # items themselves live in `cart` (shared with the sales flow) so the
+    # backend cart/checkout machinery works unchanged.
     restaurant_order_data: dict
+    # True when cart is non-empty + service_type set (+ address if delivery).
     restaurant_order_complete: bool
+    # "collect" | "confirmation". The summary node latches "confirmation"
+    # so the next turn resumes at restaurant_confirm instead of re-collecting.
+    # Readers must use .get() — old checkpoints lack the key.
+    restaurant_phase: str
+    # Set by restaurant_confirm on a clear yes; routes the same turn to
+    # execute (checkout). Reset when a new order starts post-checkout.
+    restaurant_order_confirmed: bool
 
     # ── Appointments flow ─────────────────────────────────────────────
     # Legacy fields (kept for backward compat with existing checkpoints
@@ -147,6 +175,30 @@ class AgentState(TypedDict):
     # the graph can route back to availability_lookup and re-search.
     slot_conflict: bool
 
+    # ── Leads flow (veronica) ─────────────────────────────────────────
+    # Fields extracted so far, keyed like the backend DTO (fullName, email,
+    # serviceInterest, company, phoneCountryCode, phoneNumber, challenge,
+    # comments). Merged turn by turn; never trimmed by the LLM.
+    lead_data: dict
+    # True once fullName + email + serviceInterest are all present/valid.
+    lead_collection_complete: bool
+    # Minted (uuid4) exactly once when collection completes; rides to the
+    # backend as the InquirySource.idempotencyKey so retries and LangGraph
+    # replays can never create a second Inquiry.
+    lead_submission_id: Optional[str]
+    # Latched by execute_lead ONLY on a confirmed 2xx from the backend; a
+    # failed POST leaves it False so the next turn retries with the same
+    # lead_submission_id.
+    lead_submitted: bool
+
+    # ── Theology flow (ismael) ────────────────────────────────────────
+    # {question, pending_question, survey_step, survey_answers} — see
+    # src/agents/ismael/nodes.py. Readers must use .get(): other graphs'
+    # checkpoints never carry it.
+    ismael: dict
+    # Per-turn branch chosen by ismael_triage (written every turn).
+    ismael_route: str
+
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool
 
@@ -171,10 +223,43 @@ class AgentState(TypedDict):
     # stale attachments don't bleed across turns. Camila escalates to
     # human as soon as this list is non-empty.
     attachments: list
-    # Latched True once the contact's name has been parsed and persisted
-    # to the backend by name_capture. Prevents the graph from re-asking.
+    # LEGACY latch (camila-only, superseded by `name_captured` below).
+    # Honoured read-only by shared_routing.has_name so existing camila
+    # checkpoints never re-ask; new captures set both flags.
     school_name_captured: bool
+
+    # ── Name capture (generic, all graphs) ─────────────────────────────
+    # Latched once a name is confirmed persisted by the backend (or adopted
+    # from a MANUAL human-edited name on applied=false). NOT set on backend
+    # HTTP failure — next turn the backend snapshot stays authoritative.
+    name_captured: bool
+    # Extraction attempts without success this thread; reaching
+    # MAX_NAME_CAPTURE_ATTEMPTS triggers an implicit deferral so the agent
+    # never nags indefinitely.
+    name_capture_attempts: int
+    # Local mirror of Contact.nameCaptureDeferredAt, set when the user
+    # declines. `user_context.name_capture_deferred` (backend snapshot,
+    # re-sent every turn with window expiry applied) is authoritative on
+    # subsequent turns.
+    name_capture_deferred: bool
+    # Per-turn flag ALWAYS written by name_capture_node: True → the node
+    # already replied (ask or greeting), end the turn; False → continue to
+    # the graph's normal intent routing in the same turn.
+    name_capture_reply_sent: bool
     # Free-text reason recorded when handoff runs; mirrors the value sent
     # to /internal/conversations/:id/handoff so the audit trail stays
     # consistent between graph state and the backend Incident record.
     handoff_reason: Optional[str]
+
+    # ── Query normalization (per-turn; sole writer: query_normalizer) ──
+    # Snapshot of the user's turn text before any typo correction. Stamped
+    # every turn by query_normalizer_node. Readers must use .get() — old
+    # checkpoints (and turns where the node was bypassed) lack the key.
+    original_text: Optional[str]
+    # Write-once provenance for the turn's normalization decision. Shape:
+    #   {enabled: bool, model: str|None, confidence: float|None,
+    #    changed_meaning_risk: "LOW"|"MEDIUM"|"HIGH"|None, reason: str,
+    #    applied: bool, corrected_text: str|None}
+    # JSON-native values only (checkpoint rule). None = node did not run
+    # (legacy checkpoint). Downstream nodes treat this as read-only.
+    normalization: Optional[dict]

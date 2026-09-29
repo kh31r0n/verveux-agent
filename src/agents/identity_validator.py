@@ -28,6 +28,33 @@ def _extract_documentos(text: str) -> set[str]:
     return {m.group(1) for m in _DOCUMENTO.finditer((text or "").replace(".", ""))}
 
 
+def detect_identity_conflict_texts(texts: Iterable[str]) -> bool:
+    """Text-list variant of the conflict check.
+
+    Lets callers test hypothetical transcripts (e.g. camila re-runs the check
+    with the last user text replaced by the normalizer's typo-corrected
+    version) without constructing message objects.
+    """
+    names: set[str] = set()
+    documentos: set[str] = set()
+    for text in texts or []:
+        names |= _extract_names(text)
+        documentos |= _extract_documentos(text)
+        if len(names) >= 2 or len(documentos) >= 2:
+            return True
+    return False
+
+
+def extract_human_texts(messages: Iterable[object]) -> list[str]:
+    """The USER-message texts of a conversation, oldest first."""
+    texts: list[str] = []
+    for msg in messages or []:
+        if getattr(msg, "type", "") != "human":
+            continue
+        texts.append(msg.content if hasattr(msg, "content") else str(msg))
+    return texts
+
+
 def detect_identity_conflict(messages: Iterable[object]) -> bool:
     """Return True if the user's messages reference two distinct full names
     or two distinct documento numbers across the conversation.
@@ -35,14 +62,4 @@ def detect_identity_conflict(messages: Iterable[object]) -> bool:
     Only USER messages are inspected — assistant prompts can mention
     multiple names without being a conflict signal.
     """
-    names: set[str] = set()
-    documentos: set[str] = set()
-    for msg in messages or []:
-        if getattr(msg, "type", "") != "human":
-            continue
-        text = msg.content if hasattr(msg, "content") else str(msg)
-        names |= _extract_names(text)
-        documentos |= _extract_documentos(text)
-        if len(names) >= 2 or len(documentos) >= 2:
-            return True
-    return False
+    return detect_identity_conflict_texts(extract_human_texts(messages))

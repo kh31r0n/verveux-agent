@@ -1,0 +1,9 @@
+From: Novedades <boletin@tienda.example>
+To: ventas@example.test
+Subject: Ofertas de la semana
+List-Unsubscribe: <mailto:unsubscribe@tienda.example>
+Precedence: bulk
+Message-ID: <newsletter-unsub@tienda.example>
+Content-Type: text/plain; charset=utf-8
+
+Descuentos de hasta 40% en toda la tienda. Solo por esta semana.

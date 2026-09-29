@@ -87,6 +87,7 @@ class TestAppointmentsGraphRouting:
                 {
                     "messages": [HumanMessage(content="quiero una cita")],
                     "thread_id": "u:1",
+                    "user_context": {"name": "Ana"},
                 },
                 config=_config("u:1"),
                 stream_mode="updates",
@@ -149,6 +150,7 @@ class TestAppointmentsGraphRouting:
                 {
                     "messages": [HumanMessage(content="muévela al jueves")],
                     "thread_id": "u:r",
+                    "user_context": {"name": "Ana"},
                 },
                 config=_config("u:r"),
                 stream_mode="updates",
@@ -176,6 +178,7 @@ class TestAppointmentsGraphRouting:
                 {
                     "messages": [HumanMessage(content="¿qué horarios atienden?")],
                     "thread_id": "u:faq",
+                    "user_context": {"name": "Ana"},
                 },
                 config=_config("u:faq"),
                 stream_mode="updates",
@@ -231,6 +234,7 @@ class TestAppointmentsGraphRouting:
                 {
                     "messages": [HumanMessage(content="cita médica jueves 9am")],
                     "thread_id": "u:chain",
+                    "user_context": {"name": "Ana"},
                 },
                 config=_config("u:chain"),
                 stream_mode="updates",
@@ -316,6 +320,7 @@ class TestAppointmentsGraphRouting:
                 {
                     "messages": [HumanMessage(content="cita")],
                     "thread_id": "u:conflict",
+                    "user_context": {"name": "Ana"},
                 },
                 config=_config("u:conflict"),
                 stream_mode="updates",

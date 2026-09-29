@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from langgraph.config import get_stream_writer
 
 from ..graphs.state import AgentState
+from ..json_utils import strip_json_fences
 from ..providers.registry import get_provider, resolve_model
 from ..observability import get_langfuse, record_node_invocation
 from ..schemas.intent import StructuredIntent, IntentType
@@ -35,6 +36,23 @@ Reglas:
 - Preguntas sobre disponibilidad general SIN compromiso de reservar → **faq** (el flujo de booking ya muestra disponibilidad).
 - Responde SOLO con un objeto JSON de una línea, sin markdown.
 - Esquema JSON: {{"intent": "<booking|appointment_cancel|appointment_reschedule|faq|greeting|escalation>", "confidence": 0.0-1.0, "raw_text": "..."}}
+"""
+
+
+_LEADS_TRIAGE_SYSTEM_PROMPT = """Eres el agente de clasificación de Verónica, una asistente virtual que atiende a visitantes del sitio web de la empresa.
+
+Tu trabajo es clasificar la intención del visitante y devolver SOLO un objeto JSON.
+
+Intenciones disponibles:
+- **lead_capture**: El visitante muestra interés en los productos o servicios, quiere una demo, cotización, que lo contacten, o comparte datos de contacto (nombre, correo, teléfono, empresa).
+- **faq**: El visitante pregunta sobre la empresa, precios, horarios, funcionalidades, o cualquier pregunta general.
+- **greeting**: El mensaje es solo un saludo sin ninguna petición.
+
+Reglas:
+- Si el visitante comparte un correo, teléfono o dice "me interesa", "quiero más información", "contáctenme" → **lead_capture**.
+- Ante la duda entre faq y lead_capture, prefiere **faq** — la calificación del lead continúa después de responder.
+- Responde SOLO con un objeto JSON de una línea, sin markdown.
+- Esquema JSON: {{"intent": "<lead_capture|faq|greeting>", "confidence": 0.0-1.0, "raw_text": "..."}}
 """
 
 
@@ -82,18 +100,8 @@ def _build_faq_hints(faqs: list) -> str:
     return _FAQ_HINTS_BLOCK.format(faq_lines="\n".join(lines))
 
 
-def _strip_json_fences(raw: str) -> str:
-    """Remove markdown code fences that Gemini adds around JSON responses.
-
-    Handles both ```json ... ``` and ``` ... ``` variants.
-    """
-    s = raw.strip()
-    if s.startswith("```"):
-        # Drop the opening fence line (```json or ```)
-        s = s.split("\n", 1)[-1]
-        # Drop the closing fence
-        s = s.rsplit("```", 1)[0]
-    return s.strip()
+# Moved to src/json_utils.py; alias kept for existing importers.
+_strip_json_fences = strip_json_fences
 
 
 async def triage_node(
@@ -121,6 +129,17 @@ async def triage_node(
     ):
         return {}
 
+    # Restaurant: skip re-classification while an order is actively in
+    # progress. Conservative like the sales guard: require real cart items OR
+    # the awaiting-confirmation latch — restaurant_order_data alone can be
+    # stale from an abandoned order.
+    if (
+        state.get("intent") == "order"
+        and not state.get("execute_confirmed", False)
+        and (bool(state.get("cart")) or state.get("restaurant_phase") == "confirmation")
+    ):
+        return {}
+
     if (
         state.get("intent") == "tracking"
         and not state.get("execute_confirmed", False)
@@ -145,6 +164,17 @@ async def triage_node(
     ):
         return {}
 
+    # ── Leads: skip while qualification is mid-run ───────────────────────────
+    # Conservative like the sales guard: require actual extracted fields —
+    # a bare stale intent must not suppress re-classification. Once the lead
+    # was submitted, follow-ups re-triage normally (usually to faq).
+    if (
+        state.get("intent") == "lead_capture"
+        and not state.get("lead_submitted", False)
+        and bool(state.get("lead_data"))
+    ):
+        return {}
+
     provider = get_provider(config)
     model = resolve_model(config)
     thread_id: str = state.get("thread_id", "unknown")
@@ -161,11 +191,12 @@ async def triage_node(
     triage_key = f"{agent_type}_TRIAGE"
     # Pick the appointments-specific default when running under the appointments
     # graph so the LLM doesn't try to classify booking talk as `sales`.
-    default_prompt = (
-        _APPOINTMENTS_TRIAGE_SYSTEM_PROMPT
-        if code_name == "marco" or agent_type == "APPOINTMENTS"
-        else _TRIAGE_SYSTEM_PROMPT
-    )
+    if code_name == "marco" or agent_type == "APPOINTMENTS":
+        default_prompt = _APPOINTMENTS_TRIAGE_SYSTEM_PROMPT
+    elif code_name == "veronica" or agent_type == "LEADS":
+        default_prompt = _LEADS_TRIAGE_SYSTEM_PROMPT
+    else:
+        default_prompt = _TRIAGE_SYSTEM_PROMPT
     triage_prompt = resolve_prompt(config, triage_key, default_prompt, state)
 
     faqs: list = state.get("faqs") or []
@@ -208,7 +239,7 @@ async def triage_node(
 
     try:
         # Strip markdown code fences that Gemini adds despite being told not to.
-        parsed_json = json.loads(_strip_json_fences(full_response))
+        parsed_json = json.loads(strip_json_fences(full_response))
         structured_intent = StructuredIntent.model_validate(parsed_json)
         intent = structured_intent.intent
     except (ValidationError, json.JSONDecodeError) as e:
@@ -228,6 +259,7 @@ async def triage_node(
         thread_id=thread_id,
         intent=intent.value,
         faq_hints_injected=len(faqs),
+        normalization_applied=bool((state.get("normalization") or {}).get("applied")),
     )
 
     # Emit create_deal SSE event when classifying as "sales" for the first time
@@ -244,14 +276,18 @@ async def triage_node(
         logger.info("triage_deal_created", thread_id=thread_id, contact_id=contact_id)
         return {
             "intent": intent.value,
-            "structured_intent": structured_intent,
+            # Stored as a plain JSON dict — checkpoints must never carry
+            # custom Python types (LangGraph blocks their deserialization
+            # in future versions). route_from_triage handles both shapes.
+            "structured_intent": structured_intent.model_dump(mode="json"),
             "deal_created": True,
             "turn_usage": [usage_record],
         }
 
     return {
         "intent": intent.value,
-        "structured_intent": structured_intent,
+        # Plain JSON dict — keeps custom Python types out of checkpoints.
+        "structured_intent": structured_intent.model_dump(mode="json"),
         "turn_usage": [usage_record],
     }
 

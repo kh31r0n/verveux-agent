@@ -28,10 +28,17 @@ from ...providers.registry import get_provider, resolve_model
 from ...schemas.ismael import IsmaelIntent, SurveyAnswer, TriageResult
 from ...usage import make_usage_record
 from .. import backend_client
-from ..utils import format_user_context, latest_user_text, resolve_persona, resolve_prompt
+from ..utils import (
+    emit_pending_followup,
+    emit_quick_replies,
+    format_user_context,
+    latest_user_text,
+    resolve_persona,
+    resolve_prompt,
+)
 from . import rag_job
 from .prompts import SURVEY_PROMPT, TRIAGE_PROMPT
-from .texts import NO_ANSWER, SURVEY, lang_of, text
+from .texts import NO_ANSWER, SURVEY, SurveyStep, lang_of, text
 
 logger = structlog.get_logger(__name__)
 
@@ -47,6 +54,25 @@ def _ismael(state: AgentState) -> dict:
 def _reply(message: str, **updates) -> dict:
     get_stream_writer()({"type": "token", "content": message})
     return {"messages": [AIMessage(content=message)], **updates}
+
+
+def _reply_while_consulting(message: str, lang: str, **updates) -> dict:
+    """A reply that promises the answer later: the widget keeps a waiting
+    indicator up until it arrives, for as long as a job may legitimately run."""
+    result = _reply(message, **updates)
+    emit_pending_followup(text("working", lang), ttl_seconds=int(rag_job.JOB_TTL_SECONDS))
+    return result
+
+
+def _ask_survey_step(message: str, step: SurveyStep, lang: str, **updates) -> dict:
+    """A survey question: the numbered text for every channel, buttons where drawn.
+
+    ``message`` must end with ``step.render(lang)`` — the backend only keeps the
+    buttons when the text ends with exactly those numbered options.
+    """
+    result = _reply(message, **updates)
+    emit_quick_replies(step.labels(lang))
+    return result
 
 
 def _survey_done(state: AgentState, ismael: dict) -> bool:
@@ -144,7 +170,7 @@ async def ismael_start_node(state: AgentState, config: RunnableConfig) -> dict:
 
     if _survey_done(state, ismael):
         await _spawn_answer(state, config, question)
-        return _reply(text("consulting", lang), ismael=ismael)
+        return _reply_while_consulting(text("consulting", lang), lang, ismael=ismael)
 
     # Boot Brain now; the three survey turns are what pay for its ~1 min start.
     rag_job.start_host_in_background()
@@ -156,7 +182,7 @@ async def ismael_start_node(state: AgentState, config: RunnableConfig) -> dict:
         + f"\n\n1/{len(SURVEY)} — "
         + SURVEY[0].render(lang)
     )
-    return _reply(message, ismael=ismael)
+    return _ask_survey_step(message, SURVEY[0], lang, ismael=ismael)
 
 
 # ── Survey ───────────────────────────────────────────────────────────────────
@@ -171,6 +197,11 @@ def parse_survey_answer(step_index: int, reply: str) -> str | None:
     """Option key from a number or an option label; None when it takes an LLM."""
     step = SURVEY[step_index]
     folded = _fold(reply)
+    # A quick-reply button sends its label verbatim: match it exactly first,
+    # so a click never depends on the substring heuristics or on the LLM.
+    for key, es, en in step.options:
+        if folded in (_fold(es), _fold(en)):
+            return key
     number = re.fullmatch(r"\D{0,12}?(\d{1,2})\D{0,12}", folded)
     if number:
         n = int(number.group(1))
@@ -235,7 +266,9 @@ async def ismael_survey_node(state: AgentState, config: RunnableConfig) -> dict:
             + f"\n\n{step_number + 1}/{len(SURVEY)} — "
             + SURVEY[step_number].render(lang)
         )
-        return _reply(message, ismael=ismael, turn_usage=usage)
+        return _ask_survey_step(
+            message, SURVEY[step_number], lang, ismael=ismael, turn_usage=usage
+        )
 
     ismael["survey_step"] = SURVEY_DONE
     contact_id = state.get("contact_id") or ""
@@ -247,7 +280,9 @@ async def ismael_survey_node(state: AgentState, config: RunnableConfig) -> dict:
         except Exception as exc:  # noqa: BLE001 — statistics must not block the answer
             logger.warning("ismael_survey_save_failed", error=str(exc))
     await _spawn_answer(state, config, ismael.get("pending_question") or reply)
-    return _reply(text("survey_done", lang), ismael=ismael, turn_usage=usage)
+    return _reply_while_consulting(
+        text("survey_done", lang), lang, ismael=ismael, turn_usage=usage
+    )
 
 
 # ── Holding and off-topic replies ────────────────────────────────────────────
@@ -257,7 +292,8 @@ async def ismael_pending_node(state: AgentState, config: RunnableConfig) -> dict
     record_node_invocation("ismael_pending")
     ismael = _ismael(state)
     question = ismael.get("pending_question") or ""
-    return _reply(text("pending", lang_of(state), question=question[:160]))
+    lang = lang_of(state)
+    return _reply_while_consulting(text("pending", lang, question=question[:160]), lang)
 
 
 async def ismael_off_topic_node(state: AgentState, config: RunnableConfig) -> dict:

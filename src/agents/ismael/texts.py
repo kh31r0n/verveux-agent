@@ -20,11 +20,17 @@ class SurveyStep:
     options: tuple[tuple[str, str, str], ...]
     question: dict[str, str]
 
+    def labels(self, lang: str) -> list[str]:
+        """Visible option labels, in the order of their numbers."""
+        idx = 2 if lang == "en" else 1
+        return [option[idx] for option in self.options]
+
     def render(self, lang: str) -> str:
-        idx = 1 if lang == "en" else 0
+        # The question plus the numbered list the backend matches the
+        # quick-reply buttons against (``emit_quick_replies``); keep the format.
         lines = [self.question[lang]]
-        for n, option in enumerate(self.options, start=1):
-            lines.append(f"{n}) {option[1 + idx]}")
+        for n, label in enumerate(self.labels(lang), start=1):
+            lines.append(f"{n}) {label}")
         return "\n".join(lines)
 
     def keys(self) -> list[str]:
@@ -78,12 +84,12 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": (
             "Buena pregunta{name}. Mientras preparo las fuentes de la biblioteca "
             "(tarda alrededor de un minuto), te hago tres preguntas rápidas. Son solo "
-            "para estadística y no cambian la respuesta; puedes contestar con el número."
+            "para estadística y no cambian la respuesta; elige una opción o escribe tu respuesta."
         ),
         "en": (
             "Good question{name}. While I get the library's sources ready (it takes "
             "about a minute), here are three quick questions. They are only for "
-            "statistics and do not change the answer; you can reply with the number."
+            "statistics and do not change the answer; pick an option or type your answer."
         ),
     },
     "survey_next": {"es": "Gracias.", "en": "Thanks."},
@@ -135,6 +141,8 @@ _TEXTS: dict[str, dict[str, str]] = {
         "en": "Sorry, I couldn't check the sources right now. Please try again in a few minutes.",
     },
     "references": {"es": "Referencias:", "en": "References:"},
+    # The widget's waiting indicator while the answer is on its way.
+    "working": {"es": "Consultando la biblioteca…", "en": "Checking the library…"},
     "general_notice": {
         "es": "(Respuesta general: la biblioteca no tiene fuentes sobre esta pregunta.)",
         "en": "(General answer: the library has no sources on this question.)",

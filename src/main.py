@@ -601,6 +601,22 @@ async def _stream_graph(
                         "stage_position": event_data.get("stage_position", 0),
                     })
 
+                elif event_kind == "pending_followup":
+                    yield _sse_event({
+                        "type": "pending_followup",
+                        "label": event_data.get("label", ""),
+                        "ttl_seconds": event_data.get("ttl_seconds", 0),
+                    })
+
+                elif event_kind == "quick_replies":
+                    # Forwarded untouched: the backend validates the options
+                    # against the reply's numbered suffix and never renumbers.
+                    yield _sse_event({
+                        "type": "quick_replies",
+                        "options": event_data.get("options", []),
+                        "allow_other": event_data.get("allow_other", False),
+                    })
+
             elif chunk_type == "updates":
                 update_data: dict = chunk.get("data", {})
 

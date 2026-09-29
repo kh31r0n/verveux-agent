@@ -246,16 +246,23 @@ async def post_agent_message(
     job_id: str,
     text: str,
     turn_usage: list | None = None,
+    references: dict | None = None,
 ) -> dict:
     """POST /internal/conversations/:id/agent-messages — an out-of-band reply.
 
     For answers that outlive a chat turn (ismael's Brain job). The backend
     stores the message, dispatches it on the conversation's channel and bills
-    ``turn_usage``; ``job_id`` makes the whole call idempotent.
+    ``turn_usage``; ``job_id`` makes the whole call idempotent. ``references``
+    (the sources ``text`` ends with, as data) is only sent when there are any:
+    the endpoint rejects unknown fields, so a backend without it still works
+    for every answer that cites nothing.
     """
+    body: dict = {"jobId": job_id, "text": text, "turnUsage": turn_usage or []}
+    if references:
+        body["references"] = references
     return await _post(
         f"/api/v1/internal/conversations/{conversation_id}/agent-messages",
-        json={"jobId": job_id, "text": text, "turnUsage": turn_usage or []},
+        json=body,
     )
 
 

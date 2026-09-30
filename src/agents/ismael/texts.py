@@ -144,10 +144,6 @@ _TEXTS: dict[str, dict[str, str]] = {
     "references": {"es": "Referencias:", "en": "References:"},
     # The widget's waiting indicator while the answer is on its way.
     "working": {"es": "Consultando la biblioteca…", "en": "Checking the library…"},
-    "general_notice": {
-        "es": "(Respuesta general: la biblioteca no tiene fuentes sobre esta pregunta.)",
-        "en": "(General answer: the library has no sources on this question.)",
-    },
     "page": {"es": "p.", "en": "p."},
 }
 

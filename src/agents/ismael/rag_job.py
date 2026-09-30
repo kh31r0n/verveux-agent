@@ -20,6 +20,7 @@ If the instance dies mid-job the answer is lost; the store entry expires after
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -154,13 +155,40 @@ def _reference_items(answer: dict, lang: str) -> list[tuple[str, str | None]]:
     return items
 
 
+# Brain's model sometimes opens with "Según los textos proporcionados, …": the
+# student never sees those texts, so the lead-in reads as noise. Only this
+# opening clause is removed; the claims that follow are untouched.
+_SOURCE_PREAMBLE = re.compile(
+    r"^(?:"
+    r"(?:según|de acuerdo con|con base en|basándome en|a partir de)\s+(?:los|las)\s+"
+    r"(?:textos|fragmentos|fuentes|documentos|pasajes)"
+    r"(?:\s+(?:proporcionad|disponibl|consultad|dad|citad|recibid)[oae]s)?"
+    r"|"
+    r"(?:according to|based on)\s+the\s+(?:provided\s+)?"
+    r"(?:texts|fragments|sources|documents|passages|excerpts)(?:\s+provided)?"
+    r")\s*,\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_source_preamble(body: str) -> str:
+    """``body`` without a leading "according to the provided texts," clause."""
+    match = _SOURCE_PREAMBLE.match(body)
+    rest = body[match.end():] if match else ""
+    if not rest.strip():
+        return body
+    return rest[0].upper() + rest[1:]
+
+
 def format_answer(answer: dict, lang: str) -> str:
     """Brain's answer text plus a References block built from its citations.
 
     Brain verifies every citation server-side, so the text is sent as written —
-    an LLM rewrite could detach a claim from the source that supports it.
+    an LLM rewrite could detach a claim from the source that supports it. The
+    one exception is a "según los textos proporcionados," lead-in, which carries
+    no claim (``strip_source_preamble``).
     """
-    body = (answer.get("text") or "").strip()
+    body = strip_source_preamble((answer.get("text") or "").strip())
     items = _reference_items(answer, lang)
     if not items:
         return body
@@ -203,7 +231,7 @@ async def _general_answer(job: RagJob) -> tuple[str, list]:
     reply = (reply or "").strip()
     if not reply:
         raise brain.BrainError("general answer came back empty")
-    return f"{reply}\n\n{text('general_notice', job.language)}", usage
+    return reply, usage
 
 
 async def _compose(job: RagJob) -> tuple[str, list, str, dict | None]:
@@ -232,7 +260,8 @@ async def _compose(job: RagJob) -> tuple[str, list, str, dict | None]:
                 answer_references(answer, job.language),
             )
 
-        # insufficient_evidence / off_corpus: a short general answer, labelled.
+        # insufficient_evidence / off_corpus: a short general answer, unlabelled
+        # (the outcome below still tells them apart in the logs).
         message, usage = await _general_answer(job)
         return message, usage, f"general:{answer.get('state')}", None
     except Exception as exc:  # noqa: BLE001 — the student still gets a reply

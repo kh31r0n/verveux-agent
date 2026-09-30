@@ -461,6 +461,39 @@ class TestFormatAnswer:
             "- Historia de la Iglesia, Capítulo 3"
         )
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Según los textos proporcionados, la gracia es un don.",
+            "según las fuentes disponibles,  la gracia es un don.",
+            "De acuerdo con los fragmentos, la gracia es un don.",
+            "Con base en los documentos citados, la gracia es un don.",
+        ],
+    )
+    def test_source_preamble_is_dropped(self, raw):
+        assert rag_job.strip_source_preamble(raw) == "La gracia es un don."
+
+    def test_english_source_preamble_is_dropped(self):
+        raw = "According to the provided texts, grace is a gift."
+        assert rag_job.strip_source_preamble(raw) == "Grace is a gift."
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "La gracia es un don, según los textos proporcionados.",
+            "Según Agustín, la gracia es un don.",
+            "Según los textos proporcionados,",
+        ],
+    )
+    def test_everything_else_is_left_alone(self, raw):
+        assert rag_job.strip_source_preamble(raw) == raw
+
+    def test_format_answer_drops_the_preamble_before_the_references(self):
+        text_ = "Según los textos proporcionados, la gracia es el favor inmerecido de Dios."
+        answer = {**ANSWERED["answer"], "text": text_}
+        expected = rag_job.format_answer(ANSWERED["answer"], "es")
+        assert rag_job.format_answer(answer, "es") == expected
+
     def test_no_citations_means_no_reference_block(self):
         assert rag_job.format_answer({"text": "Hola"}, "es") == "Hola"
         assert rag_job.answer_references({"text": "Hola"}, "es") is None
@@ -512,7 +545,7 @@ class TestCompose:
         brain["ask"].assert_awaited_once_with("¿Qué es la gracia?")
 
     @pytest.mark.parametrize("state", ["insufficient_evidence", "off_corpus"])
-    async def test_uncovered_question_gets_a_labelled_general_answer(self, brain, state):
+    async def test_uncovered_question_gets_a_plain_general_answer(self, brain, state):
         brain["wait"].return_value = {"state": "done", "answer": {"state": state, "text": ""}}
         with patch(
             "src.agents.ismael.rag_job._general_answer",
@@ -521,7 +554,7 @@ class TestCompose:
             composed = await rag_job._compose(_job())
         assert composed == ("Respuesta breve.", [{"node": "x"}], f"general:{state}", None)
 
-    async def test_general_answer_carries_the_notice_and_usage(self):
+    async def test_general_answer_is_the_bare_reply_with_usage(self):
         class Provider(FakeProvider):
             async def chat(self, messages, model, **_):
                 assert "120 palabras" in messages[0]["content"]
@@ -530,7 +563,7 @@ class TestCompose:
 
         with patch("src.agents.ismael.rag_job.get_provider", return_value=Provider(None)):
             message, usage = await rag_job._general_answer(_job())
-        assert message == f"Breve.\n\n{text('general_notice', 'es')}"
+        assert message == "Breve."
         assert usage[0]["node"] == "ismael_general_answer"
 
     async def test_boot_timeout_apologises(self, brain):

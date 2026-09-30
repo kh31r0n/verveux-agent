@@ -113,6 +113,8 @@ Christian theology Q&A for the MOODLE bubble, answered by **Company Brain** (the
 
 `resolve_api_key(config)` extracts the key from `config["configurable"]["openai_api_key"]` (set per-request) or falls back to `settings.openai_api_key`. Each agent node calls this independently — there is no shared client instance.
 
+**Which model: chat vs background.** Chat turns get `llm_model` from the backend, which resolves the tenant's current settings every turn. The non-chat paths fetch credentials themselves and run on the platform's cheap model: `providers/registry.background_model(creds)` reads `backgroundModel` from `GET /internal/agent/credentials`, falling back to `model` for an older backend. That covers `/prospecting/run` (aurora) and `/enrichment/run` (sherlock), whose whole graph uses it. clara carries both — `llm_background_model` in `configurable`, read by `resolve_background_model` — and uses the cheap one only for triage and task extraction (`_structured_call(..., background=True)`); the reply and follow-up drafts stay on the tenant's model because a customer reads them. ismael's background RAG job answers a chat, so it keeps the tenant's model.
+
 ### Authentication (`src/auth/service_auth.py`)
 
 Every caller is another service — the NestJS backend and its schedulers — never an end user. There is no browser or mobile client on the other end, which is why this verifies *workload* identity rather than user identity. It replaced the AWS Cognito verifier, whose JWT branch was dead on every production request.

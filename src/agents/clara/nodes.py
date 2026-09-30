@@ -19,7 +19,7 @@ from langgraph.types import RunnableConfig
 
 from ...config import settings
 from ...observability import record_node_invocation
-from ...providers.registry import get_provider, resolve_model
+from ...providers.registry import get_provider, resolve_background_model, resolve_model
 from ...schemas.email import (
     Category,
     ExtractedTask,
@@ -53,9 +53,12 @@ async def _structured_call(
     context: str,
     schema,
     thinking_budget: int | None,
+    background: bool = False,
 ):
+    """``background``: a classification step nobody reads, run on the platform's
+    cheap model. Drafts leave it False — a customer reads them."""
     provider = get_provider(config)
-    model = resolve_model(config)
+    model = resolve_background_model(config) if background else resolve_model(config)
     system = resolve_prompt(config, prompt_key, prompts.DEFAULT_PROMPTS[prompt_key])
     provenance = resolve_prompt_provenance(config, prompt_key, system, prompts.PROMPT_VERSION)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": context}]
@@ -195,6 +198,7 @@ async def triage_node(state: dict, config: RunnableConfig) -> dict:
         context=prompts.triage_context(email, hints),
         schema=TriageResult,
         thinking_budget=settings.clara_thinking_triage,
+        background=True,
     )
     return {
         "triage": guard_triage(result, email).model_dump(mode="json"),
@@ -213,6 +217,7 @@ async def extract_task_node(state: dict, config: RunnableConfig) -> dict:
         context=prompts.task_context(email, summary),
         schema=ExtractedTask,
         thinking_budget=settings.clara_thinking_extract_task,
+        background=True,
     )
     task = guard_task(validate_task(task, email), email)
     return {"task": task.model_dump(mode="json"), "turn_usage": [usage]}

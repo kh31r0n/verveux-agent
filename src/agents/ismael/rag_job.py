@@ -129,16 +129,10 @@ async def _record(job: RagJob, status: str) -> None:
         logger.info("ismael_job_store_write_failed", error=str(exc), status=status)
 
 
-def format_answer(answer: dict, lang: str) -> str:
-    """Brain's answer text plus a References block built from its citations.
-
-    Brain verifies every citation server-side, so the text is sent as written —
-    an LLM rewrite could detach a claim from the source that supports it.
-    References are listed once per (title, page), in citation order.
-    """
-    body = (answer.get("text") or "").strip()
+def _reference_items(answer: dict, lang: str) -> list[tuple[str, str | None]]:
+    """(title, detail) per cited source: once per (title, page), in citation order."""
     evidence = {e.get("chunk_id"): e for e in answer.get("evidence") or [] if isinstance(e, dict)}
-    refs: list[str] = []
+    items: list[tuple[str, str | None]] = []
     seen: set[tuple[str, str]] = set()
     for citation in answer.get("citations") or []:
         if not isinstance(citation, dict):
@@ -154,12 +148,40 @@ def format_answer(answer: dict, lang: str) -> str:
         if key in seen:
             continue
         seen.add(key)
-        refs.append(f"- {title}" + (f", {detail}" if detail and detail != title else ""))
-        if len(refs) >= MAX_REFERENCES:
+        items.append((title, detail if detail and detail != title else None))
+        if len(items) >= MAX_REFERENCES:
             break
-    if not refs:
+    return items
+
+
+def format_answer(answer: dict, lang: str) -> str:
+    """Brain's answer text plus a References block built from its citations.
+
+    Brain verifies every citation server-side, so the text is sent as written —
+    an LLM rewrite could detach a claim from the source that supports it.
+    """
+    body = (answer.get("text") or "").strip()
+    items = _reference_items(answer, lang)
+    if not items:
         return body
-    return f"{body}\n\n{text('references', lang)}\n" + "\n".join(refs)
+    lines = [f"- {title}" + (f", {detail}" if detail else "") for title, detail in items]
+    return f"{body}\n\n{text('references', lang)}\n" + "\n".join(lines)
+
+
+def answer_references(answer: dict, lang: str) -> dict | None:
+    """The same References block as data, for the widget's citation list.
+
+    The backend keeps it only while ``format_answer``'s text ends with exactly
+    this block (``referencesSuffix`` in src/messages/references.ts) — both are
+    built from ``_reference_items``, so they cannot drift apart.
+    """
+    items = _reference_items(answer, lang)
+    if not items or not (answer.get("text") or "").strip():
+        return None
+    return {
+        "heading": text("references", lang),
+        "items": [{"title": title, "detail": detail} for title, detail in items],
+    }
 
 
 async def _general_answer(job: RagJob) -> tuple[str, list]:
@@ -184,45 +206,51 @@ async def _general_answer(job: RagJob) -> tuple[str, list]:
     return f"{reply}\n\n{text('general_notice', job.language)}", usage
 
 
-async def _compose(job: RagJob) -> tuple[str, list, str]:
-    """(message, usage, outcome) for the job — never raises."""
+async def _compose(job: RagJob) -> tuple[str, list, str, dict | None]:
+    """(message, usage, outcome, references) for the job — never raises."""
     try:
         await brain.ensure_started()
         boot_deadline = time.monotonic() + settings.brain_boot_timeout_seconds
         if not await brain.wait_healthy(boot_deadline):
-            return text("failed", job.language), [], "boot_timeout"
+            return text("failed", job.language), [], "boot_timeout", None
 
         question_id = await brain.ask(job.question)
         answer_deadline = time.monotonic() + settings.brain_answer_timeout_seconds
         outcome = await brain.wait_answer(question_id, answer_deadline)
         if outcome is None:
-            return text("failed", job.language), [], "answer_timeout"
+            return text("failed", job.language), [], "answer_timeout", None
         if outcome.get("state") != "done" or not isinstance(outcome.get("answer"), dict):
             logger.warning("ismael_brain_failed", error=outcome.get("error"))
-            return text("failed", job.language), [], "brain_failed"
+            return text("failed", job.language), [], "brain_failed", None
 
         answer = outcome["answer"]
         if answer.get("state") == "answered" and (answer.get("text") or "").strip():
-            return format_answer(answer, job.language), [], "answered"
+            return (
+                format_answer(answer, job.language),
+                [],
+                "answered",
+                answer_references(answer, job.language),
+            )
 
         # insufficient_evidence / off_corpus: a short general answer, labelled.
         message, usage = await _general_answer(job)
-        return message, usage, f"general:{answer.get('state')}"
+        return message, usage, f"general:{answer.get('state')}", None
     except Exception as exc:  # noqa: BLE001 — the student still gets a reply
         logger.error("ismael_job_error", job_id=job.job_id, error=str(exc))
-        return text("failed", job.language), [], "error"
+        return text("failed", job.language), [], "error", None
 
 
 async def run(job: RagJob) -> None:
     started = time.monotonic()
     try:
-        message, usage, outcome = await _compose(job)
+        message, usage, outcome, references = await _compose(job)
         try:
             await backend_client.post_agent_message(
                 job.conversation_id,
                 job_id=job.job_id,
                 text=message,
                 turn_usage=usage,
+                references=references,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("ismael_delivery_failed", job_id=job.job_id, error=str(exc))

@@ -37,12 +37,14 @@ class FakeProvider:
         self.schemas: list[str] = []
         self.budgets: list = []
         self.messages: list = []
+        self.models: list[str] = []
         self.last_usage = SimpleNamespace(
             input_tokens=100, output_tokens=25, cached_input_tokens=0, reasoning_tokens=5
         )
 
     async def generate_structured(self, messages, model, schema, *, thinking_budget=None, temperature=0.0):
         self.schemas.append(schema.__name__)
+        self.models.append(model)
         self.budgets.append(thinking_budget)
         self.messages.append(messages)
         return self.outputs[schema]
@@ -115,6 +117,45 @@ async def test_thinking_budgets_are_per_node():
     provider = FakeProvider({TriageResult: _triage(), ExtractedTask: _task(), ReplyDraft: DRAFT})
     await _run(provider, {"email": _email()})
     assert provider.budgets == [0, 0, None]
+
+
+async def test_classification_runs_on_the_cheap_model_and_drafts_on_the_tenants():
+    provider = FakeProvider({TriageResult: _triage(), ExtractedTask: _task(), ReplyDraft: DRAFT})
+    graph = build_clara_graph(MemorySaver())
+    with patch.object(nodes, "get_provider", return_value=provider):
+        state = await graph.ainvoke(
+            {"mode": "inbound", "agent_code_name": "clara", "email": _email()},
+            {
+                "configurable": {
+                    "thread_id": "clara:t:m:k",
+                    "prompts": {},
+                    "llm_provider": "gemini",
+                    "llm_model": "gemini-3.5-flash",
+                    "llm_background_model": "gemini-3.1-flash-lite",
+                }
+            },
+        )
+    assert provider.models == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
+    # Usage is billed against the model that actually ran.
+    assert [row["model"] for row in state["turn_usage"]] == provider.models
+
+
+async def test_without_a_cheap_model_every_node_uses_the_tenants():
+    provider = FakeProvider({TriageResult: _triage(), ExtractedTask: _task(), ReplyDraft: DRAFT})
+    graph = build_clara_graph(MemorySaver())
+    with patch.object(nodes, "get_provider", return_value=provider):
+        await graph.ainvoke(
+            {"mode": "inbound", "agent_code_name": "clara", "email": _email()},
+            {
+                "configurable": {
+                    "thread_id": "clara:t:m:k2",
+                    "prompts": {},
+                    "llm_provider": "gemini",
+                    "llm_model": "gemini-3.5-flash",
+                }
+            },
+        )
+    assert provider.models == ["gemini-3.5-flash"] * 3
 
 
 async def test_invalid_evidence_and_injection_force_human_review():

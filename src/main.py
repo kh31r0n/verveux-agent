@@ -36,6 +36,7 @@ from .agents.backend_client import (
 from .agents.clara import runner as clara_runner
 from .agents.clara.runner import EmailDraftRequest, EmailFollowUpRequest, EmailSyncRequest
 from .agents.prospecting_nodes import DEFAULT_LOCATION
+from .providers.registry import background_model
 from .graphs.clara_graph import EMAIL_GRAPH_NAME
 from .services.gmail import GmailError
 from .services.serper import serper_call_count, start_serper_accounting
@@ -601,6 +602,22 @@ async def _stream_graph(
                         "stage_position": event_data.get("stage_position", 0),
                     })
 
+                elif event_kind == "pending_followup":
+                    yield _sse_event({
+                        "type": "pending_followup",
+                        "label": event_data.get("label", ""),
+                        "ttl_seconds": event_data.get("ttl_seconds", 0),
+                    })
+
+                elif event_kind == "quick_replies":
+                    # Forwarded untouched: the backend validates the options
+                    # against the reply's numbered suffix and never renumbers.
+                    yield _sse_event({
+                        "type": "quick_replies",
+                        "options": event_data.get("options", []),
+                        "allow_other": event_data.get("allow_other", False),
+                    })
+
             elif chunk_type == "updates":
                 update_data: dict = chunk.get("data", {})
 
@@ -827,7 +844,8 @@ async def prospecting_run(
     try:
         creds = await fetch_agent_credentials(req.tenant_id)
         llm_provider = creds.get("provider", "OPENAI").lower()
-        llm_model = creds.get("model") or ""
+        # Not a chat agent: the platform's cheap model for this provider.
+        llm_model = background_model(creds)
         if llm_provider == "openai":
             provider_config["openai_api_key"] = creds.get("apiKey", "")
         elif llm_provider == "anthropic":
@@ -950,7 +968,8 @@ async def enrichment_run(
     try:
         creds = await fetch_agent_credentials(req.tenant_id)
         llm_provider = creds.get("provider", "OPENAI").lower()
-        llm_model = creds.get("model") or ""
+        # Not a chat agent: the platform's cheap model for this provider.
+        llm_model = background_model(creds)
         if llm_provider == "openai":
             provider_config["openai_api_key"] = creds.get("apiKey", "")
         elif llm_provider == "anthropic":

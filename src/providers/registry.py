@@ -29,3 +29,20 @@ def resolve_model(config: RunnableConfig) -> str:
     return cfg.get("llm_model") or _DEFAULT_MODELS.get(
         provider_name, "gpt-4o"
     )
+
+
+def background_model(creds: dict) -> str:
+    """The model a non-chat agent runs on, from a credentials response.
+
+    The backend sends the platform's cheap model for the tenant's provider as
+    ``backgroundModel`` (aurora, sherlock, clara's triage and task extraction);
+    chat agents and clara's drafts keep ``model``. An older backend omits the
+    field, which means no split: the tenant's model everywhere.
+    """
+    return creds.get("backgroundModel") or creds.get("model") or ""
+
+
+def resolve_background_model(config: RunnableConfig) -> str:
+    """``llm_background_model`` from ``configurable``, else the tenant's model."""
+    cfg = config.get("configurable") or {}
+    return cfg.get("llm_background_model") or resolve_model(config)

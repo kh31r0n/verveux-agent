@@ -1218,3 +1218,48 @@ class TestDedupeCheck:
             )
         assert out["deduped_candidates"] == []
         assert out["metrics"]["duplicates"] == 1
+
+
+# ── Model: aurora is not a chat agent ────────────────────────────────────────
+
+
+def test_prospecting_run_uses_the_platforms_cheap_model_not_the_tenants() -> None:
+    from fastapi.testclient import TestClient
+
+    from src.main import app
+
+    creds = {
+        "provider": "GEMINI",
+        "model": "gemini-3.6-flash",
+        "backgroundModel": "gemini-3.1-flash-lite",
+        "geminiCredentials": {},
+        "geminiProjectId": "p",
+        "geminiLocation": "global",
+    }
+    run = AsyncMock()
+    with (
+        patch("src.main.get_or_compile_graph", AsyncMock(return_value=object())),
+        patch("src.main.fetch_agent_credentials", AsyncMock(return_value=creds)),
+        patch("src.main._run_prospecting", run),
+    ):
+        response = TestClient(app).post(
+            "/prospecting/run",
+            json={
+                "tenant_id": "t-1",
+                "run_id": "r-1",
+                "niche": {"key": "colegios", "label": "Colegios", "search_terms": ["colegio"]},
+            },
+            headers={"x-agent-key": settings.webhook_api_key},
+        )
+    assert response.status_code == 202
+    config = run.call_args.args[2]
+    assert config["configurable"]["llm_model"] == "gemini-3.1-flash-lite"
+
+
+def test_background_model_falls_back_to_the_tenants_for_an_older_backend() -> None:
+    from src.providers.registry import background_model
+
+    assert background_model({"model": "gemini-3.5-flash", "backgroundModel": "x-lite"}) == "x-lite"
+    assert background_model({"model": "gemini-3.5-flash"}) == "gemini-3.5-flash"
+    assert background_model({"model": "gemini-3.5-flash", "backgroundModel": None}) == "gemini-3.5-flash"
+    assert background_model({}) == ""

@@ -39,6 +39,7 @@ from ...observability import (
     email_sync_runs_total,
 )
 from ...providers.errors import ProviderConfigError, is_provider_config_error
+from ...providers.registry import background_model
 from ...schemas.email import ParsedEmail, SenderContext
 from ...services.email_parser import parse_gmail_raw_response
 from ...services.gmail import (
@@ -124,7 +125,13 @@ async def llm_configurable(tenant_id: str) -> dict:
     """
     creds = await fetch_agent_credentials(tenant_id)
     provider = str(creds.get("provider") or "").lower()
-    cfg: dict = {"llm_provider": provider, "llm_model": creds.get("model") or ""}
+    # Two models, one provider and credential: the tenant's for the drafts a
+    # customer reads, the platform's cheap one for triage and task extraction.
+    cfg: dict = {
+        "llm_provider": provider,
+        "llm_model": creds.get("model") or "",
+        "llm_background_model": background_model(creds),
+    }
     if provider in ("openai", "anthropic"):
         key = creds.get("apiKey") or ""
         if not key:

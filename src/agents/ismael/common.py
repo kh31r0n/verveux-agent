@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import unicodedata
 
@@ -80,3 +81,25 @@ def match_option(reply_text: str, options: list[list[str]]) -> int | None:
         if any(fold(label) and fold(label) in folded for label in labels)
     }
     return hits.pop() if len(hits) == 1 else None
+
+
+
+async def bounded_structured(
+    provider,
+    messages: list[dict],
+    model: str,
+    schema,
+    *,
+    timeout: float,
+    thinking_budget: int | None,
+):
+    """``provider.generate_structured`` with a deadline and a thinking cap.
+
+    ``asyncio.wait_for`` cancels the request when it overruns — that is what
+    frees the conversation's lock — and raises, so the caller's ``except``
+    sends its fallback reply within the backend's 60 s turn.
+    """
+    return await asyncio.wait_for(
+        provider.generate_structured(messages, model, schema, thinking_budget=thinking_budget),
+        timeout=timeout,
+    )

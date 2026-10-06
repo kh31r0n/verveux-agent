@@ -19,6 +19,7 @@ from __future__ import annotations
 import structlog
 from langchain_core.runnables import RunnableConfig
 
+from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
 from ...providers.registry import get_provider, resolve_model
@@ -35,7 +36,7 @@ from ..utils import (
 )
 from . import rag_job, teacher
 from .faq import faq_candidates, faq_candidates_block, pick_faq
-from .common import DEFAULT_PERSONA, history_messages, match_option
+from .common import bounded_structured, DEFAULT_PERSONA, history_messages, match_option
 from .common import ismael_dict as _ismael
 from .common import reply as _reply
 from .prompts import SURVEY_PROMPT, TRIAGE_PROMPT
@@ -123,7 +124,8 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
     try:
         provider = get_provider(config)
         model = resolve_model(config)
-        result = await provider.generate_structured(
+        result = await bounded_structured(
+            provider,
             [
                 {
                     "role": "system",
@@ -134,6 +136,8 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
             ],
             model,
             TriageResult,
+            timeout=settings.ismael_timeout_triage_seconds,
+            thinking_budget=settings.ismael_thinking_classify,
         )
         usage.append(make_usage_record(node="ismael_triage", provider=provider, model=model))
     except Exception as exc:  # noqa: BLE001 — Brain itself judges off-corpus questions
@@ -217,10 +221,13 @@ async def _classify_survey_answer(
     try:
         provider = get_provider(config)
         model = resolve_model(config)
-        result = await provider.generate_structured(
+        result = await bounded_structured(
+            provider,
             [{"role": "system", "content": system}, {"role": "user", "content": reply}],
             model,
             SurveyAnswer,
+            timeout=settings.ismael_timeout_step_seconds,
+            thinking_budget=settings.ismael_thinking_classify,
         )
         usage = [make_usage_record(node="ismael_survey", provider=provider, model=model)]
     except Exception as exc:  # noqa: BLE001 — an unreadable answer is just "no_answer"

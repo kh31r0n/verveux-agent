@@ -17,13 +17,14 @@ from __future__ import annotations
 import structlog
 from langchain_core.runnables import RunnableConfig
 
+from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
 from ...providers.registry import get_provider, resolve_model
 from ...schemas.ismael import MoodleSupportOutcome, MoodleSupportResult
 from ...usage import make_usage_record
 from ..utils import format_user_context, latest_user_text, resolve_persona, resolve_prompt
-from .common import DEFAULT_PERSONA, history_messages, ismael_dict, reply, user_ctx
+from .common import bounded_structured, DEFAULT_PERSONA, history_messages, ismael_dict, reply, user_ctx
 from .prompts import MOODLE_SUPPORT_PROMPT
 from .texts import lang_of, text
 
@@ -95,7 +96,8 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     try:
         provider = get_provider(config)
         model = resolve_model(config)
-        result = await provider.generate_structured(
+        result = await bounded_structured(
+            provider,
             [
                 {"role": "system", "content": system},
                 *history_messages(state),
@@ -103,6 +105,8 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
             ],
             model,
             MoodleSupportResult,
+            timeout=settings.ismael_timeout_answer_seconds,
+            thinking_budget=settings.ismael_thinking_support,
         )
         usage.append(make_usage_record(node="ismael_moodle_support", provider=provider, model=model))
     except Exception as exc:  # noqa: BLE001 — fall back to the ticket, never to silence

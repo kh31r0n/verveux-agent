@@ -168,6 +168,18 @@ class Settings(BaseSettings):
     clara_max_body_chars: int = 12_000
     clara_max_messages_per_sync: int = 25
     clara_initial_backfill_query: str = "in:inbox newer_than:1d"
+    # ismael: every chat-turn LLM call is bounded so a slow or hung Gemini
+    # request can never outlive the backend's 60 s turn — a call that did
+    # (no timeout, unbounded thinking) kept the conversation's lock for ~5 min
+    # and every later message timed out behind it (2026-10-06). Budgets: the
+    # classifiers and the FAQ/draft rewrites need no thinking; support gets a
+    # little. Worst path (step + triage + support + settle) stays under 60 s.
+    ismael_timeout_triage_seconds: float = 15.0
+    ismael_timeout_step_seconds: float = 10.0
+    ismael_timeout_answer_seconds: float = 25.0
+    ismael_thinking_classify: int | None = 0
+    ismael_thinking_support: int | None = 1024
+    ismael_thinking_answer: int | None = 0
     clara_thinking_triage: int | None = 0
     clara_thinking_extract_task: int | None = 0
     clara_thinking_draft: int | None = None

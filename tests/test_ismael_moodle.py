@@ -568,3 +568,42 @@ class TestFaqs:
         assert reply == "Del 1 al 5 de diciembre."
         user_msg = next(m for name, m in b["provider"].calls if name == "FaqAnswer")[-1]
         assert user_msg["content"] == "cuándo son los exámenes finales"
+
+
+async def test_a_hung_model_call_times_out_and_the_turn_still_replies(b, monkeypatch):
+    """2026-10-06: a support call that never returned held the conversation's
+    lock for minutes; now it is cut off and the fallback goes out in time."""
+    import asyncio
+
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "ismael_timeout_answer_seconds", 0.05)
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "Course not found")
+
+    async def hang(messages, model, schema, **kwargs):
+        if schema is MoodleSupportResult:
+            await asyncio.sleep(3600)
+        return b["provider"].results[schema]
+
+    b["provider"].generate_structured = hang
+    graph = build_ismael_graph(MemorySaver())
+    nodes, reply, _ = await asyncio.wait_for(go(graph, "h1", "El error es Course not found"), 5)
+    assert nodes == ["ismael_triage", "ismael_moodle_support"]
+    assert reply.startswith(text("support_failed", "es"))
+    assert "https://ryca.unidadeducativa.org/soporte" in reply
+
+
+async def test_every_ismael_call_caps_thinking(b):
+    seen = []
+    original = b["provider"].generate_structured
+
+    async def spy(messages, model, schema, **kwargs):
+        seen.append((schema.__name__, kwargs.get("thinking_budget")))
+        return await original(messages, model, schema)
+
+    b["provider"].generate_structured = spy
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "notas")
+    b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="ok")
+    graph = build_ismael_graph(MemorySaver())
+    await go(graph, "h2", "¿dónde veo mis notas?")
+    assert seen == [("TriageResult", 0), ("MoodleSupportResult", 1024)]

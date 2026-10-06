@@ -31,6 +31,7 @@ import time
 import structlog
 from langchain_core.runnables import RunnableConfig
 
+from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
 from ...providers.registry import get_provider, resolve_model
@@ -38,7 +39,7 @@ from ...schemas.ismael import TeacherDraft, TeacherStepAnswer, TeacherTopic
 from ...usage import make_usage_record
 from .. import backend_client
 from ..utils import latest_user_text
-from .common import ask_options, fold, ismael_dict, match_option, reply, user_ctx
+from .common import bounded_structured, ask_options, fold, ismael_dict, match_option, reply, user_ctx
 from .prompts import STEP_PROMPT, TEACHER_DRAFT_PROMPT
 from .texts import lang_of, text
 
@@ -150,10 +151,13 @@ class _Turn:
         try:
             provider = get_provider(self.config)
             model = resolve_model(self.config)
-            result = await provider.generate_structured(
+            result = await bounded_structured(
+                provider,
                 [{"role": "system", "content": system}, {"role": "user", "content": self.text}],
                 model,
                 TeacherStepAnswer,
+                timeout=settings.ismael_timeout_step_seconds,
+                thinking_budget=settings.ismael_thinking_classify,
             )
             self.usage.append(
                 make_usage_record(node="ismael_teacher_step", provider=provider, model=model)
@@ -357,10 +361,13 @@ async def _draft(turn: _Turn, content: str, change: str = "") -> str:
     try:
         provider = get_provider(turn.config)
         model = resolve_model(turn.config)
-        result = await provider.generate_structured(
+        result = await bounded_structured(
+            provider,
             [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(lines)}],
             model,
             TeacherDraft,
+            timeout=settings.ismael_timeout_answer_seconds,
+            thinking_budget=settings.ismael_thinking_answer,
         )
         turn.usage.append(make_usage_record(node="ismael_teacher_draft", provider=provider, model=model))
         message = result.message.strip()

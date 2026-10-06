@@ -7,6 +7,8 @@ the background job (`rag_job`). State lives in one dict, ``state["ismael"]``:
     pending_question  the question the survey is holding / the job is answering
     survey_step       0 not started · 1-3 waiting for answer n · 4 done
     survey_answers    {level, topic, intendedUse} → option key or "no_answer"
+    teacher           the "contact my teacher" flow (see teacher.py); its
+                      ``step`` latches triage like ``survey_step`` does
 
 The survey is asked once per contact: the backend reports
 ``user_context.ismael_survey_done`` once the answers are stored.
@@ -14,13 +16,8 @@ The survey is asked once per contact: the backend reports
 
 from __future__ import annotations
 
-import re
-import unicodedata
-
 import structlog
-from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.config import get_stream_writer
 
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
@@ -36,24 +33,24 @@ from ..utils import (
     resolve_persona,
     resolve_prompt,
 )
-from . import rag_job
+from . import rag_job, teacher
+from .faq import faq_candidates, faq_candidates_block, pick_faq
+from .common import DEFAULT_PERSONA, history_messages, match_option
+from .common import ismael_dict as _ismael
+from .common import reply as _reply
 from .prompts import SURVEY_PROMPT, TRIAGE_PROMPT
 from .texts import NO_ANSWER, SURVEY, SurveyStep, lang_of, text
 
 logger = structlog.get_logger(__name__)
 
-DEFAULT_PERSONA = "Ismael"
 SURVEY_DONE = len(SURVEY) + 1
 
-
-def _ismael(state: AgentState) -> dict:
-    value = state.get("ismael")
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _reply(message: str, **updates) -> dict:
-    get_stream_writer()({"type": "token", "content": message})
-    return {"messages": [AIMessage(content=message)], **updates}
+# Intents that are answered even while a Brain job is running: they never
+# touch the library, so the student is not made to wait for it.
+_NOT_BLOCKED_BY_JOB = {IsmaelIntent.MOODLE_SUPPORT, IsmaelIntent.CONTACT_TEACHER}
+# Intents a matching FAQ answers directly. A greeting stays a greeting; a
+# teacher request keeps its flow and offers the FAQ as the "help first".
+_FAQ_INTENTS = {IsmaelIntent.THEOLOGY, IsmaelIntent.MOODLE_SUPPORT, IsmaelIntent.OTHER}
 
 
 def _reply_while_consulting(message: str, lang: str, **updates) -> dict:
@@ -111,28 +108,28 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
     if 1 <= ismael.get("survey_step", 0) < SURVEY_DONE:
         return {"ismael_route": "survey"}
 
+    if teacher.flow_open(ismael):
+        return {"ismael_route": "teacher"}
+    ismael.pop("teacher", None)  # an expired flow is forgotten, not resumed
+
     running = await rag_job.running_job(
         state.get("tenant_id") or "", state.get("conversation_id") or ""
     )
-    if running:
-        ismael["pending_question"] = running.get("question") or ismael.get("pending_question", "")
-        return {"ismael_route": "pending", "ismael": ismael}
 
     user_text = latest_user_text(state)
+    candidates = faq_candidates(state)
     system = resolve_prompt(config, "THEOLOGY_TRIAGE", TRIAGE_PROMPT, state)
-    history = [
-        {"role": "assistant" if getattr(m, "type", "") == "ai" else "user", "content": m.content}
-        for m in (state.get("messages") or [])[-7:-1]
-        if getattr(m, "content", None)
-    ]
     usage: list = []
     try:
         provider = get_provider(config)
         model = resolve_model(config)
         result = await provider.generate_structured(
             [
-                {"role": "system", "content": system + format_user_context(state)},
-                *history,
+                {
+                    "role": "system",
+                    "content": system + format_user_context(state) + faq_candidates_block(candidates),
+                },
+                *history_messages(state),
                 {"role": "user", "content": user_text},
             ],
             model,
@@ -143,12 +140,28 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
         logger.warning("ismael_triage_failed", error=str(exc))
         result = TriageResult(intent=IsmaelIntent.THEOLOGY, question=user_text)
 
+    faq = pick_faq(candidates, result.faq_id)
+    answered_by_faq = faq is not None and result.intent in _FAQ_INTENTS
+
+    if running and result.intent not in _NOT_BLOCKED_BY_JOB and not answered_by_faq:
+        ismael["pending_question"] = running.get("question") or ismael.get("pending_question", "")
+        return {"ismael_route": "pending", "ismael": ismael, "turn_usage": usage}
+
     route = {
         IsmaelIntent.THEOLOGY: "start",
+        IsmaelIntent.MOODLE_SUPPORT: "moodle_support",
+        IsmaelIntent.CONTACT_TEACHER: "teacher",
         IsmaelIntent.GREETING: "greeting",
         IsmaelIntent.OTHER: "off_topic",
     }[result.intent]
     ismael["question"] = (result.question or user_text).strip()
+    if answered_by_faq:
+        # The institution's curated answer wins — a theology question it
+        # covers never reaches Brain, and asks no survey.
+        ismael["faq"] = faq
+        route = "faq"
+    if result.intent == IsmaelIntent.CONTACT_TEACHER:
+        ismael["teacher"] = teacher.new_flow(result.question, result.teacher_topic, faq=faq)
     return {
         "ismael_route": route,
         "intent": result.intent.value,
@@ -188,30 +201,11 @@ async def ismael_start_node(state: AgentState, config: RunnableConfig) -> dict:
 # ── Survey ───────────────────────────────────────────────────────────────────
 
 
-def _fold(value: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", value.lower())
-    return "".join(c for c in decomposed if not unicodedata.combining(c)).strip()
-
-
 def parse_survey_answer(step_index: int, reply: str) -> str | None:
     """Option key from a number or an option label; None when it takes an LLM."""
     step = SURVEY[step_index]
-    folded = _fold(reply)
-    # A quick-reply button sends its label verbatim: match it exactly first,
-    # so a click never depends on the substring heuristics or on the LLM.
-    for key, es, en in step.options:
-        if folded in (_fold(es), _fold(en)):
-            return key
-    number = re.fullmatch(r"\D{0,12}?(\d{1,2})\D{0,12}", folded)
-    if number:
-        n = int(number.group(1))
-        return step.options[n - 1][0] if 1 <= n <= len(step.options) else None
-    hits = {
-        key
-        for key, es, en in step.options
-        if _fold(es) in folded or _fold(en) in folded
-    }
-    return hits.pop() if len(hits) == 1 else None
+    index = match_option(reply, [[es, en] for _, es, en in step.options])
+    return step.options[index][0] if index is not None else None
 
 
 async def _classify_survey_answer(

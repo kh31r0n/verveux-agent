@@ -177,14 +177,14 @@ class TestFirstQuestion:
 
 
 class TestOtherBranches:
-    async def test_running_job_short_circuits_to_pending_without_an_llm_call(self, boundary):
+    async def test_running_job_holds_theology_questions_in_pending(self, boundary):
         rag_job._local_jobs["c1"] = ("job-1", "¿Qué es la gracia?", time.monotonic())
         graph = build_ismael_graph(MemorySaver())
         nodes, reply = await _turn(graph, "th6", "¿ya tienes la respuesta?")
 
         assert nodes == ["ismael_triage", "ismael_pending"]
         assert "¿Qué es la gracia?" in reply
-        assert boundary["triage"].calls == 0
+        boundary["spawn"].assert_not_called()
 
     async def test_off_topic(self, boundary):
         boundary["triage"]._result = TriageResult(intent=IsmaelIntent.OTHER)

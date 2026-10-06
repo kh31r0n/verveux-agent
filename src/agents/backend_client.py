@@ -266,6 +266,42 @@ async def post_agent_message(
     )
 
 
+async def get_moodle_teachers(conversation_id: str) -> dict:
+    """GET /internal/conversations/:id/moodle/teachers — the student's courses
+    and each course's teachers (with Moodle conversation links), derived by the
+    backend from the conversation's own contact. ``messagingEnabled`` says
+    whether ismael may send, or only suggest the link.
+    """
+    result = await _get(f"/api/v1/internal/conversations/{conversation_id}/moodle/teachers")
+    return result if isinstance(result, dict) else {}
+
+
+async def post_teacher_message(
+    conversation_id: str,
+    *,
+    teacher_id: str,
+    course_id: int,
+    text: str,
+    idempotency_key: str,
+    language: str,
+) -> dict:
+    """POST /internal/conversations/:id/moodle/teacher-messages — deliver the
+    student's confirmed message to a teacher through Moodle's own messaging,
+    with the student as sender. Refusals come back as 200 + ``status: FAILED``
+    and a ``code``; ``idempotency_key`` makes a replay return the first result.
+    """
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/moodle/teacher-messages",
+        json={
+            "teacherId": teacher_id,
+            "courseId": course_id,
+            "text": text,
+            "idempotencyKey": idempotency_key,
+            "language": language,
+        },
+    )
+
+
 # ─── Prospecting (aurora — /internal/prospecting/*) ─────────────────────────
 
 

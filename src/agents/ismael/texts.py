@@ -139,6 +139,10 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": "Lo siento, no pude revisar tu consulta del aula virtual en este momento.",
         "en": "Sorry, I couldn't look into your virtual-classroom question right now.",
     },
+    "support_redirect_fallback": {
+        "es": "Para ese trámite comunícate directamente con la institución: {contacts}.",
+        "en": "For that, please contact the institution directly: {contacts}.",
+    },
     "ticket_intro": {
         "es": "Para abrir el ticket entra a {url} y completa el formulario con estos datos:",
         "en": "To open the ticket, go to {url} and fill in the form with these details:",

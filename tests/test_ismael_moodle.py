@@ -606,7 +606,7 @@ async def test_every_ismael_call_caps_thinking(b):
     b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="ok")
     graph = build_ismael_graph(MemorySaver())
     await go(graph, "h2", "¿dónde veo mis notas?")
-    assert seen == [("TriageResult", 0), ("MoodleSupportResult", 1024)]
+    assert seen == [("TriageResult", 0), ("MoodleSupportResult", 0)]
 
 
 class TestTriageFallback:
@@ -648,3 +648,12 @@ def test_fallback_intent_reads_the_newest_fragment_first():
     assert fallback_intent(burst[:2]) == IsmaelIntent.CONTACT_TEACHER
     assert fallback_intent(["¿Quién fue el apóstol Pedro?"]) == IsmaelIntent.THEOLOGY
     assert fallback_intent([]) == IsmaelIntent.THEOLOGY
+
+
+async def test_support_fallback_sends_an_admin_question_to_the_contacts_not_the_form(b):
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "cómo pago la matrícula")
+    b["provider"].results[MoodleSupportResult] = TimeoutError()
+    graph = build_ismael_graph(MemorySaver())
+    _, reply, _ = await go(graph, "sf1", "¿Cómo pago la matrícula del próximo semestre?")
+    assert "uebogota.matriculas@casaroca.org" in reply
+    assert "ryca.unidadeducativa.org/soporte" not in reply

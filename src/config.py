@@ -172,8 +172,9 @@ class Settings(BaseSettings):
     # request can never outlive the backend's 60 s turn — a call that did
     # (no timeout, unbounded thinking) kept the conversation's lock for ~5 min
     # and every later message timed out behind it (2026-10-06). Budgets: the
-    # classifiers and the FAQ/draft rewrites need no thinking; support gets a
-    # little. Worst path (step + triage + support + settle) stays under 60 s.
+    # classifiers and the FAQ/draft rewrites need no thinking, and support
+    # none either (an eval on Vertex showed no quality gain from 1024 tokens,
+    # only latency). Worst path (step + triage + answer + settle) < 60 s.
     # Vertex answered a 66-token triage in 15 s once (and in 1.5 s minutes
     # later): the triage deadline leaves room for that, and a miss still
     # routes by keyword (common.fallback_intent) instead of to the library.
@@ -181,7 +182,7 @@ class Settings(BaseSettings):
     ismael_timeout_step_seconds: float = 8.0
     ismael_timeout_answer_seconds: float = 25.0
     ismael_thinking_classify: int | None = 0
-    ismael_thinking_support: int | None = 1024
+    ismael_thinking_support: int | None = 0
     ismael_thinking_answer: int | None = 0
     clara_thinking_triage: int | None = 0
     clara_thinking_extract_task: int | None = 0

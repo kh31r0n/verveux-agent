@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage
 from langgraph.config import get_stream_writer
 
 from ...graphs.state import AgentState
+from ...schemas.ismael import IsmaelIntent
 from ..utils import emit_quick_replies
 
 DEFAULT_PERSONA = "Ismael"
@@ -103,3 +104,39 @@ async def bounded_structured(
         provider.generate_structured(messages, model, schema, thinking_budget=thinking_budget),
         timeout=timeout,
     )
+
+
+# Keyword fallback for when triage's LLM call fails or times out. Matched on
+# folded text (no accents, lower case) as whole-word prefixes. Deliberately
+# small: it only has to beat "everything is theology", which sent a Moodle
+# error to the library on 2026-10-06.
+_TEACHER_WORDS = ("profesor", "profe", "docente", "tutor", "maestr")
+_MOODLE_WORDS = (
+    "moodle", "aula virtual", "plataforma", "error", "contrasena", "usuario",
+    "matricul", "inscrib", "inscripc", "tarea", "entrega", "calificac", "nota",
+    "cuestionario", "examen", "foro", "acceso", "ingresar", "iniciar sesion",
+    "login", "curso", "pago", "certificado", "no me deja", "no puedo",
+    "no carga", "no abre", "no aparece",
+)
+
+
+def _mentions(folded: str, words: tuple[str, ...]) -> bool:
+    return any(re.search(r"\b" + re.escape(word), folded) for word in words)
+
+
+def fallback_intent(fragments: list[str]) -> IsmaelIntent:
+    """Best guess at the intent without an LLM, newest fragment first.
+
+    The newest message decides when it says something recognizable, because
+    an unanswered burst can still hold older fragments from failed turns.
+    A teacher request wins over a Moodle problem within one fragment (it
+    usually comes with one). Anything unrecognized stays theology, where
+    Brain judges off-corpus questions itself.
+    """
+    for fragment in reversed(fragments):
+        folded = fold(fragment)
+        if _mentions(folded, _TEACHER_WORDS):
+            return IsmaelIntent.CONTACT_TEACHER
+        if _mentions(folded, _MOODLE_WORDS):
+            return IsmaelIntent.MOODLE_SUPPORT
+    return IsmaelIntent.THEOLOGY

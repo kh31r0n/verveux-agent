@@ -607,3 +607,44 @@ async def test_every_ismael_call_caps_thinking(b):
     graph = build_ismael_graph(MemorySaver())
     await go(graph, "h2", "¿dónde veo mis notas?")
     assert seen == [("TriageResult", 0), ("MoodleSupportResult", 1024)]
+
+
+class TestTriageFallback:
+    """2026-10-06: a triage timeout routed "Tengo un error con moodle" to the
+    library. A failed triage now routes by keyword, newest fragment first."""
+
+    async def test_a_moodle_error_goes_to_support_when_triage_fails(self, b):
+        b["provider"].results[TriageResult] = TimeoutError()
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="Revisemos el error.")
+        graph = build_ismael_graph(MemorySaver())
+        nodes, reply, _ = await go(graph, "fb1", "Tengo un error con moodle")
+        assert nodes == ["ismael_triage", "ismael_moodle_support"]
+        b["spawn"].assert_not_called()
+
+    async def test_a_teacher_request_opens_the_teacher_flow_when_triage_fails(self, b):
+        b["provider"].results[TriageResult] = TimeoutError()
+        graph = build_ismael_graph(MemorySaver())
+        nodes, reply, _ = await go(graph, "fb2", "Me gustaría comunicarme con el Profesor Jaime Quiceno")
+        assert nodes == ["ismael_triage", "ismael_teacher"]
+        assert reply.startswith(text("teacher_offer", "es"))
+
+    async def test_a_theology_question_still_reaches_the_library(self, b):
+        b["provider"].results[TriageResult] = TimeoutError()
+        graph = build_ismael_graph(MemorySaver())
+        nodes, _, _ = await go(graph, "fb3", "¿Qué dice Pablo sobre la justificación?")
+        assert nodes == ["ismael_triage", "ismael_start"]
+        b["spawn"].assert_awaited_once()
+
+
+def test_fallback_intent_reads_the_newest_fragment_first():
+    from src.agents.ismael.common import fallback_intent
+
+    burst = [
+        "El error que me aparece es Course not found",
+        "Me gustaría comunicarme con el Profesor Jaime Quiceno",
+        "Tengo un error con moodle",
+    ]
+    assert fallback_intent(burst) == IsmaelIntent.MOODLE_SUPPORT
+    assert fallback_intent(burst[:2]) == IsmaelIntent.CONTACT_TEACHER
+    assert fallback_intent(["¿Quién fue el apóstol Pedro?"]) == IsmaelIntent.THEOLOGY
+    assert fallback_intent([]) == IsmaelIntent.THEOLOGY

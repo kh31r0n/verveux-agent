@@ -30,13 +30,20 @@ from ..utils import (
     emit_pending_followup,
     emit_quick_replies,
     format_user_context,
+    latest_user_messages,
     latest_user_text,
     resolve_persona,
     resolve_prompt,
 )
 from . import rag_job, teacher
 from .faq import faq_candidates, faq_candidates_block, pick_faq
-from .common import bounded_structured, DEFAULT_PERSONA, history_messages, match_option
+from .common import (
+    DEFAULT_PERSONA,
+    bounded_structured,
+    fallback_intent,
+    history_messages,
+    match_option,
+)
 from .common import ismael_dict as _ismael
 from .common import reply as _reply
 from .prompts import SURVEY_PROMPT, TRIAGE_PROMPT
@@ -140,9 +147,15 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
             thinking_budget=settings.ismael_thinking_classify,
         )
         usage.append(make_usage_record(node="ismael_triage", provider=provider, model=model))
-    except Exception as exc:  # noqa: BLE001 — Brain itself judges off-corpus questions
-        logger.warning("ismael_triage_failed", error=str(exc))
-        result = TriageResult(intent=IsmaelIntent.THEOLOGY, question=user_text)
+    except Exception as exc:  # noqa: BLE001 — a keyword guess beats no reply
+        fragments = latest_user_messages(state)
+        intent = fallback_intent(fragments)
+        logger.warning(
+            "ismael_triage_failed",
+            error=str(exc) or type(exc).__name__,
+            fallback_intent=intent.value,
+        )
+        result = TriageResult(intent=intent, question=user_text)
 
     faq = pick_faq(candidates, result.faq_id)
     answered_by_faq = faq is not None and result.intent in _FAQ_INTENTS

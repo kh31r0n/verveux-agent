@@ -247,6 +247,30 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": "Puedes escribirle a {teacher} directamente aquí: {url}",
         "en": "You can write to {teacher} directly here: {url}",
     },
+    "teacher_email_given": {
+        "es": "Puedes escribirle a {teacher} a su correo: {email}",
+        "en": "You can write to {teacher} at: {email}",
+    },
+    "teacher_email_hidden": {
+        "es": "{teacher} no tiene su correo visible para los estudiantes, así que no puedo dártelo.",
+        "en": "{teacher} does not show their email to students, so I can't give it to you.",
+    },
+    "teacher_email_failed": {
+        "es": "No pude obtener el correo de {teacher} en este momento.",
+        "en": "I couldn't get {teacher}'s email right now.",
+    },
+    "teacher_fallback_contacts": {
+        "es": "Puedes pedir ayuda a la institución: {contacts}.",
+        "en": "You can ask the institution for help: {contacts}.",
+    },
+    "teacher_fallback_support": {
+        "es": "Puedes pedir ayuda a la institución aquí: {url}",
+        "en": "You can ask the institution for help here: {url}",
+    },
+    "teacher_fallback_generic": {
+        "es": "Puedes pedir el contacto en la secretaría de tu institución.",
+        "en": "You can ask your institution's office for a way to contact them.",
+    },
     "teacher_compose": {
         "es": "¿Qué quieres decirle a {teacher}?",
         "en": "What would you like to tell {teacher}?",

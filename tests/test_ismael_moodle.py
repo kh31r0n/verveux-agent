@@ -129,8 +129,12 @@ def b():
                 return_value={"status": "SENT", "teacherName": "Prof. Juan", "messageUrl": JUAN["messageUrl"]}
             ),
         ) as send,
+        patch(
+            "src.agents.ismael.teacher.backend_client.get_teacher_email",
+            new=AsyncMock(return_value={"status": "OK", "email": "juan@colegio.edu", "teacherName": "Prof. Juan"}),
+        ) as email,
     ):
-        yield {"provider": provider, "spawn": spawn, "lookup": lookup, "send": send}
+        yield {"provider": provider, "spawn": spawn, "lookup": lookup, "send": send, "email": email}
 
 
 def triage(b, intent, question="", topic=TeacherTopic.NONE):
@@ -372,13 +376,46 @@ class TestSuggestAndPick:
         assert reply == text("teacher_self_link", "es", teacher="Prof. Juan", url=JUAN["messageUrl"])
         b["send"].assert_not_called()
 
-    async def test_messaging_off_skips_the_choice_and_only_suggests(self, b):
+    async def test_messaging_off_skips_the_choice_and_gives_the_teachers_email(self, b):
         b["lookup"].return_value = teachers_view(messagingEnabled=False)
         triage(b, IsmaelIntent.CONTACT_TEACHER)
         graph = build_ismael_graph(MemorySaver())
         await go(graph, "p2", "quiero hablar con mi profesor")
         _, reply, _ = await go(graph, "p2", "2")
+        assert reply == text("teacher_email_given", "es", teacher="Prof. Juan", email="juan@colegio.edu")
+        b["email"].assert_awaited_once_with("c1", teacher_id="5", course_id=7)
+        b["send"].assert_not_called()
+
+    async def test_a_hidden_email_is_not_given_and_points_to_the_institution(self, b):
+        b["lookup"].return_value = teachers_view(messagingEnabled=False)
+        b["email"].return_value = {"status": "FAILED", "code": "email_hidden"}
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2h", "quiero hablar con mi profesor")
+        _, reply, _ = await go(graph, "p2h", "no")
+        assert reply.startswith(text("teacher_email_hidden", "es", teacher="Prof. Juan"))
+        assert "uebogota.matriculas@casaroca.org" in reply
+        assert "@colegio.edu" not in reply
+
+    async def test_an_email_lookup_error_still_offers_a_way(self, b):
+        b["lookup"].return_value = teachers_view(messagingEnabled=False)
+        b["email"].side_effect = RuntimeError("down")
+        ctx = {k: v for k, v in CTX.items() if k != "lms_other_contacts"}
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2e", "quiero hablar con mi profesor", ctx=ctx)
+        _, reply, _ = await go(graph, "p2e", "no", ctx=ctx)
+        assert reply.startswith(text("teacher_email_failed", "es", teacher="Prof. Juan"))
+        assert "https://ryca.unidadeducativa.org/soporte" in reply
+
+    async def test_with_messaging_on_writing_yourself_still_gets_the_link_not_the_email(self, b):
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2l", "quiero hablar con mi profesor")
+        await go(graph, "p2l", "no")
+        _, reply, _ = await go(graph, "p2l", "Le escribo yo")
         assert reply == text("teacher_self_link", "es", teacher="Prof. Juan", url=JUAN["messageUrl"])
+        b["email"].assert_not_called()
 
     async def test_no_current_course_asks_the_course_then_the_teacher(self, b):
         b["lookup"].return_value = teachers_view(currentCourseId=None)

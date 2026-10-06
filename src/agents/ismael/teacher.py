@@ -34,7 +34,7 @@ from langchain_core.runnables import RunnableConfig
 from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
-from ...providers.registry import get_provider, resolve_model
+from ...providers.registry import get_provider, resolve_background_model
 from ...schemas.ismael import TeacherDraft, TeacherStepAnswer, TeacherTopic
 from ...usage import make_usage_record
 from .. import backend_client
@@ -150,7 +150,7 @@ class _Turn:
         system = STEP_PROMPT.format(question=question, options=options)
         try:
             provider = get_provider(self.config)
-            model = resolve_model(self.config)
+            model = resolve_background_model(self.config)
             result = await bounded_structured(
                 provider,
                 [{"role": "system", "content": system}, {"role": "user", "content": self.text}],
@@ -360,7 +360,7 @@ async def _draft(turn: _Turn, content: str, change: str = "") -> str:
     system = TEACHER_DRAFT_PROMPT.format(language_rule=_language_rule(turn.lang))
     try:
         provider = get_provider(turn.config)
-        model = resolve_model(turn.config)
+        model = resolve_background_model(turn.config)
         result = await bounded_structured(
             provider,
             [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(lines)}],

@@ -22,7 +22,7 @@ from langchain_core.runnables import RunnableConfig
 from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
-from ...providers.registry import get_provider, resolve_model
+from ...providers.registry import get_provider, resolve_background_model
 from ...schemas.ismael import IsmaelIntent, SurveyAnswer, TriageResult
 from ...usage import make_usage_record
 from .. import backend_client
@@ -130,7 +130,7 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
     usage: list = []
     try:
         provider = get_provider(config)
-        model = resolve_model(config)
+        model = resolve_background_model(config)
         result = await bounded_structured(
             provider,
             [
@@ -233,7 +233,7 @@ async def _classify_survey_answer(
     system = SURVEY_PROMPT.format(question=step.question["es"], options=options)
     try:
         provider = get_provider(config)
-        model = resolve_model(config)
+        model = resolve_background_model(config)
         result = await bounded_structured(
             provider,
             [{"role": "system", "content": system}, {"role": "user", "content": reply}],

@@ -20,7 +20,7 @@ from langchain_core.runnables import RunnableConfig
 from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
-from ...providers.registry import get_provider, resolve_model
+from ...providers.registry import get_provider, resolve_background_model
 from ...schemas.ismael import FaqAnswer
 from ...usage import make_usage_record
 from ..utils import latest_user_text, resolve_persona, resolve_prompt
@@ -85,7 +85,7 @@ async def ismael_faq_node(state: AgentState, config: RunnableConfig) -> dict:
     message = answer
     try:
         provider = get_provider(config)
-        model = resolve_model(config)
+        model = resolve_background_model(config)
         result = await bounded_structured(
             provider,
             [

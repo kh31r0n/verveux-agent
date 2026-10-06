@@ -112,10 +112,10 @@ def b():
         patch("src.agents.ismael.support.get_provider", return_value=provider),
         patch("src.agents.ismael.teacher.get_provider", return_value=provider),
         patch("src.agents.ismael.faq.get_provider", return_value=provider),
-        patch("src.agents.ismael.faq.resolve_model", return_value="m"),
-        patch("src.agents.ismael.nodes.resolve_model", return_value="m"),
-        patch("src.agents.ismael.support.resolve_model", return_value="m"),
-        patch("src.agents.ismael.teacher.resolve_model", return_value="m"),
+        patch("src.agents.ismael.faq.resolve_background_model", return_value="m"),
+        patch("src.agents.ismael.nodes.resolve_background_model", return_value="m"),
+        patch("src.agents.ismael.support.resolve_background_model", return_value="m"),
+        patch("src.agents.ismael.teacher.resolve_background_model", return_value="m"),
         patch("src.agents.ismael.nodes.rag_job.spawn", new=AsyncMock()) as spawn,
         patch("src.agents.ismael.nodes.rag_job.start_host_in_background"),
         patch("src.agents.ismael.rag_job.get_store_or_none", return_value=None),
@@ -657,3 +657,95 @@ async def test_support_fallback_sends_an_admin_question_to_the_contacts_not_the_
     _, reply, _ = await go(graph, "sf1", "¿Cómo pago la matrícula del próximo semestre?")
     assert "uebogota.matriculas@casaroca.org" in reply
     assert "ryca.unidadeducativa.org/soporte" not in reply
+
+
+# ── Model: ismael's chat turn runs on the platform's background model ───────
+
+
+class ModelSpy(SchemaProvider):
+    def __init__(self):
+        super().__init__()
+        self.models: list[tuple[str, str]] = []
+
+    async def generate_structured(self, messages, model, schema, **kwargs):
+        self.models.append((schema.__name__, model))
+        return await super().generate_structured(messages, model, schema, **kwargs)
+
+
+async def _models_for_one_support_turn(configurable: dict) -> list[tuple[str, str]]:
+    spy = ModelSpy()
+    spy.results[TriageResult] = TriageResult(intent=IsmaelIntent.MOODLE_SUPPORT, question="notas")
+    spy.results[MoodleSupportResult] = MoodleSupportResult(reply="Ve a «Calificaciones».")
+    graph = build_ismael_graph(MemorySaver())
+    config = {"configurable": {"thread_id": "model-1", "llm_provider": "gemini", **configurable}}
+    from langchain_core.messages import HumanMessage
+
+    with (
+        patch("src.agents.ismael.nodes.get_provider", return_value=spy),
+        patch("src.agents.ismael.support.get_provider", return_value=spy),
+        patch("src.agents.ismael.rag_job.get_store_or_none", return_value=None),
+    ):
+        async for _ in graph.astream(
+            {
+                "messages": [HumanMessage(content="¿dónde veo mis notas?")],
+                "tenant_id": "t1",
+                "conversation_id": "c-model",
+                "agent_type": "theology",
+                "language": "es",
+                "user_context": CTX,
+            },
+            config=config,
+        ):
+            pass
+    return spy.models
+
+
+async def test_ismael_runs_on_the_background_model_when_the_platform_sends_one():
+    models = await _models_for_one_support_turn(
+        {"llm_model": "gemini-3.5-flash", "llm_background_model": "gemini-3.1-flash-lite"}
+    )
+    assert models == [
+        ("TriageResult", "gemini-3.1-flash-lite"),
+        ("MoodleSupportResult", "gemini-3.1-flash-lite"),
+    ]
+
+
+async def test_without_a_background_model_ismael_keeps_the_tenants():
+    models = await _models_for_one_support_turn({"llm_model": "gemini-3.5-flash"})
+    assert {m for _, m in models} == {"gemini-3.5-flash"}
+
+
+async def test_chat_stream_passes_the_background_model_from_the_credentials():
+    import src.main as main_module
+    from src.main import ChatStreamRequest
+
+    captured = {}
+
+    async def fake_coalesced(message, attachments, faqs, inputs, config, graph, code_name, thread_id):
+        captured.update(config["configurable"])
+        yield "data: {}\n\n"
+
+    creds = {
+        "provider": "GEMINI",
+        "model": "gemini-3.5-flash",
+        "backgroundModel": "gemini-3.1-flash-lite",
+        "geminiCredentials": {},
+        "geminiProjectId": "p",
+        "geminiLocation": "global",
+    }
+    with (
+        patch.object(main_module, "fetch_agent_credentials", new=AsyncMock(return_value=creds)),
+        patch.object(main_module, "get_or_compile_graph", new=AsyncMock(return_value=object())),
+        patch.object(main_module, "_coalesced_stream", new=fake_coalesced),
+    ):
+        response = await main_module.chat_stream(
+            ChatStreamRequest(
+                thread_id="th", message="hola", tenant_id="t1", conversation_id="c1",
+                agent_code_name="ismael", agent_type="theology",
+            ),
+            "system",
+        )
+        async for _ in response.body_iterator:
+            pass
+    assert captured["llm_model"] == "gemini-3.5-flash"
+    assert captured["llm_background_model"] == "gemini-3.1-flash-lite"

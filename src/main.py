@@ -1170,6 +1170,11 @@ async def chat_stream(
     # never logged or emitted via SSE (stripped by _SECRET_KEYS).
     llm_provider = req.llm_provider or "openai"
     llm_model = req.llm_model or ""
+    # The platform's cheap model for the tenant's provider. Chat graphs keep
+    # `llm_model` for what a customer reads; a graph may opt into this one for
+    # steps where speed matters more (ismael's whole chat turn). Empty = no
+    # split: `resolve_background_model` falls back to `llm_model`.
+    llm_background_model = ""
     provider_config: dict = {}
 
     if req.tenant_id:
@@ -1177,6 +1182,7 @@ async def chat_stream(
             creds = await fetch_agent_credentials(req.tenant_id)
             llm_provider = creds.get("provider", "OPENAI").lower()
             llm_model = creds.get("model") or llm_model
+            llm_background_model = creds.get("backgroundModel") or ""
 
             if llm_provider == "openai":
                 provider_config["openai_api_key"] = creds.get("apiKey", "")
@@ -1217,6 +1223,7 @@ async def chat_stream(
             "thread_id": thread_id,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
+            "llm_background_model": llm_background_model,
             "prompts": prompts_dict,
             "turn_request_id": req.turn_request_id,
             "normalization_enabled": req.query_normalization_enabled,
@@ -1284,6 +1291,7 @@ async def chat_stream(
         agent_type=agent_type,
         provider=llm_provider,
         model=llm_model,
+        background_model=llm_background_model,
         catalog_count=len(req.product_catalog),
         catalog_access_enabled=req.catalog_access_enabled,
         faq_count=len(req.rawFaqs or []),

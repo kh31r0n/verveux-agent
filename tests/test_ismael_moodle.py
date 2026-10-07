@@ -786,3 +786,12 @@ async def test_chat_stream_passes_the_background_model_from_the_credentials():
             pass
     assert captured["llm_model"] == "gemini-3.5-flash"
     assert captured["llm_background_model"] == "gemini-3.1-flash-lite"
+
+
+@pytest.mark.parametrize("lang", ["es", "en"])
+def test_off_topic_does_not_offer_contacting_the_teacher(lang):
+    # Product decision (2026-10-07): ismael still helps a student who asks to
+    # reach their teacher, but never suggests it unprompted.
+    reply = text("off_topic", lang, persona="Ismael").lower()
+    assert "profesor" not in reply and "teacher" not in reply
+    assert "aula virtual" in reply or "virtual classroom" in reply

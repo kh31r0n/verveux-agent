@@ -126,12 +126,12 @@ _TEXTS: dict[str, dict[str, str]] = {
     },
     "off_topic": {
         "es": (
-            "Soy {persona}: respondo preguntas de teología cristiana, te ayudo con el "
-            "aula virtual y puedo ponerte en contacto con tu profesor. ¿En qué te ayudo?"
+            "Soy {persona}: respondo preguntas de teología cristiana y te ayudo con el "
+            "aula virtual. ¿En qué te ayudo?"
         ),
         "en": (
-            "I'm {persona}: I answer questions about Christian theology, help with the "
-            "virtual classroom and can put you in touch with your teacher. How can I help?"
+            "I'm {persona}: I answer questions about Christian theology and help with the "
+            "virtual classroom. How can I help?"
         ),
     },
     # ── Moodle support ──

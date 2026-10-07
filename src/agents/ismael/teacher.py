@@ -6,7 +6,10 @@ triage routes straight here without an LLM call, like the survey latch.
     (new)         offer help first ("¿puedo ayudarte yo?")
     offer_help    yes  → answer it (theology → Brain, Moodle → support) or ask what
                   no   → look up the student's courses and teachers
-    choose_mode   "Envíalo tú" (ismael sends) / "Le escribo yo" (link only)
+    choose_mode   "Envíalo tú" (ismael sends) / "Le escribo yo" (link only);
+                  skipped when the site has messaging off — then the teacher's
+                  email (asked of Moodle, which checks it is a teacher of the
+                  student's course who shows it to participants) is the answer
     pick_course   only when there is no current course and several enrolments
     pick_teacher  only when the course lists several teachers
     compose       "¿Qué quieres decirle?" (skipped when the reason is known)
@@ -31,14 +34,15 @@ import time
 import structlog
 from langchain_core.runnables import RunnableConfig
 
+from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
-from ...providers.registry import get_provider, resolve_model
+from ...providers.registry import get_provider, resolve_background_model
 from ...schemas.ismael import TeacherDraft, TeacherStepAnswer, TeacherTopic
 from ...usage import make_usage_record
 from .. import backend_client
 from ..utils import latest_user_text
-from .common import ask_options, fold, ismael_dict, match_option, reply, user_ctx
+from .common import bounded_structured, ask_options, fold, ismael_dict, match_option, reply, user_ctx
 from .prompts import STEP_PROMPT, TEACHER_DRAFT_PROMPT
 from .texts import lang_of, text
 
@@ -149,11 +153,14 @@ class _Turn:
         system = STEP_PROMPT.format(question=question, options=options)
         try:
             provider = get_provider(self.config)
-            model = resolve_model(self.config)
-            result = await provider.generate_structured(
+            model = resolve_background_model(self.config)
+            result = await bounded_structured(
+                provider,
                 [{"role": "system", "content": system}, {"role": "user", "content": self.text}],
                 model,
                 TeacherStepAnswer,
+                timeout=settings.ismael_timeout_step_seconds,
+                thinking_budget=settings.ismael_thinking_classify,
             )
             self.usage.append(
                 make_usage_record(node="ismael_teacher_step", provider=provider, model=model)
@@ -328,15 +335,52 @@ async def _after_teacher(turn: _Turn, teacher: dict) -> dict:
     }
     name = turn.flow["teacher"]["name"]
     if turn.flow.get("mode") != "send":
-        return turn.finish(
-            text("teacher_self_link", turn.lang, teacher=name, url=turn.flow["teacher"]["messageUrl"])
-        )
+        if (turn.flow.get("data") or {}).get("messaging_enabled"):
+            # They chose to write themselves, and Moodle messaging works.
+            return turn.finish(
+                text("teacher_self_link", turn.lang, teacher=name, url=turn.flow["teacher"]["messageUrl"])
+            )
+        # Messaging is off on this site: the teacher's email is the way.
+        return await _give_email(turn)
     reason = turn.flow.get("reason") or ""
     if reason:
         # They already said what it is about: go straight to a draft.
         turn.flow["content"] = reason
         return _confirm(turn, await _draft(turn, reason))
     return turn.prompt("compose", text("teacher_compose", turn.lang, teacher=name))
+
+
+def _institution_fallback(turn: _Turn) -> str:
+    """Where to turn when the teacher's email cannot be given."""
+    ctx = user_ctx(turn.state)
+    if ctx.get("lms_other_contacts"):
+        return text("teacher_fallback_contacts", turn.lang, contacts=ctx["lms_other_contacts"])
+    if ctx.get("lms_support_url"):
+        return text("teacher_fallback_support", turn.lang, url=ctx["lms_support_url"])
+    return text("teacher_fallback_generic", turn.lang)
+
+
+async def _give_email(turn: _Turn) -> dict:
+    """The teacher's email, from Moodle (which re-checks that it is a teacher
+    of the student's course who shows their email to participants)."""
+    teacher = turn.flow.get("teacher") or {}
+    course = turn.flow.get("course") or {}
+    name = teacher.get("name") or ""
+    try:
+        result = await backend_client.get_teacher_email(
+            turn.state.get("conversation_id") or "",
+            teacher_id=str(teacher.get("id") or ""),
+            course_id=int(course.get("id") or 0),
+        )
+    except Exception as exc:  # noqa: BLE001 — the institution is still a way forward
+        logger.warning("ismael_teacher_email_failed", error=str(exc) or type(exc).__name__)
+        result = {"status": "FAILED", "code": "unreachable"}
+    logger.info("ismael_teacher_email", status=result.get("status"), code=result.get("code"))
+    email = result.get("email")
+    if result.get("status") == "OK" and email:
+        return turn.finish(text("teacher_email_given", turn.lang, teacher=name, email=email))
+    key = "teacher_email_hidden" if result.get("code") == "email_hidden" else "teacher_email_failed"
+    return turn.finish(f"{text(key, turn.lang, teacher=name)} {_institution_fallback(turn)}")
 
 
 async def _draft(turn: _Turn, content: str, change: str = "") -> str:
@@ -356,11 +400,14 @@ async def _draft(turn: _Turn, content: str, change: str = "") -> str:
     system = TEACHER_DRAFT_PROMPT.format(language_rule=_language_rule(turn.lang))
     try:
         provider = get_provider(turn.config)
-        model = resolve_model(turn.config)
-        result = await provider.generate_structured(
+        model = resolve_background_model(turn.config)
+        result = await bounded_structured(
+            provider,
             [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(lines)}],
             model,
             TeacherDraft,
+            timeout=settings.ismael_timeout_answer_seconds,
+            thinking_budget=settings.ismael_thinking_answer,
         )
         turn.usage.append(make_usage_record(node="ismael_teacher_draft", provider=provider, model=model))
         message = result.message.strip()

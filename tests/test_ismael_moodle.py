@@ -112,10 +112,10 @@ def b():
         patch("src.agents.ismael.support.get_provider", return_value=provider),
         patch("src.agents.ismael.teacher.get_provider", return_value=provider),
         patch("src.agents.ismael.faq.get_provider", return_value=provider),
-        patch("src.agents.ismael.faq.resolve_model", return_value="m"),
-        patch("src.agents.ismael.nodes.resolve_model", return_value="m"),
-        patch("src.agents.ismael.support.resolve_model", return_value="m"),
-        patch("src.agents.ismael.teacher.resolve_model", return_value="m"),
+        patch("src.agents.ismael.faq.resolve_background_model", return_value="m"),
+        patch("src.agents.ismael.nodes.resolve_background_model", return_value="m"),
+        patch("src.agents.ismael.support.resolve_background_model", return_value="m"),
+        patch("src.agents.ismael.teacher.resolve_background_model", return_value="m"),
         patch("src.agents.ismael.nodes.rag_job.spawn", new=AsyncMock()) as spawn,
         patch("src.agents.ismael.nodes.rag_job.start_host_in_background"),
         patch("src.agents.ismael.rag_job.get_store_or_none", return_value=None),
@@ -129,8 +129,12 @@ def b():
                 return_value={"status": "SENT", "teacherName": "Prof. Juan", "messageUrl": JUAN["messageUrl"]}
             ),
         ) as send,
+        patch(
+            "src.agents.ismael.teacher.backend_client.get_teacher_email",
+            new=AsyncMock(return_value={"status": "OK", "email": "juan@colegio.edu", "teacherName": "Prof. Juan"}),
+        ) as email,
     ):
-        yield {"provider": provider, "spawn": spawn, "lookup": lookup, "send": send}
+        yield {"provider": provider, "spawn": spawn, "lookup": lookup, "send": send, "email": email}
 
 
 def triage(b, intent, question="", topic=TeacherTopic.NONE):
@@ -372,13 +376,46 @@ class TestSuggestAndPick:
         assert reply == text("teacher_self_link", "es", teacher="Prof. Juan", url=JUAN["messageUrl"])
         b["send"].assert_not_called()
 
-    async def test_messaging_off_skips_the_choice_and_only_suggests(self, b):
+    async def test_messaging_off_skips_the_choice_and_gives_the_teachers_email(self, b):
         b["lookup"].return_value = teachers_view(messagingEnabled=False)
         triage(b, IsmaelIntent.CONTACT_TEACHER)
         graph = build_ismael_graph(MemorySaver())
         await go(graph, "p2", "quiero hablar con mi profesor")
         _, reply, _ = await go(graph, "p2", "2")
+        assert reply == text("teacher_email_given", "es", teacher="Prof. Juan", email="juan@colegio.edu")
+        b["email"].assert_awaited_once_with("c1", teacher_id="5", course_id=7)
+        b["send"].assert_not_called()
+
+    async def test_a_hidden_email_is_not_given_and_points_to_the_institution(self, b):
+        b["lookup"].return_value = teachers_view(messagingEnabled=False)
+        b["email"].return_value = {"status": "FAILED", "code": "email_hidden"}
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2h", "quiero hablar con mi profesor")
+        _, reply, _ = await go(graph, "p2h", "no")
+        assert reply.startswith(text("teacher_email_hidden", "es", teacher="Prof. Juan"))
+        assert "uebogota.matriculas@casaroca.org" in reply
+        assert "@colegio.edu" not in reply
+
+    async def test_an_email_lookup_error_still_offers_a_way(self, b):
+        b["lookup"].return_value = teachers_view(messagingEnabled=False)
+        b["email"].side_effect = RuntimeError("down")
+        ctx = {k: v for k, v in CTX.items() if k != "lms_other_contacts"}
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2e", "quiero hablar con mi profesor", ctx=ctx)
+        _, reply, _ = await go(graph, "p2e", "no", ctx=ctx)
+        assert reply.startswith(text("teacher_email_failed", "es", teacher="Prof. Juan"))
+        assert "https://ryca.unidadeducativa.org/soporte" in reply
+
+    async def test_with_messaging_on_writing_yourself_still_gets_the_link_not_the_email(self, b):
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2l", "quiero hablar con mi profesor")
+        await go(graph, "p2l", "no")
+        _, reply, _ = await go(graph, "p2l", "Le escribo yo")
         assert reply == text("teacher_self_link", "es", teacher="Prof. Juan", url=JUAN["messageUrl"])
+        b["email"].assert_not_called()
 
     async def test_no_current_course_asks_the_course_then_the_teacher(self, b):
         b["lookup"].return_value = teachers_view(currentCourseId=None)
@@ -568,3 +605,193 @@ class TestFaqs:
         assert reply == "Del 1 al 5 de diciembre."
         user_msg = next(m for name, m in b["provider"].calls if name == "FaqAnswer")[-1]
         assert user_msg["content"] == "cuándo son los exámenes finales"
+
+
+async def test_a_hung_model_call_times_out_and_the_turn_still_replies(b, monkeypatch):
+    """2026-10-06: a support call that never returned held the conversation's
+    lock for minutes; now it is cut off and the fallback goes out in time."""
+    import asyncio
+
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "ismael_timeout_answer_seconds", 0.05)
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "Course not found")
+
+    async def hang(messages, model, schema, **kwargs):
+        if schema is MoodleSupportResult:
+            await asyncio.sleep(3600)
+        return b["provider"].results[schema]
+
+    b["provider"].generate_structured = hang
+    graph = build_ismael_graph(MemorySaver())
+    nodes, reply, _ = await asyncio.wait_for(go(graph, "h1", "El error es Course not found"), 5)
+    assert nodes == ["ismael_triage", "ismael_moodle_support"]
+    assert reply.startswith(text("support_failed", "es"))
+    assert "https://ryca.unidadeducativa.org/soporte" in reply
+
+
+async def test_every_ismael_call_caps_thinking(b):
+    seen = []
+    original = b["provider"].generate_structured
+
+    async def spy(messages, model, schema, **kwargs):
+        seen.append((schema.__name__, kwargs.get("thinking_budget")))
+        return await original(messages, model, schema)
+
+    b["provider"].generate_structured = spy
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "notas")
+    b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="ok")
+    graph = build_ismael_graph(MemorySaver())
+    await go(graph, "h2", "¿dónde veo mis notas?")
+    assert seen == [("TriageResult", 0), ("MoodleSupportResult", 0)]
+
+
+class TestTriageFallback:
+    """2026-10-06: a triage timeout routed "Tengo un error con moodle" to the
+    library. A failed triage now routes by keyword, newest fragment first."""
+
+    async def test_a_moodle_error_goes_to_support_when_triage_fails(self, b):
+        b["provider"].results[TriageResult] = TimeoutError()
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="Revisemos el error.")
+        graph = build_ismael_graph(MemorySaver())
+        nodes, reply, _ = await go(graph, "fb1", "Tengo un error con moodle")
+        assert nodes == ["ismael_triage", "ismael_moodle_support"]
+        b["spawn"].assert_not_called()
+
+    async def test_a_teacher_request_opens_the_teacher_flow_when_triage_fails(self, b):
+        b["provider"].results[TriageResult] = TimeoutError()
+        graph = build_ismael_graph(MemorySaver())
+        nodes, reply, _ = await go(graph, "fb2", "Me gustaría comunicarme con el Profesor Jaime Quiceno")
+        assert nodes == ["ismael_triage", "ismael_teacher"]
+        assert reply.startswith(text("teacher_offer", "es"))
+
+    async def test_a_theology_question_still_reaches_the_library(self, b):
+        b["provider"].results[TriageResult] = TimeoutError()
+        graph = build_ismael_graph(MemorySaver())
+        nodes, _, _ = await go(graph, "fb3", "¿Qué dice Pablo sobre la justificación?")
+        assert nodes == ["ismael_triage", "ismael_start"]
+        b["spawn"].assert_awaited_once()
+
+
+def test_fallback_intent_reads_the_newest_fragment_first():
+    from src.agents.ismael.common import fallback_intent
+
+    burst = [
+        "El error que me aparece es Course not found",
+        "Me gustaría comunicarme con el Profesor Jaime Quiceno",
+        "Tengo un error con moodle",
+    ]
+    assert fallback_intent(burst) == IsmaelIntent.MOODLE_SUPPORT
+    assert fallback_intent(burst[:2]) == IsmaelIntent.CONTACT_TEACHER
+    assert fallback_intent(["¿Quién fue el apóstol Pedro?"]) == IsmaelIntent.THEOLOGY
+    assert fallback_intent([]) == IsmaelIntent.THEOLOGY
+
+
+async def test_support_fallback_sends_an_admin_question_to_the_contacts_not_the_form(b):
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "cómo pago la matrícula")
+    b["provider"].results[MoodleSupportResult] = TimeoutError()
+    graph = build_ismael_graph(MemorySaver())
+    _, reply, _ = await go(graph, "sf1", "¿Cómo pago la matrícula del próximo semestre?")
+    assert "uebogota.matriculas@casaroca.org" in reply
+    assert "ryca.unidadeducativa.org/soporte" not in reply
+
+
+# ── Model: ismael's chat turn runs on the platform's background model ───────
+
+
+class ModelSpy(SchemaProvider):
+    def __init__(self):
+        super().__init__()
+        self.models: list[tuple[str, str]] = []
+
+    async def generate_structured(self, messages, model, schema, **kwargs):
+        self.models.append((schema.__name__, model))
+        return await super().generate_structured(messages, model, schema, **kwargs)
+
+
+async def _models_for_one_support_turn(configurable: dict) -> list[tuple[str, str]]:
+    spy = ModelSpy()
+    spy.results[TriageResult] = TriageResult(intent=IsmaelIntent.MOODLE_SUPPORT, question="notas")
+    spy.results[MoodleSupportResult] = MoodleSupportResult(reply="Ve a «Calificaciones».")
+    graph = build_ismael_graph(MemorySaver())
+    config = {"configurable": {"thread_id": "model-1", "llm_provider": "gemini", **configurable}}
+    from langchain_core.messages import HumanMessage
+
+    with (
+        patch("src.agents.ismael.nodes.get_provider", return_value=spy),
+        patch("src.agents.ismael.support.get_provider", return_value=spy),
+        patch("src.agents.ismael.rag_job.get_store_or_none", return_value=None),
+    ):
+        async for _ in graph.astream(
+            {
+                "messages": [HumanMessage(content="¿dónde veo mis notas?")],
+                "tenant_id": "t1",
+                "conversation_id": "c-model",
+                "agent_type": "theology",
+                "language": "es",
+                "user_context": CTX,
+            },
+            config=config,
+        ):
+            pass
+    return spy.models
+
+
+async def test_ismael_runs_on_the_background_model_when_the_platform_sends_one():
+    models = await _models_for_one_support_turn(
+        {"llm_model": "gemini-3.5-flash", "llm_background_model": "gemini-3.1-flash-lite"}
+    )
+    assert models == [
+        ("TriageResult", "gemini-3.1-flash-lite"),
+        ("MoodleSupportResult", "gemini-3.1-flash-lite"),
+    ]
+
+
+async def test_without_a_background_model_ismael_keeps_the_tenants():
+    models = await _models_for_one_support_turn({"llm_model": "gemini-3.5-flash"})
+    assert {m for _, m in models} == {"gemini-3.5-flash"}
+
+
+async def test_chat_stream_passes_the_background_model_from_the_credentials():
+    import src.main as main_module
+    from src.main import ChatStreamRequest
+
+    captured = {}
+
+    async def fake_coalesced(message, attachments, faqs, inputs, config, graph, code_name, thread_id):
+        captured.update(config["configurable"])
+        yield "data: {}\n\n"
+
+    creds = {
+        "provider": "GEMINI",
+        "model": "gemini-3.5-flash",
+        "backgroundModel": "gemini-3.1-flash-lite",
+        "geminiCredentials": {},
+        "geminiProjectId": "p",
+        "geminiLocation": "global",
+    }
+    with (
+        patch.object(main_module, "fetch_agent_credentials", new=AsyncMock(return_value=creds)),
+        patch.object(main_module, "get_or_compile_graph", new=AsyncMock(return_value=object())),
+        patch.object(main_module, "_coalesced_stream", new=fake_coalesced),
+    ):
+        response = await main_module.chat_stream(
+            ChatStreamRequest(
+                thread_id="th", message="hola", tenant_id="t1", conversation_id="c1",
+                agent_code_name="ismael", agent_type="theology",
+            ),
+            "system",
+        )
+        async for _ in response.body_iterator:
+            pass
+    assert captured["llm_model"] == "gemini-3.5-flash"
+    assert captured["llm_background_model"] == "gemini-3.1-flash-lite"
+
+
+@pytest.mark.parametrize("lang", ["es", "en"])
+def test_off_topic_does_not_offer_contacting_the_teacher(lang):
+    # Product decision (2026-10-07): ismael still helps a student who asks to
+    # reach their teacher, but never suggests it unprompted.
+    reply = text("off_topic", lang, persona="Ismael").lower()
+    assert "profesor" not in reply and "teacher" not in reply
+    assert "aula virtual" in reply or "virtual classroom" in reply

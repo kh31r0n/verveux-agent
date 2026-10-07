@@ -302,6 +302,18 @@ async def post_teacher_message(
     )
 
 
+async def get_teacher_email(conversation_id: str, *, teacher_id: str, course_id: int) -> dict:
+    """POST /internal/conversations/:id/moodle/teacher-email — a teacher's email
+    for the conversation's student, asked of the Moodle plugin (0.5.0+) at the
+    moment of need. ``{status: OK, email}`` or ``{status: FAILED, code}``
+    (e.g. ``email_hidden`` when the teacher does not show it to participants).
+    """
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/moodle/teacher-email",
+        json={"teacherId": teacher_id, "courseId": course_id},
+    )
+
+
 # ─── Prospecting (aurora — /internal/prospecting/*) ─────────────────────────
 
 

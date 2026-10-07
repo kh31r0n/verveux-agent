@@ -99,7 +99,7 @@ def boundary():
     triage = FakeProvider(TriageResult(intent=IsmaelIntent.THEOLOGY, question="¿Qué es la gracia?"))
     with (
         patch(f"{NODES}.get_provider", return_value=triage),
-        patch(f"{NODES}.resolve_model", return_value="gpt-test"),
+        patch(f"{NODES}.resolve_background_model", return_value="gpt-test"),
         patch(f"{NODES}.rag_job.spawn", new=AsyncMock()) as spawn,
         patch(f"{NODES}.rag_job.start_host_in_background") as start_host,
         patch(f"{NODES}.backend_client.save_ismael_survey", new=AsyncMock()) as save,

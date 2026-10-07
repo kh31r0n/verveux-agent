@@ -14,16 +14,27 @@ so the model only writes the description.
 
 from __future__ import annotations
 
+import re
+
 import structlog
 from langchain_core.runnables import RunnableConfig
 
+from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
-from ...providers.registry import get_provider, resolve_model
+from ...providers.registry import get_provider, resolve_background_model
 from ...schemas.ismael import MoodleSupportOutcome, MoodleSupportResult
 from ...usage import make_usage_record
 from ..utils import format_user_context, latest_user_text, resolve_persona, resolve_prompt
-from .common import DEFAULT_PERSONA, history_messages, ismael_dict, reply, user_ctx
+from .common import (
+    DEFAULT_PERSONA,
+    bounded_structured,
+    fold,
+    history_messages,
+    ismael_dict,
+    reply,
+    user_ctx,
+)
 from .prompts import MOODLE_SUPPORT_PROMPT
 from .texts import lang_of, text
 
@@ -72,6 +83,30 @@ def ticket_block(ctx: dict, description: str, lang: str) -> str:
     return block
 
 
+# Administrative topics the technical-support form explicitly does not take
+# (enrolment, payments, refunds, certificates). Folded, prefix match.
+_ADMIN_WORDS = ("matricul", "pago", "pagar", "reintegro", "reembolso", "certificado", "factura", "cuota")
+
+
+def fallback_support_result(ctx: dict, question: str, lang: str) -> MoodleSupportResult:
+    """What to say when the model did not answer in time.
+
+    An administrative question goes to the configured contacts — the support
+    form is for technical problems only. Anything else gets the guided ticket.
+    """
+    folded = fold(question)
+    if ctx.get("lms_other_contacts") and any(re.search(r"\b" + w, folded) for w in _ADMIN_WORDS):
+        return MoodleSupportResult(
+            reply=text("support_redirect_fallback", lang, contacts=ctx["lms_other_contacts"]),
+            outcome=MoodleSupportOutcome.REDIRECT,
+        )
+    return MoodleSupportResult(
+        reply=text("support_failed", lang),
+        outcome=MoodleSupportOutcome.NEEDS_TICKET,
+        ticket_description=question,
+    )
+
+
 async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) -> dict:
     """Answer a Moodle question; guide a ticket or redirect when it is not ours."""
     record_node_invocation("ismael_moodle_support")
@@ -94,8 +129,9 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     usage: list = []
     try:
         provider = get_provider(config)
-        model = resolve_model(config)
-        result = await provider.generate_structured(
+        model = resolve_background_model(config)
+        result = await bounded_structured(
+            provider,
             [
                 {"role": "system", "content": system},
                 *history_messages(state),
@@ -103,15 +139,13 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
             ],
             model,
             MoodleSupportResult,
+            timeout=settings.ismael_timeout_answer_seconds,
+            thinking_budget=settings.ismael_thinking_support,
         )
         usage.append(make_usage_record(node="ismael_moodle_support", provider=provider, model=model))
-    except Exception as exc:  # noqa: BLE001 — fall back to the ticket, never to silence
-        logger.warning("ismael_moodle_support_failed", error=str(exc))
-        result = MoodleSupportResult(
-            reply=text("support_failed", lang),
-            outcome=MoodleSupportOutcome.NEEDS_TICKET,
-            ticket_description=question,
-        )
+    except Exception as exc:  # noqa: BLE001 — a fallback answer, never silence
+        logger.warning("ismael_moodle_support_failed", error=str(exc) or type(exc).__name__)
+        result = fallback_support_result(ctx, question, lang)
 
     message = result.reply.strip()
     if result.outcome == MoodleSupportOutcome.NEEDS_TICKET:

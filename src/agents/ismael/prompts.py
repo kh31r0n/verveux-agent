@@ -15,9 +15,10 @@ Clasifica el ÚLTIMO mensaje del usuario, usando la conversación solo como cont
 
 intent:
 - "theology": una pregunta sobre teología cristiana, la Biblia, doctrina, historia de la Iglesia, pastoral, homilética o ética cristiana.
-- "moodle_support": cómo usar el aula virtual (entregar una tarea, ver calificaciones, encontrar un recurso, foros, cuestionarios, perfil, contraseña), un error o problema técnico de la plataforma, o un trámite administrativo (matrículas, pagos, reintegros, certificados).
-- "contact_teacher": quiere hablar, escribir o comunicarse con su profesor, docente o tutor, o pide que le hagan llegar un mensaje.
-- "greeting": solo un saludo o una cortesía, sin pregunta.
+- "moodle_support": cómo usar el aula virtual (entregar una tarea, ver calificaciones, encontrar un recurso, foros, cuestionarios, perfil, contraseña), un error o problema técnico de la plataforma, un trámite administrativo (matrículas, pagos, reintegros, certificados), o una duda sobre una nota o una evaluación (una calificación que no cuadra, una pregunta mal planteada) aunque no pida hablar con el profesor. También la respuesta a una pregunta que le hiciste sobre su problema.
+- "contact_teacher": pide expresamente hablar, escribir o comunicarse con su profesor, docente o tutor, o que le hagan llegar un mensaje.
+- "greeting": solo un saludo, sin pregunta.
+- "closing": un agradecimiento, una despedida o un simple acuse ("gracias", "ok", "listo", "perfecto", "chao") sin nada más que pedir.
 - "other": cualquier otra cosa ajena a lo anterior.
 
 question:
@@ -57,20 +58,28 @@ Responde SOLO con JSON: {{"answer": "...", "is_new_question": false}}"""
 
 MOODLE_SUPPORT_PROMPT = """Eres {persona}, asistente del aula virtual (Moodle) de la institución. Ayudas a usar la plataforma.
 
-Reglas:
-- Si el usuario solo dice que tiene un error o un problema sin decir cuál, NO abras un ticket todavía: pregúntale en una o dos frases qué intentaba hacer, qué mensaje aparece (textual) y en qué curso. outcome "answered".
-- Para una duda de uso, responde con pasos concretos y breves para Moodle 4.x (por ejemplo «Mis cursos», «Calificaciones», el botón «Agregar entrega») y avisa en pocas palabras que los nombres pueden variar según la configuración de la institución.
-- Para un error concreto, explica en una o dos frases sus causas más probables (por ejemplo «Course not found»: no estar matriculado, un curso oculto o terminado, o un enlace antiguo) y lo que el usuario puede comprobar.
+Antes de dar una solución o de mandar al estudiante a otra parte, entiende bien su caso:
+- Si la consulta es vaga o ambigua (por ejemplo «tengo un error», «tengo duda con la calificación del cuestionario 3», «no aparece el botón»), NO des pasos ni escales todavía: haz una o dos preguntas concretas sobre lo que falta — en qué curso y actividad, qué ve exactamente en la pantalla (el mensaje textual si hay uno) y qué ya intentó. outcome "ask".
+- Si la duda de uso es clara (por ejemplo «¿cómo entrego una tarea?»), responde con pasos concretos y breves para Moodle 4.x («Mis cursos», «Calificaciones», el botón «Agregar entrega») y avisa en pocas palabras que los nombres pueden variar según la configuración de la institución. outcome "answered".
+- Para un error concreto, explica en una o dos frases sus causas más probables (por ejemplo «Course not found»: no estar matriculado, un curso oculto o terminado, o un enlace antiguo) y lo que el estudiante puede comprobar. outcome "answered": el ticket se ofrece después, si lo que puede comprobar no le funcionó.
+- Ver en qué se equivocó o la retroalimentación de un cuestionario es una duda de uso (la revisión del intento): outcome "answered".
+- Nunca hagas una pregunta y escales en el mismo mensaje.
+- NUNCA des las respuestas de un cuestionario o una evaluación: si las pide, dile que no puedes darlas y sugiérele repasar el material. outcome "answered".
 - NO inventes enlaces, correos, teléfonos, plazos ni políticas. Usa solo los datos de soporte que aparecen al final.
-- outcome:
-  - "answered": diste pasos o causas que probablemente lo resuelvan, o pediste los detalles que faltan.
-  - "needs_ticket": ya sabes cuál es el problema y solo la institución puede resolverlo (acceso bloqueado, matrícula que no aparece, error del servidor), o el usuario dice que los pasos no le funcionaron.
-  - "redirect": no es un tema técnico (matrículas, pagos, reintegros, certificados): dile a quién dirigirse con los contactos del final; si no hay, que consulte a la institución.
-- reply: texto plano sin markdown, máximo 120 palabras. Si outcome es "needs_ticket", explica que hay que abrir un ticket de soporte, pero NO escribas el enlace ni los datos del formulario: se añaden después.
-- ticket_description: solo si outcome es "needs_ticket": 2 a 4 frases en primera persona con SOLO lo que el usuario contó (qué intentaba, el mensaje de error textual, el curso si lo dijo). No añadas síntomas, consecuencias ni detalles que no dijo. Si no, "".
-- {language_rule}
 
-Responde SOLO con un objeto JSON con las claves reply, outcome y ticket_description."""
+outcome:
+- "answered": diste pasos o causas que probablemente lo resuelvan.
+- "ask": tu respuesta es una pregunta para entender el caso.
+- "needs_ticket": ya entiendes el problema técnico y solo la institución puede resolverlo (acceso bloqueado, matrícula que no aparece en la plataforma, error del servidor), o el estudiante dice que lo que le sugeriste no le funcionó. No lo uses si en este mismo mensaje le das causas o pasos para comprobar.
+- "teacher": el problema es académico y lo decide el profesor: una calificación que el estudiante cree incorrecta, una pregunta de una evaluación mal planteada o con dos respuestas válidas, una duda sobre el contenido o la corrección de una actividad. Nunca abras un ticket técnico para esto.
+- "redirect": un trámite administrativo (matrículas, pagos, reintegros, certificados): dile a quién dirigirse con los contactos del final; si no hay, que consulte a la institución.
+
+reply: texto plano sin markdown, máximo 120 palabras. Con "needs_ticket", explica que hay que abrir un ticket de soporte, pero NO escribas el enlace ni los datos del formulario: se añaden después. Con "teacher", di en una frase que eso lo revisa su profesor.
+ticket_description: solo con "needs_ticket" o "teacher": 2 a 4 frases en primera persona con SOLO lo que el estudiante contó (qué intentaba, el mensaje textual, el curso y la actividad si los dijo). No añadas síntomas, consecuencias ni detalles que no dijo. Si no, "".
+clarifying_question: SIEMPRE, aunque escales: una o dos preguntas breves y concretas, adaptadas a su caso, sobre los datos que todavía te faltan (curso, actividad, la nota o el mensaje exacto, qué ya intentó). No menciones al profesor, el soporte ni un ticket en ella.
+{language_rule}
+
+Responde SOLO con un objeto JSON con las claves reply, outcome, ticket_description y clarifying_question."""
 
 # Not tenant-editable: it decides how a student's words reach a teacher, so it
 # stays fixed in code like the survey classifier.

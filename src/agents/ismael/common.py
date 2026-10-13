@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import unicodedata
 
 from langchain_core.messages import AIMessage
@@ -14,6 +15,25 @@ from ...schemas.ismael import IsmaelIntent
 from ..utils import emit_quick_replies
 
 DEFAULT_PERSONA = "Ismael"
+
+# A multi-turn latch (the teacher flow, a support case, the rating question) is
+# forgotten after this long: the next message is a fresh turn, not an answer to
+# something asked yesterday.
+FLOW_TTL_SECONDS = 30 * 60
+
+
+def latch_fresh(latch: object) -> bool:
+    """True while a latch dict was touched within ``FLOW_TTL_SECONDS``."""
+    if not isinstance(latch, dict):
+        return False
+    return time.time() - float(latch.get("touched_at") or 0) < FLOW_TTL_SECONDS
+
+
+def mark_helped(ismael: dict) -> dict:
+    """Record that ismael just helped (an answer, steps, a ticket, a teacher's
+    contact): the next closing may then ask the student to rate the service."""
+    ismael["helped_at"] = time.time()
+    return ismael
 
 
 def ismael_dict(state: AgentState) -> dict:
@@ -118,6 +138,30 @@ _MOODLE_WORDS = (
     "login", "curso", "pago", "certificado", "no me deja", "no puedo",
     "no carga", "no abre", "no aparece",
 )
+
+
+# A message made only of these words (and punctuation or emoji) is a thank-you
+# or an acknowledgement — routed to the closing without an LLM call. At least
+# one word must be in _CLOSING_ANCHORS: "muy" or "de" alone close nothing.
+_CLOSING_ANCHORS = {
+    "gracias", "graciass", "ok", "okay", "oki", "listo", "perfecto", "vale",
+    "entendido", "chao", "adios", "bendiciones", "amable", "excelente", "genial",
+    "acuerdo", "buenisimo", "thanks", "thank", "bye",
+}
+_CLOSING_FILLER = {
+    "muchas", "mil", "muchisimas", "hasta", "luego", "pronto", "dios", "te", "le",
+    "bendiga", "muy", "de", "super", "ya", "entonces", "bueno", "you", "so", "much",
+    "great", "y", "por", "todo", "tu", "su", "ayuda",
+}
+
+
+def is_bare_closing(message: str, persona: str = "") -> bool:
+    """True for "gracias", "ok 👍", "Gracias...", "listo, gracias Salomón"."""
+    words = re.sub(r"[^a-z\s]", " ", fold(message)).split()
+    if not words or len(words) > 8:
+        return False
+    allowed = _CLOSING_ANCHORS | _CLOSING_FILLER | set(fold(persona).split())
+    return all(w in allowed for w in words) and any(w in _CLOSING_ANCHORS for w in words)
 
 
 def _mentions(folded: str, words: tuple[str, ...]) -> bool:

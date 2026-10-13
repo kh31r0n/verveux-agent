@@ -24,7 +24,7 @@ from ...providers.registry import get_provider, resolve_background_model
 from ...schemas.ismael import FaqAnswer
 from ...usage import make_usage_record
 from ..utils import latest_user_text, resolve_persona, resolve_prompt
-from .common import bounded_structured, DEFAULT_PERSONA, history_messages, ismael_dict, reply
+from .common import DEFAULT_PERSONA, bounded_structured, history_messages, ismael_dict, mark_helped, reply
 from .prompts import FAQ_PROMPT
 from .texts import lang_of
 
@@ -112,5 +112,5 @@ async def ismael_faq_node(state: AgentState, config: RunnableConfig) -> dict:
         }
     ] if faq.get("id") else None
     return reply(
-        message, ismael=ismael, turn_usage=usage, faq_used=faq_used, ismael_route="done"
+        message, ismael=mark_helped(ismael), turn_usage=usage, faq_used=faq_used, ismael_route="done"
     )

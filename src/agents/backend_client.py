@@ -240,6 +240,24 @@ async def save_ismael_survey(contact_id: str, conversation_id: str, answers: dic
     )
 
 
+async def save_ismael_rating(
+    conversation_id: str, rating: str, *, reason: str = "", message_id: str = ""
+) -> dict:
+    """POST /internal/conversations/:id/ismael-rating — the student's 👍/👎.
+
+    Stored as ``message_feedback`` on the conversation's latest outbound
+    message (the closing question that asked for it), or on ``message_id``
+    when given — how a 👎's reason, asked one turn later, reaches the same row.
+    Returns ``{"messageId": ...}``.
+    """
+    body: dict = {"rating": rating}
+    if reason:
+        body["reason"] = reason
+    if message_id:
+        body["messageId"] = message_id
+    return await _post(f"/api/v1/internal/conversations/{conversation_id}/ismael-rating", json=body)
+
+
 async def post_agent_message(
     conversation_id: str,
     *,

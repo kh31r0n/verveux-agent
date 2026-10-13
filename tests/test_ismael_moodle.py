@@ -147,6 +147,17 @@ async def go(graph, thread, message, ctx=CTX):
     return await _run(graph, thread, message, user_context=ctx)
 
 
+async def clarify_first(b, graph, thread, message, ctx=CTX):
+    """Turn 1 of a support case: ismael asks a clarifying question. Every
+    escalation is held until the student answered one."""
+    b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
+        reply="¿En qué curso y qué ves en la pantalla?", outcome=MoodleSupportOutcome.ASK
+    )
+    nodes, reply, _ = await go(graph, thread, message, ctx=ctx)
+    assert nodes == ["ismael_triage", "ismael_moodle_support"]
+    assert reply == "¿En qué curso y qué ves en la pantalla?"
+
+
 # ── Moodle support ───────────────────────────────────────────────────────────
 
 
@@ -180,13 +191,14 @@ class TestMoodleSupport:
 
     async def test_needs_ticket_appends_the_form_and_the_users_data_in_code(self, b):
         triage(b, IsmaelIntent.MOODLE_SUPPORT, "error en el cuestionario")
+        graph = build_ismael_graph(MemorySaver())
+        await clarify_first(b, graph, "s3", "me sale error al abrir el cuestionario")
         b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
             reply="Esto lo tiene que revisar soporte técnico.",
             outcome=MoodleSupportOutcome.NEEDS_TICKET,
             ticket_description="No puedo abrir el cuestionario 2 de Teología I; sale un error.",
         )
-        graph = build_ismael_graph(MemorySaver())
-        _, reply, _ = await go(graph, "s3", "me sale error al abrir el cuestionario")
+        _, reply, _ = await go(graph, "s3", "En Teología I, el cuestionario 2 dice error")
 
         assert "https://ryca.unidadeducativa.org/soporte" in reply
         assert "1020304050" in reply and "Ana Pérez" in reply and "ana@example.edu" in reply
@@ -195,23 +207,26 @@ class TestMoodleSupport:
 
     async def test_no_support_url_never_invents_a_link(self, b):
         triage(b, IsmaelIntent.MOODLE_SUPPORT, "error")
+        ctx = {k: v for k, v in CTX.items() if not k.startswith("lms_support")}
+        graph = build_ismael_graph(MemorySaver())
+        await clarify_first(b, graph, "s4", "error", ctx=ctx)
         b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
             reply="Hay que reportarlo.", outcome=MoodleSupportOutcome.NEEDS_TICKET,
             ticket_description="Me sale un error.",
         )
-        ctx = {k: v for k, v in CTX.items() if not k.startswith("lms_support")}
-        graph = build_ismael_graph(MemorySaver())
-        _, reply, _ = await go(graph, "s4", "error", ctx=ctx)
+        _, reply, _ = await go(graph, "s4", "sale un error al entrar", ctx=ctx)
 
         assert "http" not in reply
         assert text("ticket_no_url", "es") in reply and "Me sale un error." in reply
 
-    async def test_llm_failure_still_guides_the_ticket(self, b):
+    async def test_llm_failure_asks_first_then_guides_the_ticket(self, b):
         triage(b, IsmaelIntent.MOODLE_SUPPORT, "no puedo entrar al curso")
         b["provider"].results[MoodleSupportResult] = RuntimeError("down")
         graph = build_ismael_graph(MemorySaver())
         _, reply, _ = await go(graph, "s5", "no puedo entrar al curso")
+        assert reply == text("support_clarify", "es")
 
+        _, reply, _ = await go(graph, "s5", "Teología I, dice Course not found")
         assert reply.startswith(text("support_failed", "es"))
         assert "https://ryca.unidadeducativa.org/soporte" in reply
 
@@ -270,10 +285,10 @@ class TestOfferHelpFirst:
         assert reply == text("teacher_tell_me", "es")
 
         # The flow is closed: the next message is triaged from scratch.
-        triage(b, IsmaelIntent.GREETING)
-        with patch("src.agents.greeting_response.get_provider", side_effect=RuntimeError):
-            nodes, _, _ = await go(graph, "t4", "gracias")
-        assert nodes == ["ismael_triage", "greeting_response"]
+        nodes, reply, quick = await go(graph, "t4", "gracias")
+        assert nodes == ["ismael_triage", "ismael_closing"]
+        # "Cuéntame qué necesitas" is not help yet: nothing to rate.
+        assert reply == text("closing_plain", "es", name=", Ana") and quick == []
 
     async def test_a_new_question_abandons_the_flow_and_is_answered(self, b):
         triage(b, IsmaelIntent.CONTACT_TEACHER)
@@ -624,6 +639,9 @@ async def test_a_hung_model_call_times_out_and_the_turn_still_replies(b, monkeyp
 
     b["provider"].generate_structured = hang
     graph = build_ismael_graph(MemorySaver())
+    nodes, reply, _ = await asyncio.wait_for(go(graph, "h1", "Tengo un error"), 5)
+    assert nodes == ["ismael_triage", "ismael_moodle_support"]
+    assert reply == text("support_clarify", "es")
     nodes, reply, _ = await asyncio.wait_for(go(graph, "h1", "El error es Course not found"), 5)
     assert nodes == ["ismael_triage", "ismael_moodle_support"]
     assert reply.startswith(text("support_failed", "es"))
@@ -691,6 +709,8 @@ async def test_support_fallback_sends_an_admin_question_to_the_contacts_not_the_
     triage(b, IsmaelIntent.MOODLE_SUPPORT, "cómo pago la matrícula")
     b["provider"].results[MoodleSupportResult] = TimeoutError()
     graph = build_ismael_graph(MemorySaver())
+    _, reply, _ = await go(graph, "sf1", "Tengo una duda con la matrícula")
+    assert reply == text("support_clarify_redirect", "es")
     _, reply, _ = await go(graph, "sf1", "¿Cómo pago la matrícula del próximo semestre?")
     assert "uebogota.matriculas@casaroca.org" in reply
     assert "ryca.unidadeducativa.org/soporte" not in reply

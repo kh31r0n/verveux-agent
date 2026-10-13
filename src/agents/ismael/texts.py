@@ -151,6 +151,32 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": "Comunícate con el soporte técnico de tu institución y cuéntales esto:",
         "en": "Contact your institution's technical support and tell them this:",
     },
+    "support_clarify": {
+        "es": (
+            "Para ayudarte bien, cuéntame un poco más: ¿qué intentabas hacer, en qué "
+            "curso o actividad, y qué ves exactamente en la pantalla (el mensaje textual, "
+            "si aparece alguno)?"
+        ),
+        "en": (
+            "To help you properly, tell me a bit more: what were you trying to do, in "
+            "which course or activity, and what exactly do you see on the screen (the "
+            "exact message, if there is one)?"
+        ),
+    },
+    "support_clarify_teacher": {
+        "es": (
+            "Para ayudarte bien con eso, cuéntame: ¿de qué curso y actividad es, y qué "
+            "nota o qué respuesta ves exactamente?"
+        ),
+        "en": (
+            "To help you properly with that, tell me: which course and activity is it, "
+            "and exactly which grade or answer do you see?"
+        ),
+    },
+    "support_clarify_redirect": {
+        "es": "Para orientarte bien, cuéntame un poco más: ¿qué trámite necesitas y para qué curso o periodo?",
+        "en": "To point you the right way, tell me a bit more: what do you need to do, and for which course or term?",
+    },
     "ticket_document": {"es": "Nro. de documento", "en": "ID number"},
     "ticket_document_missing": {
         "es": "tu número de documento",
@@ -199,6 +225,10 @@ _TEXTS: dict[str, dict[str, str]] = {
             "Sure. Before writing to your teacher, can I help you myself? I answer "
             "questions about theology and the virtual classroom."
         ),
+    },
+    "teacher_from_support": {
+        "es": "Eso lo revisa tu profesor; te ayudo a contactarlo.",
+        "en": "That is for your teacher to review; I'll help you reach them.",
     },
     "teacher_tell_me": {
         "es": "Con gusto. Cuéntame qué necesitas.",
@@ -316,6 +346,37 @@ _TEXTS: dict[str, dict[str, str]] = {
     "teacher_reason_other": {
         "es": "el aula virtual no lo aceptó en este momento",
         "en": "the virtual classroom did not accept it right now",
+    },
+    # ── Closing and the service rating ──
+    "closing_rate": {
+        "es": "¡Con gusto{name}! ¿Te sirvió mi ayuda?",
+        "en": "You're welcome{name}! Did my help work for you?",
+    },
+    "closing_plain": {
+        "es": "¡Con gusto{name}! Si necesitas algo más, aquí estoy.",
+        "en": "You're welcome{name}! If you need anything else, I'm here.",
+    },
+    "closing_again": {
+        "es": "¡Hola de nuevo{name}! ¿En qué más te ayudo?",
+        "en": "Hi again{name}! What else can I help you with?",
+    },
+    "rating_thanks": {
+        "es": "¡Gracias por tu calificación! Si necesitas algo más, aquí estoy.",
+        "en": "Thanks for your rating! If you need anything else, I'm here.",
+    },
+    "rating_ask_reason": {
+        "es": "Gracias por decírmelo. ¿Qué faltó o qué podría mejorar?",
+        "en": "Thanks for telling me. What was missing, or what could I do better?",
+    },
+    "rating_reason_thanks": {
+        "es": (
+            "Gracias, lo tendremos en cuenta. Si quieres, cuéntame de nuevo qué "
+            "necesitas y lo intento otra vez."
+        ),
+        "en": (
+            "Thank you, we'll take it into account. If you like, tell me again what "
+            "you need and I'll try once more."
+        ),
     },
     "failed": {
         "es": (

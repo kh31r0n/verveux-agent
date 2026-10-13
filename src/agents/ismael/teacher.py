@@ -3,7 +3,9 @@
 A small state machine in ``state["ismael"]["teacher"]``; while ``step`` is set
 triage routes straight here without an LLM call, like the survey latch.
 
-    (new)         offer help first ("¿puedo ayudarte yo?")
+    (new)         offer help first ("¿puedo ayudarte yo?") — skipped when the
+                  support branch hands over an academic matter it already
+                  clarified (``from_support``): straight to the teacher lookup
     offer_help    yes  → answer it (theology → Brain, Moodle → support) or ask what
                   no   → look up the student's courses and teachers
     choose_mode   "Envíalo tú" (ismael sends) / "Le escribo yo" (link only);
@@ -42,15 +44,22 @@ from ...schemas.ismael import TeacherDraft, TeacherStepAnswer, TeacherTopic
 from ...usage import make_usage_record
 from .. import backend_client
 from ..utils import latest_user_text
-from .common import bounded_structured, ask_options, fold, ismael_dict, match_option, reply, user_ctx
+from .common import (
+    ask_options,
+    bounded_structured,
+    fold,
+    ismael_dict,
+    latch_fresh,
+    mark_helped,
+    match_option,
+    reply,
+    user_ctx,
+)
 from .prompts import STEP_PROMPT, TEACHER_DRAFT_PROMPT
 from .texts import lang_of, text
 
 logger = structlog.get_logger(__name__)
 
-# A flow left half-way is forgotten after this long: the next message is a
-# fresh turn, not an answer to a question asked yesterday.
-FLOW_TTL_SECONDS = 30 * 60
 MAX_COURSE_OPTIONS = 8
 
 # Option labels: (es, en). The number a user types is the position.
@@ -77,11 +86,18 @@ def new_flow(reason: str, topic: TeacherTopic | str, faq: dict | None = None) ->
     return flow
 
 
+def from_support(reason: str) -> dict:
+    """A flow opened by the support branch for an academic matter (a grade, a
+    quiz question): support already clarified it, so there is no "can I help
+    you first?" — straight to finding the teacher, with the reason filled in."""
+    flow = new_flow(reason, TeacherTopic.NONE)
+    flow["skip_offer"] = True
+    return flow
+
+
 def flow_open(ismael: dict) -> bool:
     flow = ismael.get("teacher")
-    if not isinstance(flow, dict) or not flow.get("step"):
-        return False
-    return time.time() - float(flow.get("touched_at") or 0) < FLOW_TTL_SECONDS
+    return isinstance(flow, dict) and bool(flow.get("step")) and latch_fresh(flow)
 
 
 # The backend keeps quick-reply buttons only for labels of at most 60
@@ -117,13 +133,20 @@ class _Turn:
         self.lang = lang_of(state)
         self.text = latest_user_text(state)
         self.usage: list = []
+        # Said once before this turn's first message (the support handoff).
+        self.intro = ""
+
+    def _say(self, message: str) -> str:
+        if self.intro:
+            message, self.intro = f"{self.intro} {message}", ""
+        return message
 
     def ask(self, step: str, question: str, labels: list[str]) -> dict:
         self.flow["step"] = step
         self.flow["touched_at"] = time.time()
         self.ismael["teacher"] = self.flow
         return ask_options(
-            question, labels, ismael=self.ismael, turn_usage=self.usage, ismael_route="done"
+            self._say(question), labels, ismael=self.ismael, turn_usage=self.usage, ismael_route="done"
         )
 
     def prompt(self, step: str, message: str) -> dict:
@@ -131,11 +154,13 @@ class _Turn:
         self.flow["step"] = step
         self.flow["touched_at"] = time.time()
         self.ismael["teacher"] = self.flow
-        return reply(message, ismael=self.ismael, turn_usage=self.usage, ismael_route="done")
+        return reply(self._say(message), ismael=self.ismael, turn_usage=self.usage, ismael_route="done")
 
-    def finish(self, message: str) -> dict:
+    def finish(self, message: str, helped: bool = True) -> dict:
         self.ismael.pop("teacher", None)
-        return reply(message, ismael=self.ismael, turn_usage=self.usage, ismael_route="done")
+        if helped:
+            mark_helped(self.ismael)
+        return reply(self._say(message), ismael=self.ismael, turn_usage=self.usage, ismael_route="done")
 
     def hand_off(self, route: str) -> dict:
         """Leave the flow and let another node answer, in this same turn."""
@@ -219,7 +244,7 @@ async def _on_offer(turn: _Turn) -> dict:
         if reason and topic == TeacherTopic.MOODLE_SUPPORT.value:
             turn.ismael["support_question"] = reason
             return turn.hand_off("moodle_support")
-        return turn.finish(text("teacher_tell_me", turn.lang))
+        return turn.finish(text("teacher_tell_me", turn.lang), helped=False)
     return await _begin_contact(turn)
 
 
@@ -452,7 +477,7 @@ async def _on_confirm(turn: _Turn) -> dict:
     if index == 1:
         return turn.prompt("edit", text("teacher_edit", turn.lang))
     if index == 2:
-        return turn.finish(text("teacher_cancelled", turn.lang))
+        return turn.finish(text("teacher_cancelled", turn.lang), helped=False)
     # Free text that is not an option: read it as the change to make.
     return await _on_edit(turn)
 
@@ -515,6 +540,9 @@ async def ismael_teacher_node(state: AgentState, config: RunnableConfig) -> dict
     record_node_invocation("ismael_teacher")
     turn = _Turn(state, config)
     handler = _HANDLERS.get(str(turn.flow.get("step") or ""))
+    if handler is None and turn.flow.pop("skip_offer", False):
+        turn.intro = text("teacher_from_support", turn.lang)
+        return await _begin_contact(turn)
     if handler is None:
         return _offer(turn)
     return await handler(turn)

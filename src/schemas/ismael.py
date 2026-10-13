@@ -21,6 +21,8 @@ class IsmaelIntent(StrEnum):
     # Wants to talk to / write to their teacher.
     CONTACT_TEACHER = "contact_teacher"
     GREETING = "greeting"
+    # Thanks, "ok", "listo", a goodbye: the conversation is winding down.
+    CLOSING = "closing"
     OTHER = "other"
 
 
@@ -50,8 +52,19 @@ class TriageResult(BaseModel):
 
 class MoodleSupportOutcome(StrEnum):
     ANSWERED = "answered"
+    # The reply is a clarifying question: something is still missing to help.
+    ASK = "ask"
     NEEDS_TICKET = "needs_ticket"
     REDIRECT = "redirect"
+    # A grade, a quiz's content or its answers: the teacher's call, not support's.
+    TEACHER = "teacher"
+
+
+# Outcomes that send the student somewhere else. Code holds them back until the
+# student has answered at least one clarifying question.
+ESCALATIONS = frozenset(
+    {MoodleSupportOutcome.NEEDS_TICKET, MoodleSupportOutcome.REDIRECT, MoodleSupportOutcome.TEACHER}
+)
 
 
 class MoodleSupportResult(BaseModel):
@@ -61,6 +74,10 @@ class MoodleSupportResult(BaseModel):
     # meaningful with needs_ticket. The form link and the user's data are
     # appended in code, never by the model.
     ticket_description: str = Field(default="", max_length=1000)
+    # The one or two things still worth asking (course, activity, the exact
+    # message, what they tried). Code sends it instead of escalating when the
+    # student has not been asked anything yet.
+    clarifying_question: str = Field(default="", max_length=600)
 
 
 class TeacherStepAnswer(BaseModel):

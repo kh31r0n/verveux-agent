@@ -10,11 +10,25 @@ connection's ``moodleSupport`` config, which the backend forwards in
 When the problem needs the institution (``needs_ticket``) the ticket block is
 assembled HERE, in code: the form link and the user's own data must be exact,
 so the model only writes the description.
+
+Ask before escalating. A support case lives in ``state["ismael"]["support"]``
+(``question``, ``awaiting`` — the last reply asked something or gave steps to
+try —, ``clarified`` — how many of those the student answered —,
+``touched_at``).
+Every escalation (a ticket, a redirect to the institution's contacts, the
+teacher) is held back in code until ``clarified >= 1``: the model's
+``clarifying_question`` is sent instead. Prompts alone did not hold it — on
+2026-10-07 a student got the question and the ticket in one message.
+
+A grade or a quiz question the student disputes is the teacher's call:
+outcome ``teacher`` hands the turn to the teacher flow, which skips its
+"can I help you first?" offer (``teacher.from_support``).
 """
 
 from __future__ import annotations
 
 import re
+import time
 
 import structlog
 from langchain_core.runnables import RunnableConfig
@@ -23,15 +37,18 @@ from ...config import settings
 from ...graphs.state import AgentState
 from ...observability import record_node_invocation
 from ...providers.registry import get_provider, resolve_background_model
-from ...schemas.ismael import MoodleSupportOutcome, MoodleSupportResult
+from ...schemas.ismael import ESCALATIONS, MoodleSupportOutcome, MoodleSupportResult
 from ...usage import make_usage_record
 from ..utils import format_user_context, latest_user_text, resolve_persona, resolve_prompt
+from . import teacher
 from .common import (
     DEFAULT_PERSONA,
     bounded_structured,
     fold,
     history_messages,
     ismael_dict,
+    latch_fresh,
+    mark_helped,
     reply,
     user_ctx,
 )
@@ -107,6 +124,56 @@ def fallback_support_result(ctx: dict, question: str, lang: str) -> MoodleSuppor
     )
 
 
+def open_case(ismael: dict) -> dict:
+    """The support case in progress, or {} when there is none (or it expired)."""
+    case = ismael.get("support")
+    return dict(case) if latch_fresh(case) else {}
+
+
+def awaiting_answer(ismael: dict) -> bool:
+    """True when ismael's last support reply asked something or gave steps to
+    try, so the student's next message is most likely about the same case."""
+    return bool(open_case(ismael).get("awaiting"))
+
+
+def case_block(case: dict) -> str:
+    """Tells the model where the case stands, so it does not ask forever."""
+    if not case.get("clarified"):
+        return ""
+    return (
+        f"\n\nCaso abierto: «{case.get('question', '')}». El estudiante ya respondió "
+        f"{case['clarified']} pregunta(s) tuya(s) de aclaración: si ya tienes lo necesario, "
+        "resuelve o escala sin volver a preguntar lo mismo."
+    )
+
+
+def hold_escalation(result: MoodleSupportResult, case: dict, lang: str) -> MoodleSupportResult:
+    """No escalation before the student answered one clarifying question."""
+    if result.outcome not in ESCALATIONS or case.get("clarified", 0) >= 1:
+        return result
+    case["leaning"] = result.outcome.value
+    generic = {
+        MoodleSupportOutcome.TEACHER: "support_clarify_teacher",
+        MoodleSupportOutcome.REDIRECT: "support_clarify_redirect",
+    }.get(result.outcome, "support_clarify")
+    question = result.clarifying_question.strip() or text(generic, lang)
+    return MoodleSupportResult(reply=question, outcome=MoodleSupportOutcome.ASK)
+
+
+def ask_message(result: MoodleSupportResult, lang: str) -> str:
+    """The reply to an ``ask``: it must actually ask something."""
+    message = result.reply.strip()
+    question = result.clarifying_question.strip()
+    if not message:
+        return question or text("support_clarify", lang)
+    if "?" not in message and question:
+        # The reply circles the question without asking it: keep its opening
+        # sentence (the acknowledgement) and ask the question itself.
+        opening = re.split(r"(?<=[.!])\s+", message, maxsplit=1)[0]
+        return f"{opening} {question}"
+    return message
+
+
 async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) -> dict:
     """Answer a Moodle question; guide a ticket or redirect when it is not ours."""
     record_node_invocation("ismael_moodle_support")
@@ -119,12 +186,21 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     handed_over = ismael.pop("support_question", None)
     question = handed_over or ismael.get("question") or latest_user_text(state)
 
+    case = {} if handed_over else open_case(ismael)
+    if case.get("awaiting"):
+        # This message answers what ismael asked (or reports on the steps) last turn.
+        case["clarified"] = int(case.get("clarified") or 0) + 1
+        case["awaiting"] = False
+    if not case:
+        case = {"question": question, "clarified": 0}
+
     system = (
         resolve_prompt(config, "THEOLOGY_MOODLE_SUPPORT", MOODLE_SUPPORT_PROMPT, state)
         .replace("{persona}", persona)
         .replace("{language_rule}", _language_rule(lang))
         + format_user_context(state)
         + support_data_block(ctx)
+        + case_block(case)
     )
     usage: list = []
     try:
@@ -147,8 +223,31 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
         logger.warning("ismael_moodle_support_failed", error=str(exc) or type(exc).__name__)
         result = fallback_support_result(ctx, question, lang)
 
-    message = result.reply.strip()
+    result = hold_escalation(result, case, lang)
+    logger.info(
+        "ismael_moodle_support",
+        outcome=result.outcome.value,
+        clarified=case.get("clarified", 0),
+        held=case.get("leaning") if result.outcome == MoodleSupportOutcome.ASK else None,
+    )
+
+    if result.outcome == MoodleSupportOutcome.TEACHER:
+        ismael.pop("support", None)  # the teacher flow takes it from here
+        reason = result.ticket_description.strip() or case.get("question", "") or question
+        ismael["teacher"] = teacher.from_support(reason)
+        return {"ismael": ismael, "turn_usage": usage, "ismael_route": "teacher"}
+
+    if result.outcome == MoodleSupportOutcome.ASK:
+        message = ask_message(result, lang)
+    else:
+        message = result.reply.strip()
+        mark_helped(ismael)
+    # The case stays open even after a ticket: more detail next turn ("es en el
+    # foro de la tarea 3") continues it instead of being asked about again.
+    # "gracias" or the TTL closes it.
+    case["awaiting"] = True
+    case["touched_at"] = time.time()
+    ismael["support"] = case
     if result.outcome == MoodleSupportOutcome.NEEDS_TICKET:
         message = f"{message}\n\n{ticket_block(ctx, result.ticket_description, lang)}".strip()
-    logger.info("ismael_moodle_support", outcome=result.outcome.value)
     return reply(message, ismael=ismael, turn_usage=usage, ismael_route="done")

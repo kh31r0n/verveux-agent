@@ -9,6 +9,11 @@ the background job (`rag_job`). State lives in one dict, ``state["ismael"]``:
     survey_answers    {level, topic, intendedUse} → option key or "no_answer"
     teacher           the "contact my teacher" flow (see teacher.py); its
                       ``step`` latches triage like ``survey_step`` does
+    support           the Moodle support case in progress (see support.py)
+    rating            the 👍/👎 question after a closing (see closing.py),
+                      latched like the teacher flow
+    helped_at         when ismael last helped; rating_asked_at, when it last
+                      asked for a rating (at most once a day)
 
 The survey is asked once per contact: the backend reports
 ``user_context.ismael_survey_done`` once the answers are stored.
@@ -35,13 +40,15 @@ from ..utils import (
     resolve_persona,
     resolve_prompt,
 )
-from . import rag_job, teacher
+from . import closing, rag_job, support, teacher
 from .faq import faq_candidates, faq_candidates_block, pick_faq
 from .common import (
     DEFAULT_PERSONA,
     bounded_structured,
     fallback_intent,
     history_messages,
+    is_bare_closing,
+    mark_helped,
     match_option,
 )
 from .common import ismael_dict as _ismael
@@ -55,7 +62,11 @@ SURVEY_DONE = len(SURVEY) + 1
 
 # Intents that are answered even while a Brain job is running: they never
 # touch the library, so the student is not made to wait for it.
-_NOT_BLOCKED_BY_JOB = {IsmaelIntent.MOODLE_SUPPORT, IsmaelIntent.CONTACT_TEACHER}
+_NOT_BLOCKED_BY_JOB = {
+    IsmaelIntent.MOODLE_SUPPORT,
+    IsmaelIntent.CONTACT_TEACHER,
+    IsmaelIntent.CLOSING,
+}
 # Intents a matching FAQ answers directly. A greeting stays a greeting; a
 # teacher request keeps its flow and offers the FAQ as the "help first".
 _FAQ_INTENTS = {IsmaelIntent.THEOLOGY, IsmaelIntent.MOODLE_SUPPORT, IsmaelIntent.OTHER}
@@ -84,6 +95,22 @@ def _survey_done(state: AgentState, ismael: dict) -> bool:
     ctx = state.get("user_context") or {}
     from_backend = isinstance(ctx, dict) and bool(ctx.get("ismael_survey_done"))
     return from_backend or ismael.get("survey_step", 0) >= SURVEY_DONE
+
+
+def _already_talking(state: AgentState) -> bool:
+    """True when ismael has replied in this conversation recently: a "hola"
+    then is not a first contact and must not trigger the introduction again."""
+    return any(m.get("role") == "assistant" for m in history_messages(state))
+
+
+def _support_case_line(ismael: dict) -> str:
+    case = support.open_case(ismael)
+    if not case.get("awaiting"):
+        return ""
+    return (
+        f"\n\nHay un caso de soporte abierto: «{case.get('question', '')}». Si el mensaje "
+        "responde a lo que le preguntaste o cuenta cómo le fue con los pasos, es moodle_support."
+    )
 
 
 def _first_name(state: AgentState) -> str:
@@ -120,11 +147,19 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
         return {"ismael_route": "teacher"}
     ismael.pop("teacher", None)  # an expired flow is forgotten, not resumed
 
+    if closing.rating_open(ismael):
+        return {"ismael_route": "rating", "ismael": ismael}
+    ismael.pop("rating", None)
+
+    user_text = latest_user_text(state)
+    if is_bare_closing(user_text, resolve_persona(state, DEFAULT_PERSONA)):
+        # "gracias", "ok 👍": no model call, and never the introduction again.
+        return {"ismael_route": "closing", "intent": IsmaelIntent.CLOSING.value, "ismael": ismael}
+
     running = await rag_job.running_job(
         state.get("tenant_id") or "", state.get("conversation_id") or ""
     )
 
-    user_text = latest_user_text(state)
     candidates = faq_candidates(state)
     system = resolve_prompt(config, "THEOLOGY_TRIAGE", TRIAGE_PROMPT, state)
     usage: list = []
@@ -136,7 +171,10 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
             [
                 {
                     "role": "system",
-                    "content": system + format_user_context(state) + faq_candidates_block(candidates),
+                    "content": system
+                    + format_user_context(state)
+                    + _support_case_line(ismael)
+                    + faq_candidates_block(candidates),
                 },
                 *history_messages(state),
                 {"role": "user", "content": user_text},
@@ -169,8 +207,14 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
         IsmaelIntent.MOODLE_SUPPORT: "moodle_support",
         IsmaelIntent.CONTACT_TEACHER: "teacher",
         IsmaelIntent.GREETING: "greeting",
+        IsmaelIntent.CLOSING: "closing",
         IsmaelIntent.OTHER: "off_topic",
     }[result.intent]
+    if result.intent == IsmaelIntent.OTHER and support.awaiting_answer(ismael):
+        # "en la semana 3" is the answer to what support asked: keep the case going.
+        route = "moodle_support"
+    elif result.intent == IsmaelIntent.GREETING and _already_talking(state):
+        route = "regreet"
     ismael["question"] = (result.question or user_text).strip()
     if answered_by_faq:
         # The institution's curated answer wins — a theology question it
@@ -200,7 +244,7 @@ async def ismael_start_node(state: AgentState, config: RunnableConfig) -> dict:
 
     if _survey_done(state, ismael):
         await _spawn_answer(state, config, question)
-        return _reply_while_consulting(text("consulting", lang), lang, ismael=ismael)
+        return _reply_while_consulting(text("consulting", lang), lang, ismael=mark_helped(ismael))
 
     # Boot Brain now; the three survey turns are what pay for its ~1 min start.
     rag_job.start_host_in_background()
@@ -295,7 +339,7 @@ async def ismael_survey_node(state: AgentState, config: RunnableConfig) -> dict:
             logger.warning("ismael_survey_save_failed", error=str(exc))
     await _spawn_answer(state, config, ismael.get("pending_question") or reply)
     return _reply_while_consulting(
-        text("survey_done", lang), lang, ismael=ismael, turn_usage=usage
+        text("survey_done", lang), lang, ismael=mark_helped(ismael), turn_usage=usage
     )
 
 

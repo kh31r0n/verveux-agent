@@ -531,3 +531,42 @@ class TestCreditControl:
         assert reported["places_calls"] == 1
         assert reported["extract_failed"] == 3
         assert reported["extract_rate_limited"] == 2
+
+
+# ── /prospecting/search-health (read by the backend while an incident is open) ─
+
+
+class TestSearchHealthEndpoint:
+    def _get(self, balance, places_key=""):
+        from fastapi.testclient import TestClient
+
+        from src.main import app
+
+        with (
+            patch("src.main.serper_account_balance", AsyncMock(return_value=balance)),
+            patch.object(settings, "google_places_api_key", places_key),
+        ):
+            return TestClient(app).get(
+                "/prospecting/search-health",
+                headers={"x-agent-key": settings.webhook_api_key},
+            )
+
+    def test_credits_left(self):
+        body = self._get(2500, "k").json()
+        assert body["serper"] == {"ok": True, "balance": 2500}
+        assert body["google_places"]["ok"] is True
+
+    def test_empty_account(self):
+        assert self._get(-8).json()["serper"] == {"ok": False, "balance": -8}
+
+    def test_unknown_balance_is_not_ok(self):
+        body = self._get(None).json()
+        assert body["serper"]["ok"] is None
+        assert body["google_places"]["ok"] is False
+
+    def test_requires_service_auth(self):
+        from fastapi.testclient import TestClient
+
+        from src.main import app
+
+        assert TestClient(app).get("/prospecting/search-health").status_code in (401, 403)

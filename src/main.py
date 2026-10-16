@@ -43,11 +43,13 @@ from .services.google_places import (
     PlacesAuthError,
     PlacesQuotaExhaustedError,
     places_call_count,
+    places_configured,
     start_places_accounting,
 )
 from .services.serper import (
     SerperAuthError,
     SerperQuotaExhaustedError,
+    serper_account_balance,
     serper_call_count,
     start_serper_accounting,
 )
@@ -859,6 +861,34 @@ def prospecting_thread_id(tenant_id: str, run_id: str, run_date: str) -> str:
     clean. run_date is the fallback for older backends that omit run_id.
     """
     return f"prospecting:{tenant_id}:{run_id or run_date}"
+
+
+@app.get("/prospecting/search-health")
+async def prospecting_search_health(
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    """Can aurora search right now? Free to call — bills no search credit.
+
+    The backend asks this before its daily sweep while a search-provider
+    incident is open, and resolves the incident once the provider reports
+    ``ok: true``. ``ok: null`` means "could not tell" (keep the pause).
+
+    Serper exposes its balance on the free ``GET /account``. Google Places has
+    no free quota probe, so it reports ``ok`` when a key is configured: a daily
+    quota resets on its own, and if it has not the next run reopens the
+    incident.
+    """
+    balance = await serper_account_balance()
+    return {
+        "serper": {
+            "ok": None if balance is None else balance > 0,
+            "balance": balance,
+        },
+        "google_places": {
+            "ok": places_configured(),
+            "configured": places_configured(),
+        },
+    }
 
 
 @app.post("/prospecting/run", status_code=202)

@@ -29,6 +29,7 @@ logger = structlog.get_logger(__name__)
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 PLACES_ENDPOINT = "https://google.serper.dev/places"
+ACCOUNT_ENDPOINT = "https://google.serper.dev/account"
 
 
 # ── Serper credit accounting ─────────────────────────────────────────────────
@@ -80,6 +81,34 @@ class SerperAuthError(RuntimeError):
     """
 
 
+class SerperQuotaExhaustedError(SerperAuthError):
+    """The Serper account has no credits left.
+
+    Serper answers it with ``400 {"message": "Not enough credits"}`` — not a 402,
+    and not a 401/403, so before 2026-10-16 it fell into the generic retry path:
+    three billed attempts per call, a geo-fallback that doubled them, and a run
+    reported COMPLETED with nothing found. From 2026-10-13 to 10-16 every aurora
+    run "completed" that way while the account sat at a negative balance.
+
+    A subclass of :class:`SerperAuthError` so every path that already treats a
+    rejected credential as fatal (both agents' nodes, the run wrappers) treats
+    this one the same; the run wrappers check for this class first to report a
+    distinct reason.
+    """
+
+
+def is_quota_exhausted_response(status_code: int, body: str) -> bool:
+    """Is this Serper response "the account is out of credits"?
+
+    402 is accepted whatever the body says; a 400 only when the body mentions
+    credits, because Serper also answers 400 to a malformed request (e.g. a
+    `location` it does not recognise) and that one is a per-query miss.
+    """
+    if status_code == 402:
+        return True
+    return status_code == 400 and "credit" in (body or "").lower()
+
+
 async def serper_post(endpoint: str, payload: dict) -> dict | None:
     """POST to a Serper endpoint with exponential backoff. Returns parsed JSON
     or ``None`` on failure — callers tolerate a missing result set.
@@ -88,8 +117,11 @@ async def serper_post(endpoint: str, payload: dict) -> dict | None:
     only place the credit counter is incremented — including every retry, which
     Serper charges for just like the first attempt.
 
-    Raises :class:`SerperAuthError` when Serper rejects the key, which fails the
-    run instead of quietly returning no results — see that class.
+    Raises :class:`SerperAuthError` when Serper rejects the key and
+    :class:`SerperQuotaExhaustedError` when the account has no credits left;
+    both fail the run instead of quietly returning no results. Any other 4xx is
+    a verdict on the request itself and returns ``None`` without a retry; only
+    429, 5xx and transport errors are retried.
     """
     if not settings.serper_api_key:
         return None
@@ -99,10 +131,12 @@ async def serper_post(endpoint: str, payload: dict) -> dict | None:
     }
     delay = 0.6
     for attempt in range(3):
+        status_code: int | None = None
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 _count_serper_call()
                 resp = await client.post(endpoint, headers=headers, json=payload)
+                status_code = resp.status_code
                 if resp.status_code in (401, 403):
                     logger.error(
                         "serper_auth_failed",
@@ -114,10 +148,32 @@ async def serper_post(endpoint: str, payload: dict) -> dict | None:
                         f"{resp.status_code} on {endpoint}; the stored secret is "
                         "invalid, revoked or out of plan"
                     )
+                if is_quota_exhausted_response(resp.status_code, resp.text):
+                    logger.error(
+                        "serper_quota_exhausted",
+                        endpoint=endpoint,
+                        status_code=resp.status_code,
+                        body=resp.text[:200],
+                    )
+                    raise SerperQuotaExhaustedError(
+                        f"Serper has no credits left (HTTP {resp.status_code} on "
+                        f"{endpoint}): {resp.text[:200]}"
+                    )
                 if resp.status_code == 429 and attempt < 2:
                     await asyncio.sleep(delay)
                     delay *= 2
                     continue
+                if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    # A verdict on THIS request (bad `location`, malformed query):
+                    # the same payload fails the same way, and Serper bills every
+                    # attempt — so it is a per-query miss, never retried.
+                    logger.warning(
+                        "serper_request_rejected",
+                        endpoint=endpoint,
+                        status_code=resp.status_code,
+                        body=resp.text[:200],
+                    )
+                    return None
                 resp.raise_for_status()
                 data = resp.json()
             return data if isinstance(data, dict) else None
@@ -126,9 +182,36 @@ async def serper_post(endpoint: str, payload: dict) -> dict | None:
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
-            logger.warning("serper_request_failed", endpoint=endpoint, error=str(exc))
+            logger.warning(
+                "serper_request_failed",
+                endpoint=endpoint,
+                status_code=status_code,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             return None
     return None
+
+
+async def serper_account_balance() -> int | None:
+    """Credits left on the Serper account, or None when it cannot be read.
+
+    ``GET /account`` is free (not billed, not counted). Best effort: callers use
+    it for an early warning, never to decide whether to run.
+    """
+    if not settings.serper_api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                ACCOUNT_ENDPOINT, headers={"X-API-KEY": settings.serper_api_key}
+            )
+            resp.raise_for_status()
+            balance = resp.json().get("balance")
+        return int(balance) if isinstance(balance, (int, float)) else None
+    except Exception as exc:  # noqa: BLE001 — advisory only
+        logger.info("serper_balance_unavailable", error=str(exc))
+        return None
 
 
 # ── Response parsing ─────────────────────────────────────────────────────────

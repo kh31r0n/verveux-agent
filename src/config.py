@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -86,7 +88,26 @@ class Settings(BaseSettings):
     # Caps how many extract_and_enrich branches of the Send fan-out run at once.
     # Applied to the prospecting graph ONLY when the tenant's provider is Gemini
     # (its RPM quota is the tight one); other providers keep unbounded fan-out.
-    prospecting_gemini_extract_concurrency: int = 5
+    # Lowered from 5 on 2026-10-16: at 5 a run still lost ~17 extractions to
+    # 429 RESOURCE_EXHAUSTED after the provider's own retries (2026-10-13).
+    prospecting_gemini_extract_concurrency: int = 3
+    # ── Prospecting search sources & credit control ──────────────────────────
+    # Business listings come from Google Places API (New) when its key is set
+    # ("google"); "serper" keeps Serper /places; "off" skips listings. Without a
+    # key "google" falls back to "serper" (logged at run start).
+    google_places_api_key: str = ""
+    prospecting_places_provider: Literal["google", "serper", "off"] = "google"
+    # Rows per Places text search. Every row becomes one extraction LLM call, so
+    # this is a cost knob, not just a recall one; 10 matches what Serper gave.
+    prospecting_places_page_size: int = 10
+    # Hard cap on billable Serper calls in ONE run (retries and geo fallbacks
+    # included). Healthy runs spend 20-40; the cap stops a misbehaving one.
+    prospecting_max_serper_calls_per_run: int = 60
+    # Warn (`serper_low_balance`) when the account drops below this many credits.
+    prospecting_serper_low_balance: int = 300
+    # Extra registrable domains never sent to extraction, comma-separated, on
+    # top of the built-in list in prospecting_nodes._BLOCKED_DOMAINS.
+    prospecting_blocked_domains: str = ""
     # ── Prospecting self-improvement ─────────────────────────────────────────
     # In-run refinement loop: when a run's quality survivors fall short of
     # `prospecting_min_quality_prospects`, the graph refines its own queries and

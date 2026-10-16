@@ -39,7 +39,18 @@ from .agents.prospecting_nodes import DEFAULT_LOCATION
 from .providers.registry import background_model
 from .graphs.clara_graph import EMAIL_GRAPH_NAME
 from .services.gmail import GmailError
-from .services.serper import serper_call_count, start_serper_accounting
+from .services.google_places import (
+    PlacesAuthError,
+    PlacesQuotaExhaustedError,
+    places_call_count,
+    start_places_accounting,
+)
+from .services.serper import (
+    SerperAuthError,
+    SerperQuotaExhaustedError,
+    serper_call_count,
+    start_serper_accounting,
+)
 from .config import settings
 from .db.postgres import (
     close_pool,
@@ -755,26 +766,63 @@ async def metrics() -> Response:
 _prospecting_tasks: set[asyncio.Task] = set()
 
 
+def prospecting_failure(exc: Exception) -> dict:
+    """``{reason, provider?}`` for a run that raised.
+
+    The search-provider reasons are a contract with the backend, which opens a
+    platform incident and pauses every tenant's prospecting on
+    ``search_quota_exhausted`` / ``search_auth_failed`` instead of failing each
+    tenant's run, every day, into the same wall. Anything else is reported as
+    ``agent_error: <message>``.
+    """
+    if isinstance(exc, SerperQuotaExhaustedError):
+        return {"reason": "search_quota_exhausted", "provider": "serper"}
+    if isinstance(exc, PlacesQuotaExhaustedError):
+        return {"reason": "search_quota_exhausted", "provider": "google_places"}
+    if isinstance(exc, SerperAuthError):
+        return {"reason": "search_auth_failed", "provider": "serper"}
+    if isinstance(exc, PlacesAuthError):
+        return {"reason": "search_auth_failed", "provider": "google_places"}
+    return {"reason": f"agent_error: {exc}"}
+
+
+async def _checkpointed_usage(graph, config: dict) -> list[dict]:
+    """LLM usage the failed run had already checkpointed — best effort.
+
+    Those calls were made and must be billed; before 2026-10-16 the FAILED
+    report sent none (an exhausted-Serper run still paid for `refine_queries`).
+    """
+    try:
+        snapshot = await graph.aget_state(config)
+        return list((snapshot.values or {}).get("turn_usage") or [])
+    except Exception:  # noqa: BLE001 — never block the FAILED report
+        return []
+
+
 async def _run_prospecting(
     graph, inputs: dict, config: dict, run_id: str
 ) -> None:
     """Run one prospecting graph to completion in the background.
 
     The graph's ``report`` node reports COMPLETED on success. If the run raises
-    before reaching it, mark the run FAILED here so the backend's daily lock is
-    released and the (bounded) usage that did happen is not lost. The backend
-    reaper is the final backstop if even this report never lands.
+    before reaching it, mark the run FAILED here — with a reason the backend can
+    act on (see :func:`prospecting_failure`) — so the daily lock is released and
+    the usage that did happen is billed. The backend reaper is the final
+    backstop if even this report never lands.
     """
-    # Install the run-scoped Serper credit counter HERE, in the parent
-    # coroutine: LangGraph node tasks each get a copy of the context, so a
-    # ContextVar set inside a node would never be visible to `report_node`.
+    # Install the run-scoped credit counters HERE, in the parent coroutine:
+    # LangGraph node tasks each get a copy of the context, so a ContextVar set
+    # inside a node would never be visible to `report_node`.
     start_serper_accounting()
+    start_places_accounting()
     try:
         await graph.ainvoke(inputs, config)
     except Exception as exc:  # noqa: BLE001 — background task must not crash the loop
+        failure = prospecting_failure(exc)
         logger.error(
             "prospecting_run_failed",
             run_id=run_id,
+            reason=failure["reason"],
             error=str(exc),
             traceback=traceback.format_exc(),
         )
@@ -782,12 +830,14 @@ async def _run_prospecting(
             await report_prospecting_run(
                 run_id,
                 "FAILED",
-                # Serper credits were spent even though the run failed, so the
+                # Search credits were spent even though the run failed, so the
                 # platform cost report must still see them.
                 metrics={
-                    "reason": f"agent_error: {exc}",
+                    **failure,
                     "serper_calls": serper_call_count(),
+                    "places_calls": places_call_count(),
                 },
+                usage=await _checkpointed_usage(graph, config),
             )
         except Exception:  # noqa: BLE001
             logger.error("prospecting_fail_report_failed", run_id=run_id)

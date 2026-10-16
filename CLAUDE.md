@@ -85,6 +85,15 @@ Gmail → sanitize → triage → task extraction → reply draft → **human ap
 - **Memory:** human-edited replies (last 3 per sender, keyed by approval id) in the existing `AsyncPostgresStore`, namespace `("clara_sender_prefs", tenant_id)`. Written only on a human edit, never by a model.
 - **Eval:** `uv run python scripts/eval_clara.py` (real LLM, costs money) over `tests/fixtures/email/` with a local LLM-as-judge for `draft_criteria`.
 
+### Prospecting search sources (aurora)
+
+- **Sources:** organic results from Serper `/search`; business listings from **Google Places API (New)** text search (`src/services/google_places.py`, `GOOGLE_PLACES_API_KEY`), which replaced Serper `/places` on 2026-10-16 and halves the Serper credits a run spends. `PROSPECTING_PLACES_PROVIDER=google|serper|off`; "google" without a key falls back to Serper. Places rows carry `locality` from `addressComponents`, which `extract_and_enrich` prefers over the LLM's city.
+- **An empty account is a failure, not an empty result.** Serper answers `400 {"message":"Not enough credits"}`; `serper_post` raises `SerperQuotaExhaustedError` (a `SerperAuthError` subclass) on it without retrying, and any other 4xx is a per-query miss that is never retried (Serper bills retries). The run wrapper reports `FAILED` with `metrics.reason` `search_quota_exhausted` / `search_auth_failed` plus `provider` (`main.prospecting_failure`) — a contract with the backend, which opens one platform incident and pauses every tenant's prospecting. Before this (2026-10-13 → 10-16) every run reported COMPLETED with nothing found.
+- **Credit control:** `PROSPECTING_MAX_SERPER_CALLS_PER_RUN` (60) stops issuing queries; `report_node` reads the free `GET /account` balance into `metrics.serper_balance` and warns `serper_low_balance` under `PROSPECTING_SERPER_LOW_BALANCE`.
+- **What never reaches extraction:** directories, job boards, document dumps, maps and `.gov.co` (`_BLOCKED_DOMAINS`, extended by `PROSPECTING_BLOCKED_DOMAINS`) — a listing keeps its row but loses the directory URL. Social pages stay but skip the doomed fetch (`_NO_FETCH_DOMAINS`).
+- **Region:** in Colombia a configured core city also covers its metropolitan municipalities (`METRO_AREAS`: Envigado → Medellín, Soacha → Bogotá, Yumbo → Cali…).
+- Run metrics added: `places_calls`, `places_provider`, `blocked_results`, `extract_failed`, `extract_rate_limited`, `serper_balance`. Tests: `tests/test_prospecting_search_sources.py`.
+
 ### Theology agent (`ismael`, agent type THEOLOGY)
 
 Christian theology Q&A for the MOODLE bubble, answered by **Company Brain** (the cited RAG in `yorch-tauri-backend`, one EC2 host in AWS that is **stopped when idle**).

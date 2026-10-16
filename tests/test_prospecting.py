@@ -1138,12 +1138,13 @@ class TestProviderConfigErrorIsFatal:
     async def test_transient_failure_still_skips_the_item(self):
         """A timeout is per-page and must NOT sink a run of 130 good results."""
         out = await self._extract_with(httpx.ReadTimeout("timed out"))
-        assert out == {}
+        # Skipped (no candidate, no usage) — only counted for the run metrics.
+        assert out == {"extract_failures": ["error"]}
 
     async def test_plain_rate_limit_still_skips_the_item(self):
         """A bare 429 is transient — the Gemini provider already backs off."""
         out = await self._extract_with(Exception("429 RESOURCE_EXHAUSTED"))
-        assert out == {}
+        assert out == {"extract_failures": ["rate_limited"]}
 
 
 class TestIsProviderConfigError:

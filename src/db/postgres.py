@@ -19,11 +19,15 @@ async def init_pool() -> asyncpg.Pool:
     global _pool
     _pool = await asyncpg.create_pool(
         dsn=settings.database_url,
-        min_size=2,
-        max_size=10,
+        min_size=max(0, min(settings.database_pool_min, settings.database_pool_max)),
+        max_size=max(1, settings.database_pool_max),
         command_timeout=30,
     )
-    logger.info("db_pool_created", dsn=settings.database_url.split("@")[-1])
+    logger.info(
+        "db_pool_created",
+        dsn=settings.database_url.split("@")[-1],
+        max_size=max(1, settings.database_pool_max),
+    )
     return _pool
 
 

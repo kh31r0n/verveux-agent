@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     )
 
     database_url: str
+    # asyncpg pool bounds (the LangGraph checkpointer and store each hold one
+    # more connection of their own). Production's db-f1-micro is shared with
+    # the backend, rocky and the WhatsApp gateway, and this service scales to 3
+    # instances: the old fixed 2..10 per instance helped exhaust its connection
+    # limit on 2026-10-16. Set per deployment.
+    database_pool_min: int = 1
+    database_pool_max: int = 5
     # ── Service-to-service authentication (src/auth/service_auth.py) ─────────
     # `service_auth_audience` is this service's own Cloud Run URL: the `aud`
     # claim callers must request their ID token for. Empty disables OIDC

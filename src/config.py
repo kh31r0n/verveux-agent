@@ -228,6 +228,11 @@ class Settings(BaseSettings):
     # endpoint instead — at ~10 credits a page, only this many per lookup
     # (the top result first); the rest keep their search snippet.
     ismael_research_scrape_pages: int = 1
+    # Searches and page texts are cached platform-wide in the shared store
+    # (public documentation): a repeated error then spends no credits. A
+    # search that found nothing is retried sooner, the docs may gain a page.
+    ismael_research_cache_days: float = 30.0
+    ismael_research_negative_cache_days: float = 7.0
     clara_thinking_triage: int | None = 0
     clara_thinking_extract_task: int | None = 0
     clara_thinking_draft: int | None = None

@@ -41,6 +41,15 @@ def organic(*links: str) -> dict:
     return {"organic": [{"title": f"t{n}", "link": link, "snippet": f"snippet {n}"} for n, link in enumerate(links)]}
 
 
+@pytest.fixture(autouse=True)
+def _no_shared_cache():
+    """Each test starts with an empty cache and no shared store."""
+    research._local_cache.clear()
+    with patch("src.agents.ismael.research._store", return_value=None):
+        yield
+    research._local_cache.clear()
+
+
 @pytest.fixture
 def web():
     pages = {
@@ -323,3 +332,121 @@ class TestSupportResearch:
         graph = build_ismael_graph(MemorySaver())
         _, reply, _ = await go(graph, "r9", RESTORE_ERROR)
         assert reply == "¿En qué curso y actividad apareció?"
+
+
+# ── The cache: a repeated error spends no credits ────────────────────────────
+
+
+def _serper_calls(web, endpoint=None) -> int:
+    endpoint = endpoint or research.SERPER_ENDPOINT
+    return sum(1 for c in web["serper"].await_args_list if c.args[0] == endpoint)
+
+
+@pytest.fixture
+def scraping(web):
+    """docs.moodle.org refuses our fetcher (as in production); Serper scrapes."""
+    web["pages"].clear()
+
+    async def serper(endpoint, payload):
+        if endpoint == research.SCRAPE_ENDPOINT:
+            return {"text": f"scraped {payload['url']}", "credits": 10}
+        return organic(DOCS)
+
+    web["serper"].side_effect = serper
+    return web
+
+
+class TestCache:
+    async def test_the_same_error_twice_spends_credits_once(self, scraping):
+        first = await research.look_up("restore error_question_answers_missing_in_db")
+        second = await research.look_up("restore error_question_answers_missing_in_db conflict id")
+        assert first[1] == "read" and second[1] == "cached"
+        assert [s.text for s in first[0]] == [s.text for s in second[0]] == [f"scraped {DOCS}"]
+        assert _serper_calls(scraping) == 1
+        assert _serper_calls(scraping, research.SCRAPE_ENDPOINT) == 1
+        assert scraping["fetch"].call_count == 1  # the cached page is not fetched again
+
+    async def test_a_query_without_code_is_keyed_folded(self, scraping):
+        await research.look_up("Error al restaurar el CURSO")
+        _, outcome = await research.look_up("error al   restaurar el curso")
+        assert outcome == "cached" and _serper_calls(scraping) == 1
+
+    async def test_a_page_reached_by_another_search_is_not_scraped_again(self, scraping):
+        await research.look_up("first question")
+        sources, outcome = await research.look_up("a different question")
+        assert outcome == "read"  # the search itself was new (1 credit)…
+        assert _serper_calls(scraping, research.SCRAPE_ENDPOINT) == 1  # …the page was not
+        assert sources[0].text == f"scraped {DOCS}"
+
+    async def test_a_snippet_is_never_cached_as_the_page(self, web):
+        web["serper"].return_value = organic("https://docs.moodle.org/missing")
+        await research.look_up("x")
+        assert research._cache_key("https://docs.moodle.org/missing") not in {
+            key for (ns, key) in research._local_cache if ns == research._PAGE_NS
+        }
+
+    async def test_nothing_found_is_remembered_for_a_week_only(self, web, monkeypatch):
+        web["serper"].return_value = organic("https://stackoverflow.com/q/1")
+        assert await research.look_up("x") == ([], "no_results")
+        assert await research.look_up("x") == ([], "no_results")
+        assert web["serper"].await_count == 2  # one search, two tiers
+        later = research.time.time() + 8 * research._DAY
+        monkeypatch.setattr(research.time, "time", lambda: later)
+        await research.look_up("x")
+        assert web["serper"].await_count == 4
+
+    async def test_found_pages_expire_after_a_month(self, scraping, monkeypatch):
+        await research.look_up("restore error_question_answers_missing_in_db")
+        later = research.time.time() + 31 * research._DAY
+        monkeypatch.setattr(research.time, "time", lambda: later)
+        _, outcome = await research.look_up("restore error_question_answers_missing_in_db")
+        assert outcome == "read" and _serper_calls(scraping, research.SCRAPE_ENDPOINT) == 2
+
+    async def test_a_failed_search_is_not_remembered_as_empty(self, web):
+        web["serper"].return_value = None  # 5xx / transport error inside serper_post
+        assert await research.look_up("x") == ([], "no_results")
+        web["serper"].return_value = organic(DOCS)
+        sources, outcome = await research.look_up("x")
+        assert outcome == "read" and sources
+
+    async def test_no_credits_are_not_remembered(self, web):
+        web["serper"].side_effect = SerperQuotaExhaustedError("Not enough credits")
+        await research.look_up("x")
+        assert not research._local_cache
+
+    async def test_the_shared_store_serves_other_instances(self, scraping):
+        from langgraph.store.memory import InMemoryStore
+
+        store = InMemoryStore()
+        with patch("src.agents.ismael.research._store", return_value=store):
+            await research.look_up("restore error_question_answers_missing_in_db")
+            research._local_cache.clear()  # another Cloud Run instance
+            sources, outcome = await research.look_up("restore error_question_answers_missing_in_db")
+        assert outcome == "cached" and sources[0].text == f"scraped {DOCS}"
+        assert _serper_calls(scraping) == 1
+
+    async def test_a_broken_store_falls_back_to_this_instance(self, scraping):
+        class Broken:
+            async def aget(self, *a, **k):
+                raise RuntimeError("db down")
+
+            async def aput(self, *a, **k):
+                raise RuntimeError("db down")
+
+        with patch("src.agents.ismael.research._store", return_value=Broken()):
+            await research.look_up("restore error_question_answers_missing_in_db")
+            _, outcome = await research.look_up("restore error_question_answers_missing_in_db")
+        assert outcome == "cached" and _serper_calls(scraping) == 1
+
+    async def test_a_cached_lookup_still_answers_and_logs_it(self, b, scraping, capsys):
+        triage(b, IsmaelIntent.MOODLE_SUPPORT, "error al restaurar")
+        _first_pass(b)
+        b["provider"].results[ResearchedSupportResult] = ResearchedSupportResult(
+            reply="Exporta las preguntas a XML.", source_url=DOCS
+        )
+        await research.look_up("restore error_question_answers_missing_in_db")  # warms the cache
+        graph = build_ismael_graph(MemorySaver())
+        _, reply, _ = await go(graph, "c1", RESTORE_ERROR)
+        assert reply.endswith(text("research_more_info", "es", url=DOCS))
+        assert _serper_calls(scraping) == 1
+        assert '"cached": true' in capsys.readouterr().out

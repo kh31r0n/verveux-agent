@@ -372,6 +372,7 @@ async def _researched(
         user_text
     )
     sources, outcome = await research.look_up(query)
+    cached = outcome == "cached"  # read without spending a Serper credit
     url = ""
     result = first
     if sources:
@@ -411,5 +412,6 @@ async def _researched(
         urls=[s.url for s in sources],
         cited=url or None,
         outcome=outcome,
+        cached=cached,
     )
     return result, url

@@ -120,6 +120,13 @@ ismael_research_total = Counter(
     ["outcome"],
 )
 
+# kind: search | page · result: hit | miss
+ismael_research_cache_total = Counter(
+    "ismael_research_cache_total",
+    "ismael research cache lookups (a hit spends no Serper credit)",
+    ["kind", "result"],
+)
+
 
 def record_node_invocation(node: str, agent_code_name: str = "unknown") -> None:
     agent_node_invocations_total.labels(

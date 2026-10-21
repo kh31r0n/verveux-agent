@@ -30,6 +30,9 @@ logger = structlog.get_logger(__name__)
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 PLACES_ENDPOINT = "https://google.serper.dev/places"
 ACCOUNT_ENDPOINT = "https://google.serper.dev/account"
+# Page text through Serper (ismael's research): reads pages behind a bot
+# challenge, e.g. every moodle.org host. ~10 credits a page, not 1.
+SCRAPE_ENDPOINT = "https://scrape.serper.dev"
 
 
 # ── Serper credit accounting ─────────────────────────────────────────────────

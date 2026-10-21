@@ -815,3 +815,159 @@ def test_off_topic_does_not_offer_contacting_the_teacher(lang):
     reply = text("off_topic", lang, persona="Ismael").lower()
     assert "profesor" not in reply and "teacher" not in reply
     assert "aula virtual" in reply or "virtual classroom" in reply
+
+
+# ── The ticket once per case, and a support form that fails (2026-10-17) ─────
+
+
+async def _ticket_given(b, graph, thread):
+    """Turns 1–2 of Armando's case: a question, then the ticket."""
+    triage(b, IsmaelIntent.MOODLE_SUPPORT, "la tarea aparece como no entregada")
+    await clarify_first(b, graph, thread, "la tarea de la semana 2 aparece como no entregada")
+    b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
+        reply="Esto lo tiene que revisar soporte técnico.",
+        outcome=MoodleSupportOutcome.NEEDS_TICKET,
+        ticket_description="La tarea «Llamado de acercamiento a Cristo» aparece como no entregada.",
+    )
+    _, reply, _ = await go(graph, thread, "Llamado de acercamiento a Cristo, no me llegó correo")
+    assert reply.count("https://ryca.unidadeducativa.org/soporte") == 1
+
+
+class TestTicketOnce:
+    async def test_a_second_ticket_in_the_same_case_is_not_pasted_again(self, b):
+        graph = build_ismael_graph(MemorySaver())
+        await _ticket_given(b, graph, "t1")
+        _, reply, _ = await go(graph, "t1", "ya revisé y sigue igual")
+        assert "https://ryca.unidadeducativa.org/soporte" not in reply
+        assert "1020304050" not in reply
+        assert reply.endswith(text("ticket_already_given", "es"))
+
+    async def test_the_form_failing_gets_tips_even_when_the_model_says_ticket(self, b):
+        graph = build_ismael_graph(MemorySaver())
+        await _ticket_given(b, graph, "t2")
+        # The model still says needs_ticket, as it did in production.
+        _, reply, _ = await go(graph, "t2", "Sale error al tratar de enviar el ticket")
+        assert reply.startswith(text("support_form_failed", "es"))
+        assert "Adjunta una captura JPG, PNG o PDF de hasta 2 MB." in reply
+        assert reply.endswith(text("support_form_ask_error", "es"))
+        assert "https://ryca.unidadeducativa.org/soporte" not in reply
+        # A bare "Sale error" right after is still about the form.
+        _, reply, _ = await go(graph, "t2", "Sale error")
+        assert reply.startswith(text("support_form_failed", "es"))
+        assert "1020304050" not in reply
+
+    async def test_the_models_own_form_failed_gets_the_same_tips(self, b):
+        graph = build_ismael_graph(MemorySaver())
+        await _ticket_given(b, graph, "t3")
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
+            reply="Lamento lo del formulario.", outcome=MoodleSupportOutcome.FORM_FAILED
+        )
+        _, reply, _ = await go(graph, "t3", "la página del soporte no carga")
+        assert reply.startswith(text("support_form_failed", "es"))
+
+    async def test_the_model_is_told_the_ticket_was_given(self, b):
+        graph = build_ismael_graph(MemorySaver())
+        await _ticket_given(b, graph, "t4")
+        await go(graph, "t4", "ya revisé y sigue igual")
+        system = [m for name, m in b["provider"].calls if name == "MoodleSupportResult"][-1][0]
+        assert "Ya le diste el formulario de soporte" in system["content"]
+
+    def test_an_error_before_any_ticket_is_not_a_form_failure(self):
+        from src.agents.ismael.support import reports_form_failure
+
+        assert not reports_form_failure("sale error al enviar la tarea", {})
+        assert reports_form_failure("sale error al enviar la tarea", {"ticket_given_at": 1.0})
+        assert not reports_form_failure("ya me funcionó, gracias", {"ticket_given_at": 1.0})
+        assert reports_form_failure("Sale error", {"ticket_given_at": 1.0, "form_failed": True})
+
+
+class TestSupportContext:
+    async def test_messaging_off_reaches_the_support_prompt(self, b):
+        triage(b, IsmaelIntent.MOODLE_SUPPORT, "plazo")
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
+            reply="¿De qué curso?", outcome=MoodleSupportOutcome.ASK
+        )
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "c1", "necesito más plazo", ctx={**CTX, "lms_teacher_messaging": "false"})
+        await go(graph, "c2", "necesito más plazo")
+        systems = [m[0]["content"] for name, m in b["provider"].calls if name == "MoodleSupportResult"]
+        assert text("support_messaging_off", "es") in systems[0]
+        assert text("support_messaging_off", "es") not in systems[1]
+
+    def test_the_support_prompt_knows_the_common_problems(self):
+        from src.agents.ismael.prompts import MOODLE_SUPPORT_PROMPT
+
+        for needle in ("Borrador (no enviado)", "Continuar el último intento", "form_failed",
+                       "research_query", "rol de profesor", "curso que está viendo ahora"):
+            assert needle in MOODLE_SUPPORT_PROMPT
+
+    def test_general_answers_never_describe_a_work_without_sources(self):
+        from src.agents.ismael.prompts import GENERAL_PROMPT, TRIAGE_PROMPT
+
+        assert "NO describas su contenido" in GENERAL_PROMPT
+        assert "work" in TRIAGE_PROMPT
+
+
+# ── The teacher flow uses the course the student named (2026-10-21) ──────────
+
+
+def _named_courses_view(**overrides) -> dict:
+    def course(cid, fullname, teachers):
+        return {"id": cid, "fullname": fullname, "participantsUrl": f"https://aulas/user/index.php?id={cid}",
+                "teachers": teachers}
+
+    view = teachers_view(
+        currentCourseId=None,
+        messagingEnabled=False,
+        courses=[
+            course(1, "CURSO DE INDUCCIÓN 2026-1", [JUAN]),
+            course(2, "HISTORIA DEL CRISTIANISMO I-G1-II-IBLI-PRE-2026-2", [MARTA]),
+            course(3, "TEOLOGÍA SOCIAL-IBLI-IV-G1-2026-2", [JUAN]),
+            course(4, "TEOLOGÍA SOCIAL-PRE-AB-2026-1", [MARTA]),
+        ],
+    )
+    view.update(overrides)
+    return view
+
+
+class TestNamedCourse:
+    async def test_a_course_the_student_named_is_picked_without_asking(self, b):
+        b["lookup"].return_value = _named_courses_view()
+        b["email"].return_value = {"status": "OK", "email": "marta@colegio.edu", "teacherName": "Prof. Marta"}
+        triage(b, IsmaelIntent.CONTACT_TEACHER, "enviarle el mapa del cuestionario de Historia del cristianismo")
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "n1", "quiero enviar el mapa al correo del profe de historia del cristianismo")
+        _, reply, quick = await go(graph, "n1", "No, quiero contactar al profesor")
+        assert quick == []
+        assert reply == text("teacher_email_given", "es", teacher="Prof. Marta", email="marta@colegio.edu")
+        assert b["email"].await_args.kwargs["course_id"] == 2
+
+    async def test_several_named_courses_narrow_the_options(self, b):
+        b["lookup"].return_value = _named_courses_view()
+        triage(b, IsmaelIntent.CONTACT_TEACHER, "una duda de Teología social")
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "n2", "quiero escribirle al profesor de teología social")
+        _, reply, quick = await go(graph, "n2", "No, quiero contactar al profesor")
+        assert reply.startswith(text("teacher_pick_course", "es"))
+        assert quick[0]["options"] == ["TEOLOGÍA SOCIAL-IBLI-IV-G1-2026-2", "TEOLOGÍA SOCIAL-PRE-AB-2026-1"]
+
+    def test_course_subjects(self):
+        from src.agents.ismael.teacher import course_subject, match_courses
+
+        assert course_subject("HISTORIA DEL CRISTIANISMO I-G1-II-IBLI-PRE-2026-2") == "historia del cristianismo"
+        assert course_subject("CURSO DE INDUCCIÓN 2026-1") == "curso de induccion"
+        courses = [{"id": 1, "fullname": "Griego-G1"}, {"id": 2, "fullname": "Hebreo-G1"}]
+        assert match_courses(courses, ["dudas de griego antiguo"]) == [courses[0]]
+        assert match_courses(courses, ["griegos"]) == []
+
+    async def test_a_course_without_teachers_and_no_link_still_gives_tips(self, b):
+        view = teachers_view()
+        view["courses"][0]["teachers"] = []
+        view["courses"][0]["participantsUrl"] = ""
+        b["lookup"].return_value = view
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "n3", "quiero hablar con mi profesor")
+        await go(graph, "n3", "no")
+        _, reply, _ = await go(graph, "n3", "Le escribo yo")
+        assert reply == text("teacher_none_no_url", "es", course="Teología I")

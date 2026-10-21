@@ -48,6 +48,11 @@ class TriageResult(BaseModel):
     # answers the message — or the teacher request's reason — or "" when none
     # does. Validated against the candidates in code; never trusted blindly.
     faq_id: str = Field(default="", max_length=64)
+    # The book, document or author a theology question names, as the user
+    # wrote it ("Las llaves del poder", "Darío Silva"), or "". Matched against
+    # Brain's library catalog in code so the question can be asked of that one
+    # document: Brain searches chunk text only, never titles.
+    work: str = ""
 
 
 class MoodleSupportOutcome(StrEnum):
@@ -58,6 +63,9 @@ class MoodleSupportOutcome(StrEnum):
     REDIRECT = "redirect"
     # A grade, a quiz's content or its answers: the teacher's call, not support's.
     TEACHER = "teacher"
+    # The institution's support form itself fails to submit. Answered with
+    # tips in code; the ticket block is never pasted again.
+    FORM_FAILED = "form_failed"
 
 
 # Outcomes that send the student somewhere else. Code holds them back until the
@@ -78,6 +86,16 @@ class MoodleSupportResult(BaseModel):
     # message, what they tried). Code sends it instead of escalating when the
     # student has not been asked anything yet.
     clarifying_question: str = Field(default="", max_length=600)
+    # A web search for a concrete error the model cannot explain (in English,
+    # with Moodle's error code when it recognizes one), or "". Code runs it
+    # against Moodle's documentation only (research.py).
+    research_query: str = ""
+
+
+class ResearchedSupportResult(MoodleSupportResult):
+    # The fetched page the reply relies on, or "" when none answered the case.
+    # Validated against the pages actually read; the link is appended in code.
+    source_url: str = ""
 
 
 class TeacherStepAnswer(BaseModel):

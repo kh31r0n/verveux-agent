@@ -164,7 +164,8 @@ def is_bare_closing(message: str, persona: str = "") -> bool:
     return all(w in allowed for w in words) and any(w in _CLOSING_ANCHORS for w in words)
 
 
-def _mentions(folded: str, words: tuple[str, ...]) -> bool:
+def mentions(folded: str, words: tuple[str, ...]) -> bool:
+    """True when ``folded`` holds one of ``words`` as a whole-word prefix."""
     return any(re.search(r"\b" + re.escape(word), folded) for word in words)
 
 
@@ -179,8 +180,8 @@ def fallback_intent(fragments: list[str]) -> IsmaelIntent:
     """
     for fragment in reversed(fragments):
         folded = fold(fragment)
-        if _mentions(folded, _TEACHER_WORDS):
+        if mentions(folded, _TEACHER_WORDS):
             return IsmaelIntent.CONTACT_TEACHER
-        if _mentions(folded, _MOODLE_WORDS):
+        if mentions(folded, _MOODLE_WORDS):
             return IsmaelIntent.MOODLE_SUPPORT
     return IsmaelIntent.THEOLOGY

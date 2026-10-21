@@ -468,6 +468,9 @@ class TestFormatAnswer:
             "según las fuentes disponibles,  la gracia es un don.",
             "De acuerdo con los fragmentos, la gracia es un don.",
             "Con base en los documentos citados, la gracia es un don.",
+            # Seen in production on 2026-10-02 and 10-14.
+            "Según los textos bíblicos citados, la gracia es un don.",
+            "Según la documentación proporcionada, la gracia es un don.",
         ],
     )
     def test_source_preamble_is_dropped(self, raw):
@@ -542,7 +545,7 @@ class TestCompose:
         assert outcome == "answered" and usage == []
         assert message.startswith("La gracia es el favor inmerecido de Dios.")
         assert references == rag_job.answer_references(ANSWERED["answer"], "es")
-        brain["ask"].assert_awaited_once_with("¿Qué es la gracia?")
+        brain["ask"].assert_awaited_once_with("¿Qué es la gracia?", filters=None)
 
     @pytest.mark.parametrize("state", ["insufficient_evidence", "off_corpus"])
     async def test_uncovered_question_gets_a_plain_general_answer(self, brain, state):
@@ -723,3 +726,196 @@ class TestWaitHealthy:
 
         with patch(f"{BRAIN}.is_healthy", new=AsyncMock(return_value=False)):
             assert await brain.wait_healthy(time.monotonic() - 1) is False
+
+
+# ── Library titles and asking about one book ─────────────────────────────────
+
+
+class TestCleanTitle:
+    @pytest.mark.parametrize(
+        "raw, shown",
+        [
+            # File names Brain shows as titles (production, 2026-10).
+            ("07-LlavesDelPoder-INT.pdf.corrected", "Llaves Del Poder"),
+            ("05-CodigoJesus-_int-S.pdf.corrected", "Codigo Jesus"),
+            ("03-ElFrutoEterno_INT-S.pdf.corrected", "El Fruto Eterno"),
+            ("7.-Doctrina-de-la-Santificación", "Doctrina de la Santificación"),
+            ("El amor de rodillas-corregido", "El amor de rodillas"),
+            # Real titles keep their punctuation.
+            ("Obligaciones Del Cuerpo - Rev. Darío Silva Silva", "Obligaciones Del Cuerpo - Rev. Darío Silva Silva"),
+            ("Revolucion de los voluntarios", "Revolucion de los voluntarios"),
+            ("TB 2024", "TB 2024"),
+            ("Las llaves del poder", "Las llaves del poder"),
+        ],
+    )
+    def test_titles(self, raw, shown):
+        assert rag_job.clean_title(raw) == shown
+
+    def test_references_show_the_clean_title(self):
+        answer = {
+            "text": "Cuerpo.",
+            "citations": [{"chunk_id": "a"}],
+            "evidence": [{"chunk_id": "a", "title": "07-LlavesDelPoder-INT.pdf.corrected"}],
+        }
+        assert rag_job.format_answer(answer, "es").endswith("\n- Llaves Del Poder")
+        assert rag_job.answer_references(answer, "es")["items"][0]["title"] == "Llaves Del Poder"
+
+
+CATALOG = [
+    {"id": "d1", "title": "07-LlavesDelPoder-INT.pdf.corrected", "author": ""},
+    {"id": "d2", "title": "Obligaciones Del Cuerpo", "author": "Rev. Darío Silva Silva"},
+    {"id": "d3", "title": "La Oración", "author": "Rev. Darío Silva Silva"},
+    {"id": "d4", "title": "Teología Sistemática", "author": "Charles C. Ryrie"},
+]
+
+
+class TestMatchWork:
+    @pytest.mark.parametrize(
+        "work, doc_id",
+        [
+            ("Las llaves del poder", "d1"),
+            ("el libro las llaves del poder de Dario Silva", "d1"),
+            ("llaves del poder", "d1"),
+            ("Obligaciones del cuerpo", "d2"),
+            ("Ryrie", "d4"),
+        ],
+    )
+    def test_a_named_work_finds_its_document(self, work, doc_id):
+        assert rag_job.match_work(work, CATALOG)["id"] == doc_id
+
+    @pytest.mark.parametrize(
+        "work",
+        [
+            "",
+            "Darío Silva",  # an author with several books: no single document
+            "oración",  # one word shorter than eight letters is not a title
+            "El código Da Vinci",
+        ],
+    )
+    def test_no_or_several_matches_ask_unscoped(self, work):
+        assert rag_job.match_work(work, CATALOG) is None
+
+    def test_after_renaming_the_title_and_author_still_match(self):
+        renamed = [{"id": "d1", "title": "Las llaves del poder", "author": "Darío Silva-Silva"}, *CATALOG[1:]]
+        assert rag_job.match_work("las llaves del poder", renamed)["id"] == "d1"
+
+
+class TestAskOneDocument:
+    async def test_a_named_book_is_asked_of_that_document(self, brain):
+        with patch(
+            "src.agents.ismael.rag_job.brain.list_documents", new=AsyncMock(return_value=CATALOG)
+        ):
+            await rag_job._compose(_job(question="¿Qué enseña Las llaves del poder?", work="Las llaves del poder"))
+        brain["ask"].assert_awaited_once_with(
+            "¿Qué enseña Las llaves del poder?", filters={"document_id": "d1"}
+        )
+
+    async def test_no_match_asks_the_whole_library(self, brain):
+        with patch(
+            "src.agents.ismael.rag_job.brain.list_documents", new=AsyncMock(return_value=CATALOG)
+        ):
+            await rag_job._compose(_job(work="El código Da Vinci"))
+        assert brain["ask"].await_args.kwargs["filters"] is None
+
+    async def test_an_unreadable_catalog_asks_the_whole_library(self, brain):
+        from src.services.brain import BrainError
+
+        with patch(
+            "src.agents.ismael.rag_job.brain.list_documents",
+            new=AsyncMock(side_effect=BrainError("403")),
+        ):
+            _, _, outcome, _ = await rag_job._compose(_job(work="Las llaves del poder"))
+        assert outcome == "answered"
+        assert brain["ask"].await_args.kwargs["filters"] is None
+
+    async def test_no_work_never_reads_the_catalog(self, brain):
+        with patch("src.agents.ismael.rag_job.brain.list_documents", new=AsyncMock()) as listing:
+            await rag_job._compose(_job())
+        listing.assert_not_called()
+
+    async def test_triage_work_reaches_the_job(self, boundary):
+        boundary["triage"]._result = TriageResult(
+            intent=IsmaelIntent.THEOLOGY,
+            question="¿Qué enseña el libro Las llaves del poder de Darío Silva-Silva?",
+            work="Las llaves del poder",
+        )
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "w1", "y el libro las llaves del poder de Dario Silva?", user_context={"ismael_survey_done": "true"})
+        job = boundary["spawn"].await_args.args[0]
+        assert job.work == "Las llaves del poder"
+
+    async def test_a_moodle_turn_clears_the_work(self, boundary):
+        boundary["triage"]._result = TriageResult(
+            intent=IsmaelIntent.THEOLOGY, question="¿Qué enseña Las llaves del poder?", work="Las llaves del poder"
+        )
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "w2", "las llaves del poder", user_context={"ismael_survey_done": "true"})
+        boundary["triage"]._result = TriageResult(intent=IsmaelIntent.OTHER, work="ignored")
+        await _turn(graph, "w2", "¿qué hora es?", user_context={"ismael_survey_done": "true"})
+        state = await graph.aget_state({"configurable": {"thread_id": "w2"}})
+        assert state.values["ismael"]["work"] == ""
+
+
+class TestBrainCatalog:
+    async def test_list_documents_is_cached(self, monkeypatch):
+        from src.services import brain as brain_service
+
+        calls = []
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {"documents": [{"id": "d1", "title": "Las llaves del poder", "author": None}]}
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url, headers):
+                calls.append(url)
+                return Response()
+
+        monkeypatch.setattr(brain_service, "_catalog", None)
+        monkeypatch.setattr(brain_service.httpx, "AsyncClient", Client)
+        first = await brain_service.list_documents()
+        second = await brain_service.list_documents()
+        assert first == second == [{"id": "d1", "title": "Las llaves del poder", "author": ""}]
+        assert len(calls) == 1 and calls[0].endswith("/documents")
+
+    async def test_ask_sends_filters_only_when_given(self, monkeypatch):
+        from src.services import brain as brain_service
+
+        bodies = []
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {"question_id": "q1"}
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json, headers):
+                bodies.append(json)
+                return Response()
+
+        monkeypatch.setattr(brain_service.httpx, "AsyncClient", Client)
+        await brain_service.ask("a")
+        await brain_service.ask("b", filters={"document_id": "d1"})
+        assert "filters" not in bodies[0]
+        assert bodies[1]["filters"] == {"document_id": "d1"}

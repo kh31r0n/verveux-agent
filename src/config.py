@@ -212,6 +212,22 @@ class Settings(BaseSettings):
     ismael_thinking_classify: int | None = 0
     ismael_thinking_support: int | None = 0
     ismael_thinking_answer: int | None = 0
+    # ismael's support branch looks up a concrete error it cannot explain
+    # (a Moodle restore error on 2026-10-18 got a generic ticket) in Moodle's
+    # own documentation: one Serper query (~1 credit) restricted to these
+    # domains, then up to `ismael_research_max_pages` pages read through the
+    # SSRF-hardened fetcher. Search + fetch share one deadline, so with the
+    # second answer call the turn stays inside the backend's 60 s.
+    ismael_research_enabled: bool = True
+    ismael_research_domains: str = "docs.moodle.org,moodle.org,tracker.moodle.org"
+    ismael_research_timeout_seconds: float = 12.0
+    ismael_research_max_pages: int = 2
+    ismael_research_page_chars: int = 6000
+    # Every moodle.org host answers our fetcher with a Cloudflare challenge
+    # (403), so a page that refuses it is read through Serper's scrape
+    # endpoint instead — at ~10 credits a page, only this many per lookup
+    # (the top result first); the rest keep their search snippet.
+    ismael_research_scrape_pages: int = 1
     clara_thinking_triage: int | None = 0
     clara_thinking_extract_task: int | None = 0
     clara_thinking_draft: int | None = None

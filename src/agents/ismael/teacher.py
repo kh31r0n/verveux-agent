@@ -12,7 +12,9 @@ triage routes straight here without an LLM call, like the survey latch.
                   skipped when the site has messaging off — then the teacher's
                   email (asked of Moodle, which checks it is a teacher of the
                   student's course who shows it to participants) is the answer
-    pick_course   only when there is no current course and several enrolments
+    pick_course   only when there is no current course and several enrolments;
+                  a course the student named ("historia del cristianismo") is
+                  picked without asking, or narrows the options
     pick_teacher  only when the course lists several teachers
     compose       "¿Qué quieres decirle?" (skipped when the reason is known)
     confirm       draft + Enviar / Cambiar algo / Cancelar
@@ -31,6 +33,7 @@ cleared first, so this can never loop.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 
 import structlog
@@ -286,6 +289,34 @@ def _course_options(turn: _Turn) -> list[dict]:
     return (turn.flow.get("data") or {}).get("courses", [])[:MAX_COURSE_OPTIONS]
 
 
+def _words(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", fold(value or "")).split())
+
+
+# "HISTORIA DEL CRISTIANISMO I-G1-II-IBLI-PRE-2026-2": the subject is what comes
+# before the first "-", without a trailing level ("I", "2") a student never says.
+_TRAILING_LEVEL = re.compile(r"\s+(?:[ivx]{1,4}|\d+)$")
+
+
+def course_subject(fullname: str) -> str:
+    return _TRAILING_LEVEL.sub("", _words((fullname or "").split("-", 1)[0])).strip()
+
+
+def match_courses(courses: list[dict], texts: list[str]) -> list[dict]:
+    """The courses whose subject the student named in ``texts``, as whole words.
+
+    On 2026-10-21 a student who had just said «Historia del cristianismo» was
+    still asked to pick among eight courses, past terms included.
+    """
+    haystack = f" {_words(' '.join(t for t in texts if t))} "
+    hits = []
+    for course in courses:
+        subject = course_subject(course.get("fullname") or "")
+        if len(subject) >= 4 and f" {subject} " in haystack:
+            hits.append(course)
+    return hits
+
+
 async def _resolve_course(turn: _Turn) -> dict:
     data = turn.flow.get("data") or {}
     courses = data.get("courses") or []
@@ -293,6 +324,14 @@ async def _resolve_course(turn: _Turn) -> dict:
     course = next((c for c in courses if c.get("id") == current), None) if current else None
     if course is None and len(courses) == 1:
         course = courses[0]
+    if course is None:
+        named = match_courses(
+            courses, [turn.flow.get("reason") or "", turn.ismael.get("question") or "", turn.text]
+        )
+        if len(named) == 1:
+            course = named[0]
+        elif named:
+            data["courses"] = named  # offer only the ones they named
     if course is None:
         return turn.ask(
             "pick_course",
@@ -322,12 +361,13 @@ async def _resolve_teacher(turn: _Turn, course: dict) -> dict:
     }
     teachers = turn.flow["course"]["teachers"]
     if not teachers:
+        url = course.get("participantsUrl") or ""
         return turn.finish(
             text(
-                "teacher_none",
+                "teacher_none" if url else "teacher_none_no_url",
                 turn.lang,
                 course=turn.flow["course"]["fullname"],
-                url=course.get("participantsUrl") or "",
+                **({"url": url} if url else {}),
             )
         )
     if len(teachers) == 1:

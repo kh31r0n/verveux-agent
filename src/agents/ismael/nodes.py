@@ -4,6 +4,8 @@ Every node here replies within the turn; the answer itself arrives later from
 the background job (`rag_job`). State lives in one dict, ``state["ismael"]``:
 
     question          the current turn's question, made standalone by triage
+    work              the book, document or author a theology question names
+                      (triage), for asking Brain about that one document
     pending_question  the question the survey is holding / the job is answering
     survey_step       0 not started · 1-3 waiting for answer n · 4 done
     survey_answers    {level, topic, intendedUse} → option key or "no_answer"
@@ -128,6 +130,7 @@ async def _spawn_answer(state: AgentState, config: RunnableConfig, question: str
             language=lang_of(state),
             persona=resolve_persona(state, DEFAULT_PERSONA),
             llm_config=rag_job.job_llm_config(config),
+            work=str(_ismael(state).get("work") or ""),
         )
     )
 
@@ -216,6 +219,7 @@ async def ismael_triage_node(state: AgentState, config: RunnableConfig) -> dict:
     elif result.intent == IsmaelIntent.GREETING and _already_talking(state):
         route = "regreet"
     ismael["question"] = (result.question or user_text).strip()
+    ismael["work"] = result.work.strip()[:200] if result.intent == IsmaelIntent.THEOLOGY else ""
     if answered_by_faq:
         # The institution's curated answer wins — a theology question it
         # covers never reaches Brain, and asks no survey.

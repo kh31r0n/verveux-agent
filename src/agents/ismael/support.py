@@ -23,6 +23,14 @@ teacher) is held back in code until ``clarified >= 1``: the model's
 A grade or a quiz question the student disputes is the teacher's call:
 outcome ``teacher`` hands the turn to the teacher flow, which skips its
 "can I help you first?" offer (``teacher.from_support``).
+
+The ticket block goes out once per case (``ticket_given_at``): on 2026-10-17 a
+student told ismael twice that the form itself failed and got the whole block
+pasted again both times. A failing form is outcome ``form_failed`` — fixed tips
+in code, never the ticket again — also when the model says ``needs_ticket``.
+
+A concrete error the model cannot explain is looked up in Moodle's
+documentation first (``research.py``); the reply then cites the page it used.
 """
 
 from __future__ import annotations
@@ -35,12 +43,17 @@ from langchain_core.runnables import RunnableConfig
 
 from ...config import settings
 from ...graphs.state import AgentState
-from ...observability import record_node_invocation
+from ...observability import ismael_research_total, record_node_invocation
 from ...providers.registry import get_provider, resolve_background_model
-from ...schemas.ismael import ESCALATIONS, MoodleSupportOutcome, MoodleSupportResult
+from ...schemas.ismael import (
+    ESCALATIONS,
+    MoodleSupportOutcome,
+    MoodleSupportResult,
+    ResearchedSupportResult,
+)
 from ...usage import make_usage_record
 from ..utils import format_user_context, latest_user_text, resolve_persona, resolve_prompt
-from . import teacher
+from . import research, teacher
 from .common import (
     DEFAULT_PERSONA,
     bounded_structured,
@@ -49,10 +62,11 @@ from .common import (
     ismael_dict,
     latch_fresh,
     mark_helped,
+    mentions,
     reply,
     user_ctx,
 )
-from .prompts import MOODLE_SUPPORT_PROMPT
+from .prompts import MOODLE_SUPPORT_PROMPT, RESEARCH_PROMPT
 from .texts import lang_of, text
 
 logger = structlog.get_logger(__name__)
@@ -73,6 +87,9 @@ def support_data_block(ctx: dict) -> str:
         lines.append(f"- Contactos para otros temas: {ctx['lms_other_contacts']}")
     if not lines:
         lines.append("- La institución no configuró datos de soporte.")
+    if ctx.get("lms_teacher_messaging") == "false":
+        # Only the backend's explicit "false": an absent key may be an older plugin.
+        lines.append(f"- {text('support_messaging_off', 'es')}")
     return "\n\nDatos de soporte de la institución:\n" + "\n".join(lines)
 
 
@@ -98,6 +115,38 @@ def ticket_block(ctx: dict, description: str, lang: str) -> str:
     if ctx.get("lms_support_instructions"):
         block += f"\n\n{ctx['lms_support_instructions']}"
     return block
+
+
+def form_failed_message(ctx: dict, lang: str) -> str:
+    """Tips for a support form that will not submit, in code: the form's own
+    limits come from the institution's instructions, never from the model."""
+    parts = [text("support_form_failed", lang)]
+    if ctx.get("lms_support_instructions"):
+        parts.append(text("support_form_instructions", lang, instructions=ctx["lms_support_instructions"]))
+    parts.append(text("support_form_ask_error", lang))
+    return "\n\n".join(parts)
+
+
+# A message saying the support form (or the ticket) fails to submit. Folded,
+# prefix match, like _ADMIN_WORDS.
+_FORM_WORDS = ("formulario", "ticket", "solicitud", "soporte", "enviar", "envio", "registrar")
+_FAIL_WORDS = (
+    "error", "falla", "fallo", "no deja", "no me deja", "no sirve", "no funciona",
+    "no carga", "no envia", "no se envia", "no puedo enviar",
+)
+
+
+def reports_form_failure(message: str, case: dict) -> bool:
+    """After the ticket was handed out: is this "the form gives an error"?
+
+    Once a case is in that state, a bare "sale error" is still about the form.
+    """
+    if not case.get("ticket_given_at"):
+        return False
+    folded = fold(message)
+    if not mentions(folded, _FAIL_WORDS):
+        return False
+    return bool(case.get("form_failed")) or mentions(folded, _FORM_WORDS)
 
 
 # Administrative topics the technical-support form explicitly does not take
@@ -138,13 +187,19 @@ def awaiting_answer(ismael: dict) -> bool:
 
 def case_block(case: dict) -> str:
     """Tells the model where the case stands, so it does not ask forever."""
-    if not case.get("clarified"):
-        return ""
-    return (
-        f"\n\nCaso abierto: «{case.get('question', '')}». El estudiante ya respondió "
-        f"{case['clarified']} pregunta(s) tuya(s) de aclaración: si ya tienes lo necesario, "
-        "resuelve o escala sin volver a preguntar lo mismo."
-    )
+    lines = []
+    if case.get("clarified"):
+        lines.append(
+            f"Caso abierto: «{case.get('question', '')}». El estudiante ya respondió "
+            f"{case['clarified']} pregunta(s) tuya(s) de aclaración: si ya tienes lo necesario, "
+            "resuelve o escala sin volver a preguntar lo mismo."
+        )
+    if case.get("ticket_given_at"):
+        lines.append(
+            "Ya le diste el formulario de soporte con sus datos: no lo repitas. Si dice que "
+            'el formulario falla al enviarlo, el outcome es "form_failed".'
+        )
+    return "".join(f"\n\n{line}" for line in lines)
 
 
 def hold_escalation(result: MoodleSupportResult, case: dict, lang: str) -> MoodleSupportResult:
@@ -186,6 +241,7 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     handed_over = ismael.pop("support_question", None)
     question = handed_over or ismael.get("question") or latest_user_text(state)
 
+    started = time.monotonic()
     case = {} if handed_over else open_case(ismael)
     if case.get("awaiting"):
         # This message answers what ismael asked (or reports on the steps) last turn.
@@ -202,27 +258,37 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
         + support_data_block(ctx)
         + case_block(case)
     )
+    user_text = handed_over or latest_user_text(state) or question
+    messages = [
+        {"role": "system", "content": system},
+        *history_messages(state),
+        {"role": "user", "content": user_text},
+    ]
     usage: list = []
+    source_url = ""
     try:
         provider = get_provider(config)
         model = resolve_background_model(config)
         result = await bounded_structured(
             provider,
-            [
-                {"role": "system", "content": system},
-                *history_messages(state),
-                {"role": "user", "content": handed_over or latest_user_text(state) or question},
-            ],
+            messages,
             model,
             MoodleSupportResult,
             timeout=settings.ismael_timeout_answer_seconds,
             thinking_budget=settings.ismael_thinking_support,
         )
         usage.append(make_usage_record(node="ismael_moodle_support", provider=provider, model=model))
+        if _wants_research(result, case, user_text, started):
+            result, source_url = await _researched(
+                provider, model, messages, result, case, user_text, usage
+            )
     except Exception as exc:  # noqa: BLE001 — a fallback answer, never silence
         logger.warning("ismael_moodle_support_failed", error=str(exc) or type(exc).__name__)
         result = fallback_support_result(ctx, question, lang)
 
+    if reports_form_failure(user_text, case):
+        # The model may still say "needs_ticket": the form is what failed.
+        result = MoodleSupportResult(reply=result.reply, outcome=MoodleSupportOutcome.FORM_FAILED)
     result = hold_escalation(result, case, lang)
     logger.info(
         "ismael_moodle_support",
@@ -239,8 +305,14 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
 
     if result.outcome == MoodleSupportOutcome.ASK:
         message = ask_message(result, lang)
+    elif result.outcome == MoodleSupportOutcome.FORM_FAILED:
+        case["form_failed"] = True
+        message = form_failed_message(ctx, lang)
+        mark_helped(ismael)
     else:
         message = result.reply.strip()
+        if source_url:
+            message = f"{message}\n\n{text('research_more_info', lang, url=source_url)}".strip()
         mark_helped(ismael)
     # The case stays open even after a ticket: more detail next turn ("es en el
     # foro de la tarea 3") continues it instead of being asked about again.
@@ -249,5 +321,95 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     case["touched_at"] = time.time()
     ismael["support"] = case
     if result.outcome == MoodleSupportOutcome.NEEDS_TICKET:
-        message = f"{message}\n\n{ticket_block(ctx, result.ticket_description, lang)}".strip()
+        if case.get("ticket_given_at"):
+            block = text("ticket_already_given", lang)
+        else:
+            block = ticket_block(ctx, result.ticket_description, lang)
+            case["ticket_given_at"] = time.time()
+        message = f"{message}\n\n{block}".strip()
     return reply(message, ismael=ismael, turn_usage=usage, ismael_route="done")
+
+
+# The research pass must leave room for its second call inside the backend's
+# 60 s turn (triage and the settle window run before this node): it only runs
+# when the first call came back quickly, and the second call has its own cap.
+_RESEARCH_IF_FIRST_CALL_UNDER_SECONDS = 8.0
+_RESEARCH_ANSWER_TIMEOUT_SECONDS = 15.0
+_NO_RESEARCH_OUTCOMES = {
+    MoodleSupportOutcome.TEACHER,
+    MoodleSupportOutcome.REDIRECT,
+    MoodleSupportOutcome.FORM_FAILED,
+}
+
+
+def _wants_research(
+    result: MoodleSupportResult, case: dict, user_text: str, started: float
+) -> bool:
+    if not settings.ismael_research_enabled or case.get("researched"):
+        return False
+    if result.outcome in _NO_RESEARCH_OUTCOMES or reports_form_failure(user_text, case):
+        return False
+    if not (result.research_query.strip() or research.pasted_error_page(user_text)):
+        return False
+    return time.monotonic() - started <= _RESEARCH_IF_FIRST_CALL_UNDER_SECONDS
+
+
+async def _researched(
+    provider,
+    model: str,
+    messages: list[dict],
+    first: MoodleSupportResult,
+    case: dict,
+    user_text: str,
+    usage: list,
+) -> tuple[MoodleSupportResult, str]:
+    """Look the error up and answer again from the pages; (result, cited url).
+
+    Keeps ``first`` unless the second answer cites one of the pages read.
+    """
+    case["researched"] = True  # one lookup per case: Serper bills every query
+    query = first.research_query.strip()[: research.MAX_QUERY_CHARS] or research.query_from_text(
+        user_text
+    )
+    sources, outcome = await research.look_up(query)
+    url = ""
+    result = first
+    if sources:
+        system = messages[0]["content"] + RESEARCH_PROMPT + research.sources_block(sources)
+        try:
+            second = await bounded_structured(
+                provider,
+                [{"role": "system", "content": system}, *messages[1:]],
+                model,
+                ResearchedSupportResult,
+                timeout=_RESEARCH_ANSWER_TIMEOUT_SECONDS,
+                thinking_budget=settings.ismael_thinking_support,
+            )
+            usage.append(
+                make_usage_record(node="ismael_moodle_research", provider=provider, model=model)
+            )
+        except Exception as exc:  # noqa: BLE001 — the first answer still stands
+            logger.warning("ismael_research_answer_failed", error=str(exc) or type(exc).__name__)
+            outcome = "error"
+        else:
+            url = research.cited_url(second.source_url, sources)
+            if url:
+                result = MoodleSupportResult(**second.model_dump(exclude={"source_url"}))
+                if result.outcome == MoodleSupportOutcome.NEEDS_TICKET:
+                    # A documented cause and fix is an answer; held as a ticket
+                    # it would be replaced by a clarifying question and lost.
+                    result.outcome = MoodleSupportOutcome.ANSWERED
+                    result.ticket_description = ""
+                outcome = "answered"
+            else:
+                outcome = "unresolved"
+    if outcome != "disabled":
+        ismael_research_total.labels(outcome=outcome).inc()
+    logger.info(
+        "ismael_research",
+        query=query,
+        urls=[s.url for s in sources],
+        cited=url or None,
+        outcome=outcome,
+    )
+    return result, url

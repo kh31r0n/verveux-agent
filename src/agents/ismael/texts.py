@@ -177,6 +177,45 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": "Para orientarte bien, cuéntame un poco más: ¿qué trámite necesitas y para qué curso o periodo?",
         "en": "To point you the right way, tell me a bit more: what do you need to do, and for which course or term?",
     },
+    "ticket_already_given": {
+        "es": "Los datos para el formulario están en mi mensaje anterior.",
+        "en": "The details for the form are in my previous message.",
+    },
+    "support_form_failed": {
+        "es": (
+            "Lamento que el formulario no te deje enviar la solicitud. Prueba esto antes "
+            "de enviarlo de nuevo:\n"
+            "- Adjunta una captura de pantalla en vez de una foto del celular: pesa menos "
+            "y suele estar en un formato aceptado.\n"
+            "- Revisa que el archivo cumpla el formato y el tamaño que pide el formulario.\n"
+            "- Escribe el número de documento solo con números, sin puntos ni espacios.\n"
+            "- Si la página estuvo abierta mucho rato, recárgala y vuelve a llenarla.\n"
+            "- Si sigue fallando, inténtalo desde otro navegador o en una ventana de incógnito."
+        ),
+        "en": (
+            "Sorry the form won't let you submit the request. Try this before sending it "
+            "again:\n"
+            "- Attach a screenshot instead of a phone photo: it is smaller and usually in "
+            "an accepted format.\n"
+            "- Check that the file meets the format and size the form asks for.\n"
+            "- Type the ID number with digits only, no dots or spaces.\n"
+            "- If the page was open for a long time, reload it and fill it in again.\n"
+            "- If it still fails, try another browser or a private window."
+        ),
+    },
+    "support_form_instructions": {
+        "es": "Lo que pide el formulario: {instructions}",
+        "en": "What the form asks for: {instructions}",
+    },
+    "support_form_ask_error": {
+        "es": "Si aun así no funciona, cuéntame qué mensaje te aparece exactamente al enviarlo.",
+        "en": "If it still doesn't work, tell me exactly what message appears when you submit it.",
+    },
+    "research_more_info": {"es": "Más información: {url}", "en": "More information: {url}"},
+    "support_messaging_off": {
+        "es": "La mensajería entre usuarios del aula está desactivada: no sugieras escribir por la mensajería de Moodle.",
+        "en": "Messaging between users is turned off in the classroom: never suggest writing through Moodle's messaging.",
+    },
     "ticket_document": {"es": "Nro. de documento", "en": "ID number"},
     "ticket_document_missing": {
         "es": "tu número de documento",
@@ -248,10 +287,27 @@ _TEXTS: dict[str, dict[str, str]] = {
     },
     "teacher_none": {
         "es": (
-            "No encontré profesores publicados para «{course}». Puedes ver a los "
-            "participantes del curso aquí: {url}"
+            "«{course}» todavía no tiene un profesor publicado en el aula virtual. En "
+            "«Participantes» puedes filtrar por el rol «Profesor» para ver quién lo dicta: "
+            "{url}\nSi no aparece nadie, consúltalo con la institución."
         ),
-        "en": "I couldn't find any listed teachers for “{course}”. You can see the course participants here: {url}",
+        "en": (
+            "“{course}” has no teacher listed in the virtual classroom yet. In "
+            "“Participants” you can filter by the “Teacher” role to see who teaches it: "
+            "{url}\nIf nobody appears, ask the institution."
+        ),
+    },
+    "teacher_none_no_url": {
+        "es": (
+            "«{course}» todavía no tiene un profesor publicado en el aula virtual. Dentro "
+            "del curso, en «Participantes», puedes filtrar por el rol «Profesor»; si no "
+            "aparece nadie, consúltalo con la institución."
+        ),
+        "en": (
+            "“{course}” has no teacher listed in the virtual classroom yet. Inside the "
+            "course, in “Participants”, you can filter by the “Teacher” role; if nobody "
+            "appears, ask the institution."
+        ),
     },
     "teacher_no_courses": {
         "es": (

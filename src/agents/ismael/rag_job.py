@@ -159,8 +159,48 @@ def clean_title(title: str) -> str:
     return cleaned.strip() or title
 
 
+# A recording's locator: "00:12:34 · https://www.youtube.com/watch?v=…&t=754s"
+# (or an s3:// URL a student cannot open). Brain builds it from facts that never
+# move, so it is parsed rather than rebuilt.
+_TIMED_LOCATOR = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})\s*·\s*(\S+)")
+MAX_REFERENCE_DETAIL = 200  # REFERENCE_LIMITS.maxDetailLength in the backend
+MAX_REFERENCE_TITLE = 300
+
+
+def _source_title(ev: dict, fallback: str) -> str:
+    """«Las llaves del poder — Darío Silva-Silva (2004)» from the evidence's
+    record facts (Brain's ficha); just the clean title when it has none."""
+    title = clean_title(ev.get("title") or fallback)
+    if not title:
+        return ""
+    who = (ev.get("author") or ev.get("source_name") or "").strip()
+    year = ev.get("published_year")
+    if who and who.lower() not in title.lower():
+        title = f"{title} — {who}"
+    if isinstance(year, int) and str(year) not in title:
+        title = f"{title} ({year})"
+    return title[:MAX_REFERENCE_TITLE]
+
+
+def _timed_detail(locator: str) -> str | None:
+    """«min 12:34 · <link that opens it there>» for a recording, else None."""
+    match = _TIMED_LOCATOR.match(locator or "")
+    if not match:
+        return None
+    hours, minutes, seconds, where = match.groups()
+    at = f"{minutes}:{seconds}" if hours.strip("0") == "" else f"{int(hours)}:{minutes}:{seconds}"
+    detail = f"min {at}"
+    if where.startswith(("http://", "https://")) and len(detail) + 3 + len(where) <= MAX_REFERENCE_DETAIL:
+        detail = f"{detail} · {where}"
+    return detail
+
+
 def _reference_items(answer: dict, lang: str) -> list[tuple[str, str | None]]:
-    """(title, detail) per cited source: once per (title, page), in citation order."""
+    """(title, detail) per cited source: once per (title, page), in citation order.
+
+    The title carries the author and year when Brain's ficha knows them; a
+    recording's detail is the minute it was said, with its link.
+    """
     evidence = {e.get("chunk_id"): e for e in answer.get("evidence") or [] if isinstance(e, dict)}
     items: list[tuple[str, str | None]] = []
     seen: set[tuple[str, str]] = set()
@@ -168,12 +208,17 @@ def _reference_items(answer: dict, lang: str) -> list[tuple[str, str | None]]:
         if not isinstance(citation, dict):
             continue
         ev = evidence.get(citation.get("chunk_id")) or {}
-        title = clean_title(ev.get("title") or citation.get("section_title") or "")
+        title = _source_title(ev, citation.get("section_title") or "")
         if not title:
             continue
         page = citation.get("page") or ev.get("page")
         where = (citation.get("section_title") or "").strip()
-        detail = f"{text('page', lang)} {page}" if page else where
+        if ev.get("kind") == "ficha":
+            detail = None  # the record itself: nothing to point into
+        elif timed := _timed_detail(citation.get("locator") or ev.get("locator") or ""):
+            detail = timed
+        else:
+            detail = f"{text('page', lang)} {page}" if page else where
         key = (title, str(detail))
         if key in seen:
             continue
@@ -297,8 +342,10 @@ def match_work(work: str, documents: list[dict]) -> dict | None:
     """The one catalog document ``work`` names, or None when none (or several) do.
 
     A title matches when one title contains the other as whole words (at least
-    two words or eight letters); an author alone matches only when they have a
-    single document. A title shared by several documents is settled by the author.
+    two words or eight letters), the title plus its subtitle included; an
+    author (or any contributor in Brain's ficha) alone matches only when they
+    have a single document. A title shared by several documents is settled by
+    the author.
     """
     wanted = _core(work)
     if not wanted:
@@ -307,13 +354,22 @@ def match_work(work: str, documents: list[dict]) -> dict | None:
     padded = f" {wanted} "
     by_title, by_author = [], []
     for doc in documents:
-        title = _core(clean_title(doc.get("title") or ""))
-        if title and (
-            (_long_enough(title) and f" {title} " in padded)
-            or (_long_enough(wanted) and padded in f" {title} ")
+        base = clean_title(doc.get("title") or "")
+        # The full title too: «Las llaves del poder: autoridad espiritual» is
+        # also how a student may name it, once Brain's ficha has a subtitle.
+        titles = {_core(base)}
+        if doc.get("subtitle"):
+            titles.add(_core(f"{base} {doc['subtitle']}"))
+        if any(
+            title and (
+                (_long_enough(title) and f" {title} " in padded)
+                or (_long_enough(wanted) and padded in f" {title} ")
+            )
+            for title in titles
         ):
             by_title.append(doc)
-        if _surnames(doc.get("author") or "") & wanted_words:
+        people = " ".join([doc.get("author") or "", *(doc.get("contributors") or [])])
+        if _surnames(people) & wanted_words:
             by_author.append(doc)
     if len(by_title) == 1:
         return by_title[0]

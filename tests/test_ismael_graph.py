@@ -761,6 +761,43 @@ class TestCleanTitle:
         assert rag_job.answer_references(answer, "es")["items"][0]["title"] == "Llaves Del Poder"
 
 
+class TestReferencesFromTheFicha:
+    def test_a_book_reference_names_its_author_and_year(self):
+        answer = {
+            "text": "Cuerpo.",
+            "citations": [{"chunk_id": "a", "page": 12}],
+            "evidence": [{"chunk_id": "a", "title": "Las llaves del poder",
+                          "author": "Darío Silva-Silva", "published_year": 2004, "content_type": "libro"}],
+        }
+        assert rag_job.answer_references(answer, "es")["items"] == [
+            {"title": "Las llaves del poder — Darío Silva-Silva (2004)", "detail": "p. 12"}
+        ]
+
+    def test_a_recording_points_at_the_minute_with_its_link(self):
+        url = "https://www.youtube.com/watch?v=abc&t=754s"
+        answer = {
+            "text": "Cuerpo.",
+            "citations": [{"chunk_id": "a", "locator": f"00:12:34 · {url}"}],
+            "evidence": [{"chunk_id": "a", "title": "Prédica sobre la fe", "source_name": "Casa sobre la Roca",
+                          "content_type": "predica"}],
+        }
+        (item,) = rag_job.answer_references(answer, "es")["items"]
+        assert item == {"title": "Prédica sobre la fe — Casa sobre la Roca", "detail": f"min 12:34 · {url}"}
+
+    def test_an_unopenable_bucket_url_is_left_out(self):
+        answer = {"text": "x", "citations": [{"chunk_id": "a", "locator": "01:02:03 · s3://b/k.mp3"}],
+                  "evidence": [{"chunk_id": "a", "title": "Clase 3"}]}
+        assert rag_job.answer_references(answer, "es")["items"][0]["detail"] == "min 1:02:03"
+
+    def test_a_ficha_citation_has_no_detail(self):
+        answer = {"text": "x", "citations": [{"chunk_id": "ficha:d", "locator": "Ficha · Las llaves",
+                                               "section_title": "Ficha"}],
+                  "evidence": [{"chunk_id": "ficha:d", "title": "Las llaves del poder", "kind": "ficha"}]}
+        assert rag_job.answer_references(answer, "es")["items"] == [
+            {"title": "Las llaves del poder", "detail": None}
+        ]
+
+
 CATALOG = [
     {"id": "d1", "title": "07-LlavesDelPoder-INT.pdf.corrected", "author": ""},
     {"id": "d2", "title": "Obligaciones Del Cuerpo", "author": "Rev. Darío Silva Silva"},
@@ -794,6 +831,15 @@ class TestMatchWork:
     )
     def test_no_or_several_matches_ask_unscoped(self, work):
         assert rag_job.match_work(work, CATALOG) is None
+
+    def test_the_ficha_subtitle_and_contributors_match(self):
+        fichas = [
+            {"id": "d9", "title": "Fe viva", "subtitle": "El poder de creer", "author": "",
+             "contributors": ["Ana Restrepo Gómez"]},
+            *CATALOG,
+        ]
+        assert rag_job.match_work("Fe viva el poder de creer", fichas)["id"] == "d9"
+        assert rag_job.match_work("algo de Restrepo", fichas)["id"] == "d9"
 
     def test_after_renaming_the_title_and_author_still_match(self):
         renamed = [{"id": "d1", "title": "Las llaves del poder", "author": "Darío Silva-Silva"}, *CATALOG[1:]]
@@ -886,7 +932,11 @@ class TestBrainCatalog:
         monkeypatch.setattr(brain_service.httpx, "AsyncClient", Client)
         first = await brain_service.list_documents()
         second = await brain_service.list_documents()
-        assert first == second == [{"id": "d1", "title": "Las llaves del poder", "author": ""}]
+        # An older Brain sends no ficha: the record fields default to empty.
+        assert first == second == [{
+            "id": "d1", "title": "Las llaves del poder", "author": "", "subtitle": "",
+            "contributors": [], "content_type": "", "published_year": None,
+        }]
         assert len(calls) == 1 and calls[0].endswith("/documents")
 
     async def test_ask_sends_filters_only_when_given(self, monkeypatch):

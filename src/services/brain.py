@@ -146,8 +146,30 @@ _CATALOG_TTL_SECONDS = 3600.0
 _catalog: tuple[float, list[dict]] | None = None
 
 
+def _catalog_entry(d: dict) -> dict:
+    metadata = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+    contributors = [
+        str(c["name"]) for c in metadata.get("contributors") or []
+        if isinstance(c, dict) and c.get("name")
+    ]
+    year = metadata.get("published_year")
+    return {
+        "id": str(d["id"]),
+        "title": d.get("title") or "",
+        "author": d.get("author") or "",
+        "subtitle": d.get("subtitle") or "",
+        "contributors": contributors,
+        "content_type": d.get("content_type") or "",
+        "published_year": year if isinstance(year, int) else None,
+    }
+
+
 async def list_documents() -> list[dict]:
-    """``[{id, title, author}]`` of the library's present documents, cached.
+    """``[{id, title, author, subtitle, contributors, content_type,
+    published_year}]`` of the library's present documents, cached.
+
+    The record fields come from Brain's ficha (2026-10): absent on an older
+    Brain, so every one but ``id``/``title``/``author`` defaults to empty.
 
     Raises :class:`BrainError` when Brain refuses (an older Brain lets the
     service key reach ``/ask`` only); callers then ask without a filter.
@@ -161,7 +183,7 @@ async def list_documents() -> list[dict]:
     if resp.status_code != 200:
         raise BrainError(f"GET /libraries/…/documents → {resp.status_code}: {resp.text[:300]}")
     documents = [
-        {"id": str(d["id"]), "title": d.get("title") or "", "author": d.get("author") or ""}
+        _catalog_entry(d)
         for d in (resp.json().get("documents") or [])
         if isinstance(d, dict) and d.get("id")
     ]

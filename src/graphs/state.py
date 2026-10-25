@@ -201,6 +201,14 @@ class AgentState(TypedDict):
     # "moodle_support", "retriage") or to end it ("done").
     ismael_route: str
 
+    # ── Assessment flow (pablo) ───────────────────────────────────────
+    # {attempt_id, assessment_id, total_cycles, current_cycle, modality,
+    # phase, used_question_ids, cycle} — see src/agents/pablo/nodes.py.
+    # Responses, scores and feedback live in the backend, never here.
+    pablo: dict
+    # Per-turn branch chosen by pablo_triage from the backend's turn kind.
+    pablo_route: str
+
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool
 

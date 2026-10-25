@@ -35,6 +35,10 @@ from .agents.backend_client import (
 )
 from .agents.clara import runner as clara_runner
 from .agents.clara.runner import EmailDraftRequest, EmailFollowUpRequest, EmailSyncRequest
+from .agents.pablo import insights as pablo_insights
+from .agents.pablo import jobs as pablo_jobs
+from .agents.pablo import scoring as pablo_scoring
+from .schemas.pablo import InsightsRequest, ScoreRequest
 from .agents.prospecting_nodes import DEFAULT_LOCATION
 from .providers.registry import background_model
 from .graphs.clara_graph import EMAIL_GRAPH_NAME
@@ -297,6 +301,10 @@ class ChatStreamRequest(BaseModel):
     # send it. When False, graphs route every non-urgent turn to
     # faq_response, which splices the {AGENT_TYPE}_OUTSIDE_HOURS prompt.
     within_business_hours: bool = True
+    # pablo (assessment) only: what happened in the attempt this turn
+    # ({kind: start|answer|continue|timeout, attempt_id, cycle_index, …}). The
+    # backend owns the attempt; the graph routes on `kind`, never on the text.
+    assessment_turn: dict = {}
 
 
 
@@ -512,6 +520,27 @@ async def _coalesced_stream(
         _checkin_turn_state(thread_id, state)
 
 
+# Graphs whose turns are events sent by the backend, not chat fragments: an
+# answer and the following "continue" must never merge into one turn, and the
+# settle window would only delay a turn the student is waiting on.
+_UNCOALESCED_CODE_NAMES = {"pablo"}
+
+
+async def _serialized_stream(
+    inputs: dict, config: dict, graph, agent_code_name: str, thread_id: str
+) -> AsyncGenerator[str, None]:
+    """One graph run per request, serialized per thread (no merging)."""
+    state = _checkout_turn_state(thread_id)
+    try:
+        async with state.lock:
+            async for event in _stream_graph(
+                inputs, config, graph=graph, agent_code_name=agent_code_name
+            ):
+                yield event
+    finally:
+        _checkin_turn_state(thread_id, state)
+
+
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
@@ -621,6 +650,11 @@ async def _stream_graph(
                         "label": event_data.get("label", ""),
                         "ttl_seconds": event_data.get("ttl_seconds", 0),
                     })
+
+                elif event_kind == "assessment":
+                    # pablo: drives the attempt's clock and the activity UI
+                    # (e.g. cycle_presented restarts the timer).
+                    yield _sse_event(event_data)
 
                 elif event_kind == "quick_replies":
                     # Forwarded untouched: the backend validates the options
@@ -1206,6 +1240,47 @@ async def email_drafts(
         )
 
 
+# ---------------------------------------------------------------------------
+# Assessment agent (pablo). The backend starts scoring once the student's UX
+# survey is submitted or skipped, and the class report once every student has
+# finished; both report back through /internal/assessment/*.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/assessment/score", status_code=202)
+async def assessment_score(
+    req: ScoreRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    if req.mode not in ("publish", "replay"):
+        raise HTTPException(status_code=400, detail="mode must be publish or replay")
+    key = f"score:{req.attempt_id}:{req.scoring_version}:{req.mode}:{req.replay_id}"
+    started = pablo_jobs.spawn(key, pablo_scoring.run(req))
+    logger.info(
+        "assessment_score_accepted",
+        attempt_id=req.attempt_id,
+        scoring_version=req.scoring_version,
+        mode=req.mode,
+        duplicate=not started,
+    )
+    return {"accepted": True, "attempt_id": req.attempt_id, "duplicate": not started}
+
+
+@app.post("/assessment/insights", status_code=202)
+async def assessment_insights(
+    req: InsightsRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    started = pablo_jobs.spawn(f"insights:{req.report_id}", pablo_insights.run(req))
+    logger.info(
+        "assessment_insights_accepted",
+        assessment_id=req.assessment_id,
+        report_id=req.report_id,
+        duplicate=not started,
+    )
+    return {"accepted": True, "report_id": req.report_id, "duplicate": not started}
+
+
 @app.post("/chat/stream")
 async def chat_stream(
     req: ChatStreamRequest,
@@ -1321,7 +1396,11 @@ async def chat_stream(
         "agent_persona_name": req.agent_persona_name,
         "agent_version": req.agent_version,
         "capabilities": {"agent_type": agent_type, "capabilities": req.capabilities},
-        "domain_state": {},
+        # Reset every request: a backend turn (pablo's assessment_turn) must
+        # never be replayed from the checkpoint.
+        "domain_state": (
+            {"assessment_turn": req.assessment_turn} if req.assessment_turn else {}
+        ),
         "product_catalog": req.product_catalog,
         # Overwritten every turn (like product_catalog) so an admin flipping the
         # CATALOG toggle takes effect on the next turn — the checkpointer can't
@@ -1383,6 +1462,13 @@ async def chat_stream(
             if v.id
         },
     )
+
+    if code_name in _UNCOALESCED_CODE_NAMES:
+        return StreamingResponse(
+            _serialized_stream(inputs, config, graph, code_name, thread_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     return StreamingResponse(
         _coalesced_stream(

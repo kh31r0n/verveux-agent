@@ -233,6 +233,27 @@ class Settings(BaseSettings):
     # search that found nothing is retried sooner, the docs may gain a page.
     ismael_research_cache_days: float = 30.0
     ismael_research_negative_cache_days: float = 7.0
+    # pablo (assessment): a chat turn only composes a question or records an
+    # answer, both while the attempt's timer is paused, but still inside the
+    # backend's 60 s turn. Scoring and feedback run as background jobs.
+    pablo_timeout_compose_seconds: float = 30.0
+    pablo_timeout_score_seconds: float = 60.0
+    pablo_timeout_feedback_seconds: float = 60.0
+    pablo_thinking_compose: int | None = 0
+    pablo_thinking_score: int | None = None
+    pablo_score_retries: int = 1
+    pablo_max_calibration_examples: int = 5
+    pablo_job_concurrency: int = 4
+    # Speech-to-Text v2 (ADC). Empty project = the ADC project.
+    pablo_stt_project_id: str = ""
+    pablo_stt_location: str = "global"
+    pablo_stt_model: str = "long"
+    pablo_stt_languages: str = "es:es-US,en:en-US"
+    pablo_stt_timeout_seconds: float = 40.0
+    pablo_stt_attempts: int = 3
+    pablo_max_audio_bytes: int = 10 * 1024 * 1024
+    # Local stacks serve uploads over http; production URLs are pre-signed https.
+    pablo_allow_http_audio: bool = False
     clara_thinking_triage: int | None = 0
     clara_thinking_extract_task: int | None = 0
     clara_thinking_draft: int | None = None

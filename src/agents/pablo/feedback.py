@@ -20,7 +20,7 @@ from ...providers.registry import get_provider, resolve_model
 from ...schemas.pablo import AttemptFeedbackResult, ScoreRequest
 from ...usage import make_usage_record
 from .. import backend_client
-from .common import fence, system_prompt
+from .common import fence, json_contract, system_prompt
 from .prompts import FEEDBACK_PROMPT
 
 logger = structlog.get_logger(__name__)
@@ -129,7 +129,7 @@ async def run(req: ScoreRequest, config: dict, rows: list[dict]) -> None:
         result = await asyncio.wait_for(
             provider.generate_structured(
                 [
-                    {"role": "system", "content": system},
+                    {"role": "system", "content": system + json_contract(AttemptFeedbackResult)},
                     {"role": "user", "content": feedback_block(req, rows, outcomes)},
                 ],
                 model,

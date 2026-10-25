@@ -26,7 +26,7 @@ from ...schemas.pablo import CycleScore, ScoreCycle, ScoreRequest
 from ...usage import make_usage_record
 from .. import backend_client
 from . import feedback, jobs
-from .common import fence, system_prompt
+from .common import fence, json_contract, system_prompt
 from .prompts import SCORE_PROMPT
 
 logger = structlog.get_logger(__name__)
@@ -181,7 +181,7 @@ async def _score_cycle(config: dict, system: str, provenance: dict, cycle: Score
     provider = get_provider(config)
     model = resolve_model(config)
     messages = [
-        {"role": "system", "content": system},
+        {"role": "system", "content": system + json_contract(CycleScore)},
         {"role": "user", "content": cycle_block(cycle, examples)},
     ]
     last_error: Exception | None = None

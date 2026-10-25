@@ -41,6 +41,7 @@ from . import compose, transcription
 from .common import (
     assessment_turn,
     emit_assessment,
+    json_contract,
     pablo_dict,
     persona,
     reply,
@@ -107,7 +108,7 @@ async def _compose(state: AgentState, config: RunnableConfig, outcome: dict, can
         result = await asyncio.wait_for(
             provider.generate_structured(
                 [
-                    {"role": "system", "content": system},
+                    {"role": "system", "content": system + json_contract(ComposedCycle)},
                     {"role": "user", "content": compose.candidates_block(outcome, candidates)},
                 ],
                 model,

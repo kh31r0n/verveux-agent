@@ -344,3 +344,13 @@ class TestSse:
         kinds = [e["type"] for e in events]
         assert {"type": "assessment", "event": "cycle_presented", "cycle_index": 0} in events
         assert kinds[-1] == "done"
+
+
+class TestLanguage:
+    async def test_the_activity_language_wins_over_the_tenant(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            await _run(graph, "lang1", _turn("start", cycle_index=0))
+        # The tenant is Spanish (language="es" in _run); the activity is English.
+        _, reply, _ = await _run(graph, "lang1", _turn("answer", cycle_index=0, language="en", answer={"text": "x"}))
+        assert "I received your answer" in reply

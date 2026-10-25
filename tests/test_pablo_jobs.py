@@ -362,3 +362,16 @@ def _key() -> str:
     from src.config import settings
 
     return settings.webhook_api_key
+
+
+class TestJsonContract:
+    async def test_every_structured_call_asks_for_json(self, backend):
+        """OpenAI/Anthropic parse the prompt-JSON fallback: the system prompt must ask for it."""
+        provider = FakeProvider({"CycleScore": [_scores(0, 1, 1)], "AttemptFeedbackResult": _feedback_result()})
+        p1, p2, p3 = _patch_provider(provider)
+        with p1, p2, p3:
+            await scoring.run(_request(cycles=[_cycle(0, {"text": "x"})]))
+        for name, messages in provider.calls:
+            system = messages[0]["content"]
+            assert "Responde SOLO con un objeto JSON" in system, name
+            assert '"properties"' in system, name

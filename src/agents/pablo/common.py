@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from langchain_core.messages import AIMessage
 from langgraph.config import get_stream_writer
 
@@ -33,6 +35,21 @@ def _version_of(key: str) -> str:
 
     name = key.removeprefix("ASSESSMENT_") + "_VERSION"
     return str(getattr(prompts, name, "unknown"))
+
+
+def json_contract(schema) -> str:
+    """The output contract, appended in code to every pablo system prompt.
+
+    Only Gemini enforces a schema natively; OpenAI and Anthropic go through
+    the prompt-JSON fallback, which needs the prompt itself to ask for JSON —
+    and a tenant-edited prompt may not. Appending it here keeps every
+    provider and every prompt version parseable.
+    """
+    shape = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    return (
+        "\n\nResponde SOLO con un objeto JSON válido, sin texto antes ni después, "
+        f"que cumpla este esquema JSON:\n{shape}"
+    )
 
 
 def fence(tag: str, body: str) -> str:

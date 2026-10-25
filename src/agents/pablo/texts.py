@@ -59,7 +59,11 @@ _TEXTS: dict[str, dict[str, str]] = {
 
 
 def lang_of(state) -> str:
-    lang = str((state or {}).get("language") or "es").lower()[:2]
+    """The activity's language (sent with every turn), else the tenant's."""
+    state = state or {}
+    domain = state.get("domain_state") or {}
+    turn = domain.get("assessment_turn") if isinstance(domain, dict) else None
+    lang = str((turn or {}).get("language") or state.get("language") or "es").lower()[:2]
     return "en" if lang == "en" else "es"
 
 

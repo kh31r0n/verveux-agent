@@ -28,7 +28,7 @@ from ...schemas.pablo import ClassReportNarrative, ImprovementProposals, Insight
 from ...usage import make_usage_record
 from .. import backend_client
 from . import jobs
-from .common import system_prompt
+from .common import json_contract, system_prompt
 from .prompts import CLASS_REPORT_PROMPT, IMPROVE_PROMPT
 
 logger = structlog.get_logger(__name__)
@@ -104,7 +104,12 @@ async def _structured(config, system, user, schema, node, provenance):
     started = time.monotonic()
     result = await asyncio.wait_for(
         provider.generate_structured(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}], model, schema
+            [
+                {"role": "system", "content": system + json_contract(schema)},
+                {"role": "user", "content": user},
+            ],
+            model,
+            schema,
         ),
         timeout=settings.pablo_timeout_feedback_seconds,
     )

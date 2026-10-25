@@ -41,12 +41,14 @@
 |---|---|---|
 | 1 · Agent | `yorchio-agent` `feat/pablo-assessment` (`cb03177`) | Done, tests pass. Not deployed. |
 | 2 · Backend | `yorchio-backend` `feat/pablo-assessment` (`9745882`) | Done; migrations verified on a fresh database; full flow tested against Postgres. Not deployed. |
-| 3 · Moodle plugin `mod_vervuxassess` | — | Not started. |
+| 3 · Moodle plugin `mod_vervuxassess` | `yorchio-moodle` `feat/vervuxassess` | Done: 10 PHPUnit tests; end to end on a local Moodle 4.4 with the real agent and a fake LLM (API smoke + Playwright in Chromium). Not released. |
 
 Differences from the sections below, decided while building:
 - `Response` and `ResponseTelemetry` are columns of `assessment_cycles` (one answer per cycle).
 - Plugin routes are `/moodle/assessments/:cmid/…`, attempts under `:cmid/attempts/:id/…`. Each student call returns the new attempt state (question, `remainingMs`, latest Pablo message, grade, feedback), so the attempt page does not need the widget's SSE.
 - A failed turn leaves the attempt in `retry_compose` / `retry_answer` with the timer paused; `POST …/retry` re-runs it.
+- The plugin does not depend on `local_vervuxchat` (it signs its own tokens; a dozen lines) and stores the setup (outcomes, rubrics as `Name | points | criteria` lines, question ids, accommodations) as JSON on its instance row; questions are synced as snapshots of their latest ready version, keyed by question bank entry.
+- The student page gets its latest attempt from `GET :cmid/my-attempt` (added in phase 3).
 - Still open: Cloud Scheduler job for `POST /internal/assessment/sweep`, bucket lifecycle for `assessment-audio/`, replay storage and its endpoint, and the CRM UI for `prompt_guidance` proposals (the teacher cannot accept those: `409 ADMIN_DECIDES`).
 
 ---

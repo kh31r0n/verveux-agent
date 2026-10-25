@@ -35,6 +35,20 @@
 | Backend pushes grades to a Moodle callback. | The plugin is the only gradebook writer. It **pulls** pending grades (on page view and from a scheduled task), and writes decisions locally the moment the teacher submits them. Moodle needs no inbound endpoint for grades (§4.4). |
 | Student responses, scores and feedback duplicated in the LangGraph checkpoint. | The checkpoint holds only the current cycle. The backend is the single source of truth for responses, scores and feedback, which also keeps student data out of checkpoints (§3.3). |
 
+### 0.4 — Implementation status (2026-10-25)
+
+| Phase | Where | State |
+|---|---|---|
+| 1 · Agent | `yorchio-agent` `feat/pablo-assessment` (`cb03177`) | Done, tests pass. Not deployed. |
+| 2 · Backend | `yorchio-backend` `feat/pablo-assessment` (`9745882`) | Done; migrations verified on a fresh database; full flow tested against Postgres. Not deployed. |
+| 3 · Moodle plugin `mod_vervuxassess` | — | Not started. |
+
+Differences from the sections below, decided while building:
+- `Response` and `ResponseTelemetry` are columns of `assessment_cycles` (one answer per cycle).
+- Plugin routes are `/moodle/assessments/:cmid/…`, attempts under `:cmid/attempts/:id/…`. Each student call returns the new attempt state (question, `remainingMs`, latest Pablo message, grade, feedback), so the attempt page does not need the widget's SSE.
+- A failed turn leaves the attempt in `retry_compose` / `retry_answer` with the timer paused; `POST …/retry` re-runs it.
+- Still open: Cloud Scheduler job for `POST /internal/assessment/sweep`, bucket lifecycle for `assessment-audio/`, replay storage and its endpoint, and the CRM UI for `prompt_guidance` proposals (the teacher cannot accept those: `409 ADMIN_DECIDES`).
+
 ---
 
 ## 1 — Summary

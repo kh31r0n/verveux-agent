@@ -284,6 +284,57 @@ async def post_agent_message(
     )
 
 
+# ─── Assessment agent (pablo) ────────────────────────────────────────────────
+# The backend owns the attempt: eligibility, the clock, the grade mapping and
+# persistence. These calls only report what pablo composed or evaluated.
+
+
+async def get_assessment_next_cycle(attempt_id: str) -> dict:
+    """POST /internal/assessment/attempts/:id/next-cycle — the authorised
+    candidates for the next learning outcome:
+    ``{cycle_index, total_cycles, is_last, learning_outcome: {id, name},
+    candidates: [...]}`` (see ``agents/pablo/compose.py``)."""
+    return await _post(f"/api/v1/internal/assessment/attempts/{attempt_id}/next-cycle")
+
+
+async def report_assessment_cycle(attempt_id: str, cycle_index: int, cycle: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n — the composed cycle,
+    stored before the student sees it. Idempotent on (attempt, cycle)."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}", json=cycle
+    )
+
+
+async def report_assessment_response(attempt_id: str, cycle_index: int, response: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n/response — the text
+    and/or transcript that will be evaluated."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}/response",
+        json=response,
+    )
+
+
+async def report_assessment_score(attempt_id: str, payload: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/score — component points; the
+    backend maps them onto the activity's grade range and publishes."""
+    return await _post(f"/api/v1/internal/assessment/attempts/{attempt_id}/score", json=payload)
+
+
+async def report_assessment_feedback(attempt_id: str, payload: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/feedback — the academic
+    feedback; the backend stores it and posts ``message`` to the attempt's
+    conversation."""
+    return await _post(f"/api/v1/internal/assessment/attempts/{attempt_id}/feedback", json=payload)
+
+
+async def report_assessment_insights(assessment_id: str, payload: dict) -> dict:
+    """POST /internal/assessment/assessments/:id/insights — the class report
+    narrative and the improvement proposals (all pending human approval)."""
+    return await _post(
+        f"/api/v1/internal/assessment/assessments/{assessment_id}/insights", json=payload
+    )
+
+
 async def get_moodle_teachers(conversation_id: str) -> dict:
     """GET /internal/conversations/:id/moodle/teachers — the student's courses
     and each course's teachers (with Moodle conversation links), derived by the

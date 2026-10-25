@@ -29,6 +29,7 @@ from .clara_graph import build_clara_graph
 from .enrichment_graph import build_enrichment_graph
 from .ismael_graph import build_ismael_graph
 from .leads_graph import build_leads_graph
+from .pablo_graph import build_pablo_graph
 from .prospecting_graph import build_prospecting_graph
 from .restaurant_graph import build_restaurant_graph
 from .sales_graph import build_sales_graph
@@ -53,6 +54,7 @@ CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "sherlock": build_enrichment_graph,
     "clara": build_clara_graph,
     "ismael": build_ismael_graph,
+    "pablo": build_pablo_graph,
 }
 
 

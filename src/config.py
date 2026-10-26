@@ -237,6 +237,14 @@ class Settings(BaseSettings):
     # answer, both while the attempt's timer is paused, but still inside the
     # backend's 60 s turn. Scoring and feedback run as background jobs.
     pablo_timeout_compose_seconds: float = 30.0
+    # The acknowledgement's quote (one short call while the timer is paused);
+    # past this the plain acknowledgement goes out.
+    pablo_timeout_ack_seconds: float = 6.0
+    pablo_thinking_ack: int | None = 0
+    # The follow-up question (one call per answer, tenant model); past this a
+    # generic question in code goes out instead.
+    pablo_timeout_followup_seconds: float = 8.0
+    pablo_thinking_followup: int | None = 0
     pablo_timeout_score_seconds: float = 60.0
     pablo_timeout_feedback_seconds: float = 60.0
     pablo_thinking_compose: int | None = 0

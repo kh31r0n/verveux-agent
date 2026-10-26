@@ -26,6 +26,28 @@ class ComposedCycle(BaseModel):
     parts: list[ComposedPart] = Field(default_factory=list)
 
 
+# ── Acknowledgement ──────────────────────────────────────────────────────────
+
+
+class AnswerEcho(BaseModel):
+    # A short literal fragment of the student's answer — its central idea, not
+    # its best one. Code checks that it really is in the answer.
+    quote: str = ""
+
+
+# ── Follow-up question (one per cycle, asked to every student) ─────────────
+
+
+class FollowupPlan(BaseModel):
+    # A literal fragment of the answer, as in AnswerEcho.
+    quote: str = ""
+    # The rubric component the answer covers least; null when nothing is
+    # missing (then the question deepens instead). Never points.
+    target_component_id: str | None = None
+    mode: str = "deepen"  # gap | deepen
+    question: str = ""
+
+
 # ── Scoring ──────────────────────────────────────────────────────────────────
 
 
@@ -109,6 +131,14 @@ class ScoreResponse(BaseModel):
     transcription_status: str | None = None
 
 
+class ScoreFollowup(BaseModel):
+    prompt: str
+    mode: str = "deepen"
+    target_component_id: str = ""
+    # None = asked but never answered.
+    response: ScoreResponse | None = None
+
+
 class ScoreQuestion(BaseModel):
     question_snapshot_id: str
     text: str
@@ -123,6 +153,8 @@ class ScoreCycle(BaseModel):
     components: list[ScoreComponent] = Field(default_factory=list)
     # None = the cycle was never reached or never answered.
     response: ScoreResponse | None = None
+    # The follow-up question and its answer, scored together with the first.
+    followup: ScoreFollowup | None = None
 
 
 class CalibrationExample(BaseModel):

@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage
 from langgraph.config import get_stream_writer
 
 from ...graphs.state import AgentState
+from ...schemas.pablo import ScoreCycle
 from ..utils import resolve_persona, resolve_prompt, resolve_prompt_provenance
 
 DEFAULT_PERSONA = "Pablo"
@@ -86,3 +87,16 @@ def emit_assessment(event: str, **data) -> None:
     """A stream event the backend reads to drive the attempt's clock and the
     activity UI (e.g. ``cycle_presented`` restarts the timer)."""
     get_stream_writer()({"type": "assessment", "event": event, **data})
+
+
+def _response_text(response) -> str:
+    if response is None:
+        return ""
+    return "\n".join(p.strip() for p in (response.text, response.transcript) if p and p.strip())
+
+
+def answer_text(cycle: ScoreCycle) -> str:
+    """Everything the student said in the cycle: the answer and, when there
+    was one, the answer to the follow-up question."""
+    followup = cycle.followup.response if cycle.followup else None
+    return "\n".join(p for p in (_response_text(cycle.response), _response_text(followup)) if p)

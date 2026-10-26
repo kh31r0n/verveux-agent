@@ -20,7 +20,7 @@ from ...providers.registry import get_provider, resolve_model
 from ...schemas.pablo import AttemptFeedbackResult, ScoreRequest
 from ...usage import make_usage_record
 from .. import backend_client
-from .common import fence, json_contract, system_prompt
+from .common import answer_text, fence, json_contract, system_prompt
 from .prompts import FEEDBACK_PROMPT
 
 logger = structlog.get_logger(__name__)
@@ -70,9 +70,7 @@ def feedback_block(req: ScoreRequest, rows: list[dict], outcomes: dict[str, dict
     )]
     reached = 0
     for cycle in sorted(req.cycles, key=lambda c: c.cycle_index):
-        answer = "\n".join(
-            p for p in ((cycle.response.text, cycle.response.transcript) if cycle.response else ()) if p
-        )
+        answer = answer_text(cycle)
         reached += 1 if answer.strip() else 0
         scored = [
             {k: r[k] for k in ("componentId", "points", "maxPoints", "criterion", "rationale")}

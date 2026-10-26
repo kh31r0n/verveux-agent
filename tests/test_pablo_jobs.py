@@ -24,7 +24,9 @@ from src.schemas.pablo import (
     OutcomeFeedback,
     QuestionFlag,
     RubricClarification,
+    ScoreFollowup,
     ScoreRequest,
+    ScoreResponse,
 )
 
 
@@ -375,3 +377,26 @@ class TestJsonContract:
             system = messages[0]["content"]
             assert "Responde SOLO con un objeto JSON" in system, name
             assert '"properties"' in system, name
+
+
+class TestFollowupScoring:
+    def test_both_answers_are_fenced_and_scored_together(self):
+        req = _request()
+        cycle = req.cycles[0].model_copy(update={"followup": ScoreFollowup(
+            prompt="¿Puedes dar un ejemplo?", mode="deepen",
+            response=ScoreResponse(text="Por ejemplo, el perdón."))})
+        block = scoring.cycle_block(cycle, [])
+        assert "Repregunta que hizo el evaluador:\n¿Puedes dar un ejemplo?" in block
+        assert block.count("<<<RESPUESTA") == 2
+        assert "Por ejemplo, el perdón." in scoring.answer_text(cycle)
+
+    def test_only_a_followup_answer_is_still_an_answer(self):
+        req = _request()
+        cycle = req.cycles[0].model_copy(update={"response": None, "followup": ScoreFollowup(
+            prompt="¿Y?", response=ScoreResponse(text="Algo dije aquí."))})
+        assert scoring.answer_text(cycle) == "Algo dije aquí."
+
+    def test_unanswered_followup_is_said(self):
+        req = _request()
+        cycle = req.cycles[0].model_copy(update={"followup": ScoreFollowup(prompt="¿Y?")})
+        assert "no respondió la repregunta" in scoring.cycle_block(cycle, [])

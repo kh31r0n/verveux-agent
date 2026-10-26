@@ -26,7 +26,7 @@ from ...schemas.pablo import CycleScore, ScoreCycle, ScoreRequest
 from ...usage import make_usage_record
 from .. import backend_client
 from . import feedback, jobs
-from .common import fence, json_contract, system_prompt
+from .common import answer_text, fence, json_contract, system_prompt
 from .prompts import SCORE_PROMPT
 
 logger = structlog.get_logger(__name__)
@@ -44,13 +44,6 @@ class ScoringFailed(Exception):
 
 def _lang(req: ScoreRequest) -> str:
     return "en" if (req.language or "").lower().startswith("en") else "es"
-
-
-def answer_text(cycle: ScoreCycle) -> str:
-    response = cycle.response
-    if response is None:
-        return ""
-    return "\n".join(p.strip() for p in (response.text, response.transcript) if p and p.strip())
 
 
 def clamp(points: float, max_points: float) -> tuple[float, bool]:
@@ -115,14 +108,23 @@ def cycle_block(cycle: ScoreCycle, examples: list[dict]) -> str:
                 for e in examples
             )
         )
-    response = cycle.response
+    _response_sections(sections, cycle.response, "")
+    if cycle.followup:
+        sections.append("Repregunta que hizo el evaluador:\n" + cycle.followup.prompt)
+        if cycle.followup.response:
+            _response_sections(sections, cycle.followup.response, " a la repregunta")
+        else:
+            sections.append("El estudiante no respondió la repregunta.")
+    return "\n\n".join(sections)
+
+
+def _response_sections(sections: list[str], response, suffix: str) -> None:
     if response and response.text and response.text.strip():
-        sections.append("Respuesta escrita del estudiante:\n" + fence("RESPUESTA", response.text))
+        sections.append(f"Respuesta escrita del estudiante{suffix}:\n" + fence("RESPUESTA", response.text))
     if response and response.transcript and response.transcript.strip():
         sections.append(
-            "Transcripción del audio del estudiante:\n" + fence("RESPUESTA", response.transcript)
+            f"Transcripción del audio del estudiante{suffix}:\n" + fence("RESPUESTA", response.transcript)
         )
-    return "\n\n".join(sections)
 
 
 def _zero(cycle: ScoreCycle, rationale: str, needs_review: bool) -> list[dict]:

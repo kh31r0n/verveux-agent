@@ -3,8 +3,12 @@
 Topology:
 
     START → pablo_triage                (on the backend's turn kind, never on student text)
+              ├── pablo_opening         (open: greeting and the warm-up offer)
+              ├── pablo_warmup          (warmup: the teacher's ungraded question)
+              ├── pablo_warmup_answer   (warmup_answer: transcribe, acknowledge, nothing stored)
               ├── pablo_next_cycle      (start / continue: compose and present a question)
-              ├── pablo_receive_answer  (answer: transcribe, record, acknowledge)
+              ├── pablo_receive_answer  (answer: transcribe, record, acknowledge, ask the follow-up)
+              ├── pablo_followup_answer (followup_answer: record it beside the first, acknowledge)
               ├── pablo_timeout         (the backend closed a cycle or the attempt)
               └── pablo_error           (a turn this attempt does not expect)
 
@@ -20,16 +24,24 @@ from langgraph.graph import END, START, StateGraph
 
 from ..agents.pablo.nodes import (
     pablo_error_node,
+    pablo_followup_answer_node,
     pablo_next_cycle_node,
+    pablo_opening_node,
     pablo_receive_answer_node,
     pablo_timeout_node,
     pablo_triage_node,
+    pablo_warmup_answer_node,
+    pablo_warmup_node,
 )
 from .state import AgentState
 
 _ROUTES = {
+    "opening": "pablo_opening",
+    "warmup": "pablo_warmup",
+    "warmup_answer": "pablo_warmup_answer",
     "next_cycle": "pablo_next_cycle",
     "answer": "pablo_receive_answer",
+    "followup_answer": "pablo_followup_answer",
     "timeout": "pablo_timeout",
     "unexpected": "pablo_error",
 }
@@ -43,8 +55,12 @@ def build_pablo_graph(checkpointer):
     graph = StateGraph(AgentState)
 
     graph.add_node("pablo_triage", pablo_triage_node)
+    graph.add_node("pablo_opening", pablo_opening_node)
+    graph.add_node("pablo_warmup", pablo_warmup_node)
+    graph.add_node("pablo_warmup_answer", pablo_warmup_answer_node)
     graph.add_node("pablo_next_cycle", pablo_next_cycle_node)
     graph.add_node("pablo_receive_answer", pablo_receive_answer_node)
+    graph.add_node("pablo_followup_answer", pablo_followup_answer_node)
     graph.add_node("pablo_timeout", pablo_timeout_node)
     graph.add_node("pablo_error", pablo_error_node)
 

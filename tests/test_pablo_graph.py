@@ -13,13 +13,15 @@ import pytest
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from src.agents.pablo import compose
+from src.agents.pablo import compose, echo, followup
 from src.agents.pablo.transcription import Transcript
 from src.graphs.pablo_graph import build_pablo_graph
 from src.providers.base import UsageInfo
-from src.schemas.pablo import ComposedCycle, ComposedPart
+from src.schemas.pablo import AnswerEcho, ComposedCycle, ComposedPart, FollowupPlan
 
 NODES = "src.agents.pablo.nodes"
+ECHO = "src.agents.pablo.echo"
+FOLLOWUP = "src.agents.pablo.followup"
 
 
 class FakeProvider:
@@ -103,8 +105,14 @@ def backend():
         patch(f"{NODES}.backend_client.get_assessment_next_cycle", AsyncMock(return_value=_next_cycle())) as nxt,
         patch(f"{NODES}.backend_client.report_assessment_cycle", AsyncMock(return_value={})) as cyc,
         patch(f"{NODES}.backend_client.report_assessment_response", AsyncMock(return_value={})) as resp,
+        patch(f"{NODES}.backend_client.report_assessment_followup", AsyncMock(return_value={})) as fup,
+        patch(
+            f"{NODES}.backend_client.report_assessment_followup_response", AsyncMock(return_value={})
+        ) as fresp,
+        # The acknowledgement's quote: none unless a test says otherwise.
+        patch(f"{ECHO}.get_provider", return_value=FakeProvider(AnswerEcho())) as ack,
     ):
-        yield {"next": nxt, "cycle": cyc, "response": resp}
+        yield {"next": nxt, "cycle": cyc, "response": resp, "ack": ack, "followup": fup, "followup_response": fresp}
 
 
 def _composed(*sids: str) -> ComposedCycle:
@@ -241,7 +249,9 @@ class TestAnswer:
         _, reply, events = await _run(
             graph, "r2", _turn("answer", cycle_index=0, is_last_cycle=True, answer={"text": "x"})
         )
-        assert "última pregunta" in reply
+        # A neutral recap of the topics, never how it went, then the survey.
+        assert "Con esto terminamos. Hablamos de Comprender X." in reply
+        assert "cuéntanos cómo fue tu experiencia" in reply
         assert events[0]["is_last"] is True
 
     async def test_audio_shows_the_transcript_that_will_be_assessed(self, backend):
@@ -354,3 +364,306 @@ class TestLanguage:
         # The tenant is Spanish (language="es" in _run); the activity is English.
         _, reply, _ = await _run(graph, "lang1", _turn("answer", cycle_index=0, language="en", answer={"text": "x"}))
         assert "I received your answer" in reply
+
+
+class TestOpening:
+    async def test_greets_by_first_name_and_offers_the_warmup(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        turn = _turn("open", student_name="Ana", warmup_available=True, topics=["la fe", "la gracia", "las obras"])
+        nodes, reply, events = await _run(graph, "op1", turn)
+        assert nodes == ["pablo_triage", "pablo_opening"]
+        assert reply.startswith("Hola, Ana. Soy Pablo.")
+        assert "Explícame tu razonamiento, no solo la respuesta" in reply
+        assert "no que aciertes" not in reply
+        assert "Vamos a recorrer 3 temas: la fe, la gracia y las obras." in reply
+        assert "calentamiento sin nota" in reply
+        assert events == [{"type": "assessment", "event": "opening_presented", "warmup_available": True}]
+        backend["next"].assert_not_awaited()
+
+    async def test_without_name_or_warmup(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        _, reply, _ = await _run(graph, "op2", _turn("open", warmup_available=False))
+        assert reply.startswith("Hola. Soy Pablo.")
+        assert "calentamiento" not in reply and "Cuando estés listo, empezamos." in reply
+
+    async def test_the_first_cycle_still_composes_after_the_opening(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await _run(graph, "op3", _turn("open", student_name="Ana"))
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            nodes, _, events = await _run(graph, "op3", _turn("start", cycle_index=0))
+        assert nodes == ["pablo_triage", "pablo_next_cycle"]
+        assert events[0]["event"] == "cycle_presented"
+
+
+class TestWarmup:
+    async def test_the_teachers_question_verbatim(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await _run(graph, "w1", _turn("open", warmup_available=True))
+        nodes, reply, events = await _run(graph, "w1", _turn("warmup", warmup_prompt="¿Qué te gustó del curso? {no}"))
+        assert nodes == ["pablo_triage", "pablo_warmup"]
+        assert reply == "Pregunta de calentamiento (sin nota):\n\n¿Qué te gustó del curso? {no}"
+        assert [e["event"] for e in events] == ["warmup_presented"]
+
+    async def test_the_answer_is_transcribed_and_never_reported(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await _run(graph, "w2", _turn("warmup", warmup_prompt="¿Qué te gustó?"))
+        with patch(f"{NODES}.transcription.transcribe", AsyncMock(return_value=Transcript("me gustó todo", "ok"))):
+            nodes, reply, events = await _run(
+                graph, "w2", _turn("warmup_answer", answer={"text": "", "audio_url": "https://x/a.webm"})
+            )
+        assert nodes == ["pablo_triage", "pablo_warmup_answer"]
+        assert "«me gustó todo»" in reply and "revisa el micrófono" in reply
+        assert events == [{"type": "assessment", "event": "warmup_recorded", "transcription": "ok"}]
+        backend["response"].assert_not_awaited()
+        backend["cycle"].assert_not_awaited()
+        backend["next"].assert_not_awaited()
+
+    async def test_failed_audio_gives_microphone_tips(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        failed = Transcript("", "failed", "boom")
+        with patch(f"{NODES}.transcription.transcribe", AsyncMock(return_value=failed)):
+            _, reply, _ = await _run(graph, "w3", _turn("warmup_answer", answer={"audio_url": "https://x/a.webm"}))
+        assert "permiso para usar el micrófono" in reply
+
+    async def test_the_warmup_is_not_a_cycle(self, backend):
+        """After a warm-up the first real answer still needs a presented cycle."""
+        graph = build_pablo_graph(MemorySaver())
+        await _run(graph, "w4", _turn("warmup", warmup_prompt="¿Qué te gustó?"))
+        await _run(graph, "w4", _turn("warmup_answer", answer={"text": "todo"}))
+        nodes, _, _ = await _run(graph, "w4", _turn("answer", cycle_index=0, answer={"text": "x"}))
+        assert nodes == ["pablo_triage", "pablo_error"]
+        state = await graph.aget_state({"configurable": {"thread_id": "w4"}})
+        assert not state.values["pablo"].get("cycle")
+        assert not state.values["pablo"].get("used_question_ids")
+
+    async def test_warmup_without_prompt_is_unexpected(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        _, reply, events = await _run(graph, "w5", _turn("warmup"))
+        assert "no espera ese mensaje" in reply and events == []
+
+
+def _payload(index: int, position: int, count: int, name: str, total: int = 6) -> dict:
+    return {
+        **_next_cycle(index=index, total=total),
+        "learning_outcome": {"id": f"lo{position}", "name": name},
+        "outcome_position": position,
+        "outcome_count": count,
+        "round": index // count,
+    }
+
+
+class TestProgress:
+    def test_first_round_counts_topics(self):
+        assert compose.progress_line(_payload(0, 1, 3, "la fe"), 0, 6, "es") == (
+            "Empezamos con el primer tema de tres: la fe."
+        )
+        assert compose.progress_line(_payload(1, 2, 3, "la gracia"), 1, 6, "es") == (
+            "Seguimos con el segundo tema de tres: la gracia."
+        )
+
+    def test_later_rounds_go_back_to_the_topic(self):
+        assert compose.progress_line(_payload(3, 1, 3, "la fe"), 3, 6, "es") == (
+            "Volvemos al tema «la fe» con otra pregunta."
+        )
+
+    def test_the_last_question_is_announced(self):
+        line = compose.progress_line(_payload(5, 3, 3, "las obras"), 5, 6, "es")
+        assert line == "Volvemos al tema «las obras» con otra pregunta. Es la última pregunta."
+
+    def test_single_topic_and_english(self):
+        assert compose.progress_line(_payload(0, 1, 1, "faith", total=2), 0, 2, "es") == "Hablemos de faith."
+        assert compose.progress_line(_payload(1, 2, 3, "grace"), 1, 6, "en") == (
+            "Next, the second topic of three: grace."
+        )
+
+    def test_old_backend_keeps_the_counter(self):
+        assert compose.progress_line(_next_cycle(index=1), 1, 3, "es") == "Pregunta 2 de 3"
+
+    async def test_the_header_replaces_the_counter(self, backend):
+        backend["next"].return_value = _payload(1, 2, 3, "la gracia")
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            _, reply, _ = await _run(graph, "p1", _turn("start", cycle_index=1))
+        assert reply.startswith("Seguimos con el segundo tema de tres: la gracia.")
+        assert "Pregunta 2" not in reply
+
+
+class TestEcho:
+    def test_literal_fragment_is_accepted(self):
+        answer = "Creo que la gracia es un regalo que no se gana con obras."
+        assert echo.validated_quote("«La  gracia es un regalo que no se gana»", answer) == (
+            "La gracia es un regalo que no se gana"
+        )
+
+    def test_paraphrase_and_bounds_are_rejected(self):
+        answer = "Creo que la gracia es un regalo que no se gana con obras."
+        assert echo.validated_quote("la gracia es un don gratuito", answer) is None
+        assert echo.validated_quote("la gracia", answer) is None
+        assert echo.validated_quote(" ".join(["palabra"] * 30), " ".join(["palabra"] * 40)) is None
+
+    async def test_quote_and_thanks_in_the_acknowledgement(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            await _run(graph, "e1", _turn("start", cycle_index=0))
+        answer = "Pienso que la fe sin obras está muerta, como dice Santiago."
+        backend["ack"].return_value = FakeProvider(AnswerEcho(quote="la fe sin obras está muerta"))
+        _, reply, _ = await _run(graph, "e1", _turn("answer", cycle_index=0, answer={"text": answer}))
+        assert reply.startswith("Anoté esta idea tuya: «la fe sin obras está muerta». Gracias por desarrollarlo.")
+
+    async def test_invented_quote_falls_back_to_the_plain_acknowledgement(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            await _run(graph, "e2", _turn("start", cycle_index=0))
+        backend["ack"].return_value = FakeProvider(AnswerEcho(quote="una respuesta excelente y completa"))
+        _, reply, _ = await _run(
+            graph, "e2", _turn("answer", cycle_index=0, answer={"text": "la fe y las obras van juntas"})
+        )
+        assert reply.startswith("Recibí tu respuesta. Gracias por desarrollarlo.")
+        assert "excelente" not in reply
+
+    async def test_ack_failure_never_blocks_the_answer(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            await _run(graph, "e3", _turn("start", cycle_index=0))
+        backend["ack"].return_value = FakeProvider(error=TimeoutError())
+        _, reply, events = await _run(
+            graph, "e3", _turn("answer", cycle_index=0, answer={"text": "la fe y las obras van juntas"})
+        )
+        assert "Recibí tu respuesta" in reply
+        assert events[0]["event"] == "response_recorded"
+
+    async def test_the_thanks_never_depends_on_the_answer(self, backend):
+        """Two different answers in the same cycle get the same words."""
+        replies = []
+        for thread, answer in (("e4", "no sé"), ("e5", "una respuesta larga y muy pensada sobre la fe")):
+            graph = build_pablo_graph(MemorySaver())
+            with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+                await _run(graph, thread, _turn("start", cycle_index=0))
+            _, reply, _ = await _run(graph, thread, _turn("answer", cycle_index=0, answer={"text": answer}))
+            replies.append(reply)
+        assert replies[0] == replies[1]
+
+    async def test_empty_answer_gets_no_thanks(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            await _run(graph, "e6", _turn("start", cycle_index=0))
+        _, reply, _ = await _run(
+            graph, "e6", _turn("answer", cycle_index=0, answer={"text": "", "timed_out": True})
+        )
+        assert reply.startswith("El tiempo de esta pregunta terminó sin respuesta.")
+        assert "Gracias por" not in reply.split("\n\n")[0]
+
+
+class TestClosing:
+    async def test_attempt_timeout_recaps_the_topics_seen(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            backend["next"].return_value = _payload(0, 1, 2, "la fe")
+            await _run(graph, "c1", _turn("start", cycle_index=0))
+            await _run(graph, "c1", _turn("answer", cycle_index=0, answer={"text": "r"}))
+            backend["next"].return_value = {**_payload(1, 2, 2, "la gracia"), "candidates": [_candidate("q3")]}
+            await _run(graph, "c1", _turn("continue", cycle_index=1))
+        _, reply, _ = await _run(graph, "c1", _turn("timeout", cycle_index=1, scope="attempt"))
+        assert "Se acabó el tiempo de la evaluación." in reply
+        assert "Hablamos de la fe y la gracia." in reply
+
+
+def _plan(**kw) -> FollowupPlan:
+    return FollowupPlan(**{"quote": "", "target_component_id": "q1:c1", "mode": "gap",
+                           "question": "Mencionaste el perdón; ¿cómo lo ves en la vida diaria?", **kw})
+
+
+class TestFollowup:
+    async def _started(self, graph, thread):
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
+            await _run(graph, thread, _turn("start", cycle_index=0))
+
+    async def _answer(self, graph, thread, plan, text="Dios perdona al que no lo merece, eso es gracia.", **extra):
+        provider = plan if isinstance(plan, FakeProvider) else FakeProvider(plan)
+        with patch(f"{FOLLOWUP}.get_provider", return_value=provider):
+            return await _run(
+                graph, thread,
+                _turn("answer", cycle_index=0, followup_allowed=True, answer={"text": text}, **extra),
+            )
+
+    async def test_every_answer_with_content_gets_one(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f1")
+        _, reply, events = await self._answer(graph, "f1", _plan())
+        assert "Antes de seguir, una pregunta más:\nMencionaste el perdón" in reply
+        assert events == [{"type": "assessment", "event": "followup_presented", "cycle_index": 0}]
+        body = backend["followup"].await_args.args[2]
+        assert body["targetComponentId"] == "q1:c1" and body["mode"] == "gap"
+        assert body["provenance"]["prompt_key"] == "ASSESSMENT_FOLLOWUP"
+        # The rubric reaches the follow-up call (and only it), with the criteria.
+        backend["response"].assert_awaited_once()
+
+    async def test_the_answer_to_it_ends_the_cycle(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f2")
+        await self._answer(graph, "f2", _plan())
+        nodes, reply, events = await _run(
+            graph, "f2", _turn("followup_answer", cycle_index=0, answer={"text": "Cuando perdono a mi hermano."})
+        )
+        assert nodes == ["pablo_triage", "pablo_followup_answer"]
+        assert "Continuar" in reply
+        assert events == [{"type": "assessment", "event": "response_recorded", "cycle_index": 0, "is_last": False}]
+        assert backend["followup_response"].await_args.args[2]["text"] == "Cuando perdono a mi hermano."
+
+    async def test_a_question_naming_the_rubric_is_refused(self, backend):
+        """The rubric says «obras»; neither the question nor the answer did."""
+        graph = build_pablo_graph(MemorySaver())
+        crit = {**_next_cycle(), "candidates": [
+            {**_candidate("q1"), "rubric": {"version_id": "rv", "components": [
+                {"id": "c1", "name": "Fe y obras", "max_points": 4, "criteria": "Relaciona la gracia con las obras"}]}},
+            _candidate("q2"),
+        ]}
+        backend["next"].return_value = crit
+        await self._started(graph, "f3")
+        leaky = _plan(question="¿Y qué papel tienen las obras en todo esto?")
+        _, reply, _ = await self._answer(graph, "f3", leaky)
+        assert "obras" not in reply.split("una pregunta más:")[1]
+        assert "¿Puedes desarrollar un poco más tu respuesta a la Parte A, con un ejemplo?" in reply
+        assert backend["followup"].await_args.args[2]["provenance"]["fallback"] == "generic"
+
+    async def test_a_failed_call_still_asks_a_generic_one(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f4")
+        _, reply, events = await self._answer(graph, "f4", FakeProvider(error=TimeoutError()))
+        assert "¿Puedes desarrollar un poco más tu respuesta" in reply
+        assert events[0]["event"] == "followup_presented"
+        assert backend["followup"].await_args.args[2]["mode"] == "deepen"
+
+    async def test_an_empty_answer_gets_none(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f5")
+        _, reply, events = await self._answer(graph, "f5", _plan(), text="", timed_out=True)
+        assert "una pregunta más" not in reply
+        assert events[0]["event"] == "response_recorded"
+        backend["followup"].assert_not_awaited()
+
+    async def test_not_allowed_means_none(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f6")
+        _, reply, events = await _run(graph, "f6", _turn("answer", cycle_index=0, answer={"text": "una respuesta"}))
+        assert events[0]["event"] == "response_recorded"
+        backend["followup"].assert_not_awaited()
+
+    async def test_unstored_followup_is_never_shown(self, backend):
+        backend["followup"].side_effect = RuntimeError("500")
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f7")
+        _, reply, events = await self._answer(graph, "f7", _plan())
+        assert "Mencionaste el perdón" not in reply and "Continuar" in reply
+        assert events[0]["event"] == "response_recorded"
+
+    async def test_followup_answer_without_followup_is_unexpected(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        await self._started(graph, "f8")
+        nodes, _, _ = await _run(graph, "f8", _turn("followup_answer", cycle_index=0, answer={"text": "x"}))
+        assert nodes == ["pablo_triage", "pablo_error"]
+
+    def test_leak_guard_ignores_generic_words_and_accents(self):
+        assert followup.leaked_words("¿Podrías dar un ejemplo?", "Explica con un ejemplo propio", "") == set()
+        assert followup.leaked_words("¿Y la santificación?", "Santificacion progresiva", "la gracia") == {"santificacion"}
+        assert followup.leaked_words("¿Y la gracia?", "gracia", "Hablé de la gracia") == set()

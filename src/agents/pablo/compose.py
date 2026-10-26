@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 
 from ...schemas.pablo import ComposedCycle, ComposedPart
-from .texts import part_label, text
+from .texts import cardinal, ordinal, part_label, text
 
 MAX_PARTS = 3
 MIN_PARTS = 2
@@ -83,14 +83,61 @@ def validated_parts(result: ComposedCycle | None, candidates: list[dict]) -> lis
     return parts
 
 
-def render(intro: str, parts: list[ComposedPart], cycle_index: int, total: int, lang: str) -> str:
-    header = text("question", lang, n=cycle_index + 1, total=total)
-    lines = [header]
+def progress_line(payload: dict, cycle_index: int, total: int, lang: str) -> str:
+    """The cycle's header told as a story: which topic, and whether it is the
+    last question. Topics rotate (cycle ``i`` → outcome ``i % n``), so after the
+    first round it says "back to …" instead of counting.
+
+    A backend that does not send ``outcome_position`` gets the old counter.
+    """
+    name = str((payload.get("learning_outcome") or {}).get("name") or "").strip()
+    position = payload.get("outcome_position")
+    count = payload.get("outcome_count")
+    if not name or not isinstance(position, int) or not isinstance(count, int) or count < 1:
+        return text("question", lang, n=cycle_index + 1, total=total)
+    round_ = payload.get("round")
+    round_ = round_ if isinstance(round_, int) else cycle_index // count
+    if round_ > 0:
+        line = text("progress_again", lang, name=name)
+    elif count == 1:
+        line = text("progress_only", lang, name=name)
+    elif position <= 1:
+        line = text("progress_first", lang, count=cardinal(count, lang), name=name)
+    else:
+        line = text("progress_next", lang, ordinal=ordinal(position, lang), count=cardinal(count, lang), name=name)
+    is_last = payload.get("is_last")
+    if not isinstance(is_last, bool):
+        is_last = total > 0 and cycle_index + 1 >= total
+    if is_last:
+        line = f"{line} {text('progress_last', lang)}"
+    return line
+
+
+def render(
+    intro: str,
+    parts: list[ComposedPart],
+    cycle_index: int,
+    total: int,
+    lang: str,
+    header: str | None = None,
+) -> str:
+    lines = [header or text("question", lang, n=cycle_index + 1, total=total)]
     if intro.strip():
         lines.append(intro.strip())
     for index, part in enumerate(parts):
         lines.append(f"{part_label(index, lang)}: {part.prompt}")
     return "\n\n".join(lines)
+
+
+def component_criteria(parts: list[ComposedPart], candidates: list[dict]) -> dict[str, str]:
+    """{component_id: criteria} for the follow-up question's rubric view.
+    Kept in the agent's state only: the backend already has the rubric."""
+    by_id = {c["snapshot_id"]: c for c in candidates}
+    return {
+        f"{part.question_snapshot_id}:{component.get('id')}": str(component.get("criteria") or "")
+        for part in parts
+        for component in (by_id[part.question_snapshot_id].get("rubric") or {}).get("components") or []
+    }
 
 
 def component_map(parts: list[ComposedPart], candidates: list[dict], lang: str) -> list[dict]:

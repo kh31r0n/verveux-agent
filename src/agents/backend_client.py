@@ -314,6 +314,24 @@ async def report_assessment_response(attempt_id: str, cycle_index: int, response
     )
 
 
+async def report_assessment_followup(attempt_id: str, cycle_index: int, followup: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n/followup — the
+    follow-up question, stored before the student sees it. Idempotent."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}/followup",
+        json=followup,
+    )
+
+
+async def report_assessment_followup_response(attempt_id: str, cycle_index: int, response: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n/followup/response —
+    the follow-up's text and/or transcript, scored with the first answer."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}/followup/response",
+        json=response,
+    )
+
+
 async def report_assessment_score(attempt_id: str, payload: dict) -> dict:
     """POST /internal/assessment/attempts/:id/score — component points; the
     backend maps them onto the activity's grade range and publishes."""

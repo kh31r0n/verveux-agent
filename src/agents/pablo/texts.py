@@ -63,19 +63,22 @@ _TEXTS: dict[str, dict[str, str]] = {
         ),
     },
     "opening_topics": {"es": "Vamos a recorrer {n} temas: {topics}.", "en": "We will cover {n} topics: {topics}."},
-    "opening_topic": {"es": "Vamos a hablar de {topics}.", "en": "We will talk about {topics}."},
+    "opening_topic": {
+        "es": "Vamos a trabajar sobre esto: {topics}.",
+        "en": "This is what we will work on: {topics}.",
+    },
     "opening_clock": {
         "es": "El tiempo solo corre mientras una pregunta está abierta.",
         "en": "The clock only runs while a question is open.",
     },
     "opening_warmup": {
         "es": (
-            "Si quieres, antes hacemos una pregunta de calentamiento sin nota para probar "
-            "el micrófono y el formato. Puedes saltarla."
+            "Antes, si quieres, hacemos una pregunta de prueba sin nota para probar el "
+            "micrófono y el formato. Elige abajo: puedes saltarla."
         ),
         "en": (
-            "If you like, we can start with an ungraded warm-up question to try the "
-            "microphone and the format. You can skip it."
+            "First, if you like, we can do an ungraded practice question to try the "
+            "microphone and the format. Choose below: you can skip it."
         ),
     },
     "opening_ready": {"es": "Cuando estés listo, empezamos.", "en": "Whenever you are ready, we begin."},
@@ -126,14 +129,16 @@ _TEXTS: dict[str, dict[str, str]] = {
         "en": "Can you develop your answer a little further, with an example?",
     },
     # ── Narrative progress (the cycle header) ──
+    # Label-like ("Topic: …"), so an outcome named as an objective with a verb
+    # reads as well as a noun.
     "progress_first": {
-        "es": "Empezamos con el primer tema de {count}: {name}.",
-        "en": "We start with the first topic of {count}: {name}.",
+        "es": "Primer tema de {count}: {name}.",
+        "en": "First topic of {count}: {name}.",
     },
-    "progress_only": {"es": "Hablemos de {name}.", "en": "Let's talk about {name}."},
+    "progress_only": {"es": "Tema: {name}.", "en": "Topic: {name}."},
     "progress_next": {
-        "es": "Seguimos con el {ordinal} tema de {count}: {name}.",
-        "en": "Next, the {ordinal} topic of {count}: {name}.",
+        "es": "{ordinal} tema de {count}: {name}.",
+        "en": "{ordinal} topic of {count}: {name}.",
     },
     "progress_again": {
         "es": "Volvemos al tema «{name}» con otra pregunta.",

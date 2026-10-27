@@ -7,6 +7,8 @@ onto the activity's grade range — the model never does the arithmetic.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -59,7 +61,19 @@ class ComponentScore(BaseModel):
     rationale: str = ""
 
 
+class QuestionVerdict(BaseModel):
+    # One per question that has a reference (the teacher's "Information for
+    # graders"). Code fills ``no_reference`` for the others.
+    question_snapshot_id: str
+    verdict: Literal["correct", "partial", "incorrect"]
+    # Technical, for the teacher; never shown to the student.
+    reason: str = ""
+
+
 class CycleScore(BaseModel):
+    # Before the components on purpose: the model judges the answer against
+    # the reference first, and scores the rubric on that ground truth.
+    verdicts: list[QuestionVerdict] = Field(default_factory=list)
     components: list[ComponentScore] = Field(default_factory=list)
 
 
@@ -71,10 +85,20 @@ class OutcomeFeedback(BaseModel):
     comment: str
 
 
+class QuestionFeedback(BaseModel):
+    cycle_index: int
+    question_snapshot_id: str
+    # What was right, where the reasoning went wrong or what was missing, and
+    # what to review — never the expected answer. Part and verdict are added
+    # in code.
+    comment: str
+
+
 class AttemptFeedbackResult(BaseModel):
     overall_summary: str
     strengths: list[str] = Field(default_factory=list)
     areas_for_improvement: list[str] = Field(default_factory=list)
+    per_question_feedback: list[QuestionFeedback] = Field(default_factory=list)
     per_outcome_feedback: list[OutcomeFeedback] = Field(default_factory=list)
     study_recommendations: list[str] = Field(default_factory=list)
 
@@ -142,6 +166,9 @@ class ScoreFollowup(BaseModel):
 class ScoreQuestion(BaseModel):
     question_snapshot_id: str
     text: str
+    # The teacher's expected answer (essay "Information for graders"); empty =
+    # scored with the rubric alone. Never reaches the student.
+    grader_info: str = ""
 
 
 class ScoreCycle(BaseModel):

@@ -9,13 +9,15 @@ reaches the student:
 - the target must be one of the cycle's components;
 - the question is short and is a question;
 - **leak guard**: a content word that appears in the rubric (component names
-  or criteria) but neither in the question the student saw nor in their
-  answer would hand them what is missing, so the question is dropped;
+  or criteria) or in the teacher's reference (``grader_info``) but neither in
+  the question the student saw nor in their answer would hand them what is
+  missing, so the question is dropped;
 - whenever the model fails or is refused, a generic question in code goes
   out instead — every student still gets one.
 
-This is the only chat-time call that sees the rubric; it never sees the
-teacher's calibration examples.
+This is the only chat-time call that sees the rubric and the reference (to
+aim the question at what the answer gets wrong or leaves out); it never sees
+the teacher's calibration examples.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from ...providers.registry import get_provider, resolve_model
 from ...schemas.pablo import FollowupPlan
 from ...usage import make_usage_record
 from . import echo
-from .common import fence, json_contract, system_prompt
+from .common import fence, json_contract, reference_rule, system_prompt
 from .prompts import FOLLOWUP_PROMPT
 from .texts import text
 
@@ -106,11 +108,23 @@ def validated(plan: FollowupPlan | None, cycle: dict, answer: str) -> tuple[str 
     if not question or len(question) > MAX_CHARS or not question.rstrip().endswith("?"):
         return None, target, mode
     rubric = " ".join(f"{c['name']} {c['criteria']}" for c in components_block(cycle))
+    references = " ".join((cycle.get("grader_info") or {}).values())
+    rubric = f"{rubric} {references}"
     leaked = leaked_words(question, rubric, f"{cycle.get('composite_prompt', '')} {answer}")
     if leaked:
         logger.info("pablo_followup_leak_refused", words=sorted(leaked)[:10])
         return None, target, mode
     return question, target, mode
+
+
+def _references_block(cycle: dict) -> str:
+    references = cycle.get("grader_info") or {}
+    if not references:
+        return ""
+    parts = {c["question_snapshot_id"]: c.get("part", "") for c in cycle.get("component_map") or []}
+    return "\n\nReferencias del profesor (el estudiante no las ve):\n" + "\n".join(
+        f"{parts.get(qid, '') or qid}:\n" + fence("REFERENCIA", ref) for qid, ref in references.items() if ref
+    )
 
 
 async def plan_for(
@@ -124,6 +138,7 @@ async def plan_for(
         + str(cycle.get("composite_prompt", ""))
         + "\n\nComponentes de la rúbrica (JSON, el estudiante no los ve):\n"
         + json.dumps(components_block(cycle), ensure_ascii=False)
+        + _references_block(cycle)
         + "\n\nRespuesta del estudiante:\n"
         + fence("RESPUESTA", answer[:6000])
     )
@@ -137,7 +152,12 @@ async def plan_for(
         plan = await asyncio.wait_for(
             provider.generate_structured(
                 [
-                    {"role": "system", "content": system + json_contract(FollowupPlan)},
+                    {
+                        "role": "system",
+                        "content": system
+                        + (reference_rule("followup", lang) if cycle.get("grader_info") else "")
+                        + json_contract(FollowupPlan),
+                    },
                     {"role": "user", "content": user},
                 ],
                 model,

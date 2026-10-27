@@ -114,6 +114,11 @@ email_sync_runs_total = Counter(
 # ── Theology agent (ismael) ──────────────────────────────────────────────────
 # outcome: answered | unresolved | no_results | no_pages | search_failed |
 # timeout | error
+pablo_feedback_reference_leaks_total = Counter(
+    "pablo_feedback_reference_leaks_total",
+    "Feedback that kept copying the teacher's reference and was rewritten without it",
+)
+
 ismael_research_total = Counter(
     "ismael_research_total",
     "Web lookups of a reported Moodle error by ismael's support branch",

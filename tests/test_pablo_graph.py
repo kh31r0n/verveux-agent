@@ -376,7 +376,7 @@ class TestOpening:
         assert "Explícame tu razonamiento, no solo la respuesta" in reply
         assert "no que aciertes" not in reply
         assert "Vamos a recorrer 3 temas: la fe, la gracia y las obras." in reply
-        assert "calentamiento sin nota" in reply
+        assert "pregunta de prueba sin nota" in reply and "Elige abajo" in reply
         assert events == [{"type": "assessment", "event": "opening_presented", "warmup_available": True}]
         backend["next"].assert_not_awaited()
 
@@ -455,10 +455,10 @@ def _payload(index: int, position: int, count: int, name: str, total: int = 6) -
 class TestProgress:
     def test_first_round_counts_topics(self):
         assert compose.progress_line(_payload(0, 1, 3, "la fe"), 0, 6, "es") == (
-            "Empezamos con el primer tema de tres: la fe."
+            "Primer tema de tres: la fe."
         )
         assert compose.progress_line(_payload(1, 2, 3, "la gracia"), 1, 6, "es") == (
-            "Seguimos con el segundo tema de tres: la gracia."
+            "Segundo tema de tres: la gracia."
         )
 
     def test_later_rounds_go_back_to_the_topic(self):
@@ -471,9 +471,9 @@ class TestProgress:
         assert line == "Volvemos al tema «las obras» con otra pregunta. Es la última pregunta."
 
     def test_single_topic_and_english(self):
-        assert compose.progress_line(_payload(0, 1, 1, "faith", total=2), 0, 2, "es") == "Hablemos de faith."
+        assert compose.progress_line(_payload(0, 1, 1, "faith", total=2), 0, 2, "es") == "Tema: faith."
         assert compose.progress_line(_payload(1, 2, 3, "grace"), 1, 6, "en") == (
-            "Next, the second topic of three: grace."
+            "Second topic of three: grace."
         )
 
     def test_old_backend_keeps_the_counter(self):
@@ -484,7 +484,7 @@ class TestProgress:
         graph = build_pablo_graph(MemorySaver())
         with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1", "q2"))):
             _, reply, _ = await _run(graph, "p1", _turn("start", cycle_index=1))
-        assert reply.startswith("Seguimos con el segundo tema de tres: la gracia.")
+        assert reply.startswith("Segundo tema de tres: la gracia.")
         assert "Pregunta 2" not in reply
 
 

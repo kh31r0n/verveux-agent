@@ -114,7 +114,9 @@ def _compose_failed(state: AgentState, pablo: dict, reason: str) -> dict:
     return reply(text("compose_failed", lang_of(state)), pablo=pablo)
 
 
-async def _compose(state: AgentState, config: RunnableConfig, outcome: dict, candidates: list[dict]):
+async def _compose(
+    state: AgentState, config: RunnableConfig, outcome: dict, candidates: list[dict], k: int | None = None
+):
     """(ComposedCycle | None, usage, provenance). None = use the candidates verbatim."""
     lang = lang_of(state)
     system, provenance = system_prompt(
@@ -127,7 +129,10 @@ async def _compose(state: AgentState, config: RunnableConfig, outcome: dict, can
         result = await asyncio.wait_for(
             provider.generate_structured(
                 [
-                    {"role": "system", "content": system + json_contract(ComposedCycle)},
+                    {
+                        "role": "system",
+                        "content": system + compose.count_rule(k, lang) + json_contract(ComposedCycle),
+                    },
                     {"role": "user", "content": compose.candidates_block(outcome, candidates)},
                 ],
                 model,
@@ -185,8 +190,9 @@ async def pablo_next_cycle_node(state: AgentState, config: RunnableConfig) -> di
     total = int(payload.get("total_cycles") or pablo.get("total_cycles") or cycle_index + 1)
     outcome = payload.get("learning_outcome") or {}
 
-    result, usage, provenance = await _compose(state, config, outcome, candidates)
-    parts = compose.validated_parts(result, candidates)
+    k = compose.questions_per_cycle(payload)
+    result, usage, provenance = await _compose(state, config, outcome, candidates, k)
+    parts = compose.validated_parts(result, candidates, k)
     cycle = {
         "cycle_index": cycle_index,
         "learning_outcome_id": str(outcome.get("id") or ""),
@@ -201,6 +207,8 @@ async def pablo_next_cycle_node(state: AgentState, config: RunnableConfig) -> di
         "question_snapshot_ids": [p.question_snapshot_id for p in parts],
         "component_map": compose.component_map(parts, candidates, lang),
         "rubric_criteria": compose.component_criteria(parts, candidates),
+        # The teacher's references, for the follow-up only (never reported).
+        "grader_info": compose.question_grader_info(parts, candidates),
         "prompt_provenance": provenance,
     }
     try:
@@ -219,7 +227,7 @@ async def pablo_next_cycle_node(state: AgentState, config: RunnableConfig) -> di
         return _compose_failed(state, pablo, f"report_cycle: {exc}"[:200])
 
     seen = list(pablo.get("outcomes_seen") or [])
-    name = str(outcome.get("name") or "").strip()
+    name = compose.topic_name(outcome.get("name") or "")
     if name and name not in seen:
         seen.append(name)
     pablo.update(
@@ -427,6 +435,13 @@ async def pablo_followup_answer_node(state: AgentState, config: RunnableConfig) 
 # ── Opening and warm-up (not cycles) ─────────────────────────────────────────
 
 
+def _display_name(raw) -> str:
+    """Moodle's first name as given, except ALL CAPS («JORGE EDUARDO») which
+    becomes «Jorge Eduardo»."""
+    name = " ".join(str(raw or "").split())[:60]
+    return name.title() if name.isupper() else name
+
+
 async def pablo_opening_node(state: AgentState) -> dict:
     """The greeting. Fixed text: the student's first name (attested by Moodle),
     what the conversation is about, and the warm-up offer."""
@@ -434,9 +449,9 @@ async def pablo_opening_node(state: AgentState) -> dict:
     turn = assessment_turn(state)
     pablo = pablo_dict(state)
     lang = lang_of(state)
-    name = " ".join(str(turn.get("student_name") or "").split())[:60]
+    name = _display_name(turn.get("student_name"))
     who = persona(state)
-    topics = [str(t).strip() for t in turn.get("topics") or [] if str(t).strip()]
+    topics = [compose.topic_name(t) for t in turn.get("topics") or [] if compose.topic_name(t)]
     warmup = bool(turn.get("warmup_available"))
 
     first = text("hello_name", lang, name=name, persona=who) if name else text("hello", lang, persona=who)

@@ -1,10 +1,18 @@
-"""Cycle composition: 2–3 authorised questions → one composite prompt.
+"""Cycle composition: the teacher's questions per cycle → one composite prompt.
 
 The backend decides which questions are eligible (the next learning outcome,
 none already used); the model only chooses among them and rewrites them as
 open prompts. Everything the scoring later depends on — which question each
 part is, which rubric components it carries — is derived here in code from the
 candidates, never from the model's text.
+
+How many questions a cycle joins is the teacher's (``questions_per_cycle``,
+1–3); the rule is appended in code (``count_rule``) so a tenant's prompt cannot
+change it. A backend that does not send it keeps the old 2–3.
+
+The candidates' ``grader_info`` (the teacher's expected answer) never reaches
+the composer: ``candidates_block`` lists only what the student may see, and
+``question_grader_info`` keeps it apart for the follow-up.
 
 Candidate shape (from ``POST /internal/assessment/attempts/:id/next-cycle``)::
 
@@ -15,6 +23,7 @@ Candidate shape (from ``POST /internal/assessment/attempts/:id/next-cycle``)::
 from __future__ import annotations
 
 import json
+import re
 
 from ...schemas.pablo import ComposedCycle, ComposedPart
 from .texts import cardinal, ordinal, part_label, text
@@ -54,13 +63,34 @@ def candidates_block(outcome: dict, candidates: list[dict]) -> str:
     )
 
 
-def validated_parts(result: ComposedCycle | None, candidates: list[dict]) -> list[ComposedPart]:
-    """The model's parts that name a real, distinct candidate, at most 3.
+def questions_per_cycle(payload: dict) -> int | None:
+    """The teacher's choice (1–3), or None from a backend that does not send it."""
+    k = payload.get("questions_per_cycle")
+    return min(max(k, 1), MAX_PARTS) if isinstance(k, int) and not isinstance(k, bool) else None
 
-    Falls back to the first candidates verbatim when the model picked fewer
-    than it could have — a cycle never silently shrinks to one part because a
-    model returned an unknown id.
+
+def count_rule(k: int | None, lang: str) -> str:
+    """How many candidates to use, appended in code to the composer's prompt."""
+    if k is None:
+        return ""
+    if k == 1:
+        rule = "Usa una sola candidata (devuelve exactamente una parte)."
+    else:
+        rule = f"Elige exactamente {k} candidatas (si hay menos, úsalas todas)."
+    return f"\n\nNúmero de partes (obligatorio): {rule}"
+
+
+def validated_parts(
+    result: ComposedCycle | None, candidates: list[dict], k: int | None = None
+) -> list[ComposedPart]:
+    """The model's parts that name a real, distinct candidate: at most ``k``
+    (3 when the backend sent no ``k``).
+
+    Completes with candidates verbatim up to ``k`` (2 without one) when the
+    model picked fewer than it could have — a cycle never silently shrinks
+    because a model returned an unknown id.
     """
+    limit = k or MAX_PARTS
     by_id = {c["snapshot_id"]: c for c in candidates}
     parts: list[ComposedPart] = []
     seen: set[str] = set()
@@ -69,9 +99,9 @@ def validated_parts(result: ComposedCycle | None, candidates: list[dict]) -> lis
         if sid in by_id and sid not in seen and part.prompt.strip():
             parts.append(ComposedPart(question_snapshot_id=sid, prompt=part.prompt.strip()))
             seen.add(sid)
-        if len(parts) == MAX_PARTS:
+        if len(parts) == limit:
             break
-    wanted = min(MIN_PARTS, len(candidates))
+    wanted = min(k or MIN_PARTS, len(candidates))
     for c in candidates:
         if len(parts) >= wanted:
             break
@@ -83,6 +113,28 @@ def validated_parts(result: ComposedCycle | None, candidates: list[dict]) -> lis
     return parts
 
 
+_TRAILING = re.compile(r"[\s.;:,…]+$")
+
+
+def topic_name(name: str) -> str:
+    """An outcome's name as a topic: «Reconoce los mitos… bíblica..» loses its
+    final punctuation (the templates end the sentence themselves)."""
+    return _TRAILING.sub("", " ".join(str(name or "").split()))
+
+
+def question_grader_info(parts: list[ComposedPart], candidates: list[dict]) -> dict[str, str]:
+    """{question_snapshot_id: reference} for the chosen parts that have one.
+    Kept in the agent's state for the follow-up only; never composed, echoed
+    or reported."""
+    by_id = {c["snapshot_id"]: c for c in candidates}
+    out = {}
+    for part in parts:
+        reference = str(by_id[part.question_snapshot_id].get("grader_info") or "").strip()[:2000]
+        if reference:
+            out[part.question_snapshot_id] = reference
+    return out
+
+
 def progress_line(payload: dict, cycle_index: int, total: int, lang: str) -> str:
     """The cycle's header told as a story: which topic, and whether it is the
     last question. Topics rotate (cycle ``i`` → outcome ``i % n``), so after the
@@ -90,7 +142,7 @@ def progress_line(payload: dict, cycle_index: int, total: int, lang: str) -> str
 
     A backend that does not send ``outcome_position`` gets the old counter.
     """
-    name = str((payload.get("learning_outcome") or {}).get("name") or "").strip()
+    name = topic_name((payload.get("learning_outcome") or {}).get("name") or "")
     position = payload.get("outcome_position")
     count = payload.get("outcome_count")
     if not name or not isinstance(position, int) or not isinstance(count, int) or count < 1:
@@ -104,7 +156,9 @@ def progress_line(payload: dict, cycle_index: int, total: int, lang: str) -> str
     elif position <= 1:
         line = text("progress_first", lang, count=cardinal(count, lang), name=name)
     else:
-        line = text("progress_next", lang, ordinal=ordinal(position, lang), count=cardinal(count, lang), name=name)
+        line = text(
+            "progress_next", lang, ordinal=ordinal(position, lang).capitalize(), count=cardinal(count, lang), name=name
+        )
     is_last = payload.get("is_last")
     if not isinstance(is_last, bool):
         is_last = total > 0 and cycle_index + 1 >= total
@@ -124,8 +178,12 @@ def render(
     lines = [header or text("question", lang, n=cycle_index + 1, total=total)]
     if intro.strip():
         lines.append(intro.strip())
-    for index, part in enumerate(parts):
-        lines.append(f"{part_label(index, lang)}: {part.prompt}")
+    # One question needs no "Part A" label.
+    if len(parts) == 1:
+        lines.append(parts[0].prompt)
+    else:
+        for index, part in enumerate(parts):
+            lines.append(f"{part_label(index, lang)}: {part.prompt}")
     return "\n\n".join(lines)
 
 

@@ -6,6 +6,12 @@ the request). The model returns points per rubric component; code clamps them
 to the rubric and the backend turns the attempt into a grade on the activity's
 scale — no arithmetic is left to the model.
 
+A question with the teacher's "Information for graders" (``grader_info``) is
+judged against it first — a verdict ``correct | partial | incorrect`` with a
+reason for the teacher — and that verdict is the ground truth the rubric is
+applied on. A question without one gets ``no_reference`` in code. The
+reference only ever reaches the model fenced (``<<<REFERENCIA``).
+
 A cycle that was never answered scores 0 without a model call. A cycle whose
 audio could not be transcribed (and has no text) scores 0 with
 ``needsReview``, which opens a review case. When the model fails a cycle after
@@ -26,7 +32,7 @@ from ...schemas.pablo import CycleScore, ScoreCycle, ScoreRequest
 from ...usage import make_usage_record
 from .. import backend_client
 from . import feedback, jobs
-from .common import answer_text, fence, json_contract, system_prompt
+from .common import answer_text, fence, json_contract, reference_rule, system_prompt
 from .prompts import SCORE_PROMPT
 
 logger = structlog.get_logger(__name__)
@@ -92,10 +98,9 @@ def cycle_block(cycle: ScoreCycle, examples: list[dict]) -> str:
         }
         for c in cycle.components
     ]
-    questions = [{"id": q.question_snapshot_id, "text": q.text[:2000]} for q in cycle.questions]
     sections = [
         "Pregunta compuesta que vio el estudiante:\n" + cycle.composite_prompt,
-        "Preguntas originales del banco (JSON):\n" + json.dumps(questions, ensure_ascii=False),
+        "Preguntas originales del banco:\n" + "\n\n".join(_question_lines(cycle)),
         "Componentes a calificar (JSON):\n" + json.dumps(components, ensure_ascii=False),
     ]
     if examples:
@@ -116,6 +121,71 @@ def cycle_block(cycle: ScoreCycle, examples: list[dict]) -> str:
         else:
             sections.append("El estudiante no respondió la repregunta.")
     return "\n\n".join(sections)
+
+
+def question_parts(cycle: ScoreCycle) -> dict[str, str]:
+    """{question_snapshot_id: "Parte A"} from the cycle's components."""
+    parts: dict[str, str] = {}
+    for c in cycle.components:
+        parts.setdefault(c.question_snapshot_id, c.part)
+    return parts
+
+
+def _question_lines(cycle: ScoreCycle) -> list[str]:
+    parts = question_parts(cycle)
+    lines = []
+    for q in cycle.questions:
+        head = json.dumps(
+            {"id": q.question_snapshot_id, "part": parts.get(q.question_snapshot_id, ""), "text": q.text[:2000]},
+            ensure_ascii=False,
+        )
+        if q.grader_info.strip():
+            lines.append(
+                f"{head}\nReferencia del profesor para {q.question_snapshot_id}:\n"
+                + fence("REFERENCIA", q.grader_info[:3000])
+            )
+        else:
+            lines.append(f"{head}\nSin referencia (calificar solo con la rúbrica).")
+    return lines
+
+
+def _verdict(cycle: ScoreCycle, question_id: str, verdict: str, reason: str) -> dict:
+    return {
+        "cycleIndex": cycle.cycle_index,
+        "questionSnapshotId": question_id,
+        "verdict": verdict,
+        "reason": reason[:1000],
+    }
+
+
+def verdicts_from(cycle: ScoreCycle, result: CycleScore) -> list[dict]:
+    """One verdict per question of the cycle. ``no_reference`` is decided in
+    code; a question with a reference the model left unjudged raises (retried,
+    like a missing component). Ids the cycle did not ask are dropped."""
+    by_id = {}
+    for v in result.verdicts:
+        by_id.setdefault(v.question_snapshot_id.strip(), v)
+    out, missing = [], []
+    for q in cycle.questions:
+        if not q.grader_info.strip():
+            out.append(_verdict(cycle, q.question_snapshot_id, "no_reference", ""))
+        elif (v := by_id.get(q.question_snapshot_id)) is not None:
+            out.append(_verdict(cycle, q.question_snapshot_id, v.verdict, v.reason))
+        else:
+            missing.append(q.question_snapshot_id)
+    if missing:
+        raise ScoringFailed(f"missing verdicts: {missing}")
+    return out
+
+
+def unanswered_verdicts(cycle: ScoreCycle, lang: str) -> list[dict]:
+    """A cycle left blank: incorrect against every reference, no model call."""
+    return [
+        _verdict(cycle, q.question_snapshot_id, "incorrect", _NO_ANSWER[lang])
+        if q.grader_info.strip()
+        else _verdict(cycle, q.question_snapshot_id, "no_reference", "")
+        for q in cycle.questions
+    ]
 
 
 def _response_sections(sections: list[str], response, suffix: str) -> None:
@@ -179,11 +249,13 @@ def components_from(cycle: ScoreCycle, result: CycleScore) -> list[dict]:
     return rows
 
 
-async def _score_cycle(config: dict, system: str, provenance: dict, cycle: ScoreCycle, examples: list):
+async def _score_cycle(
+    config: dict, system: str, provenance: dict, cycle: ScoreCycle, examples: list, lang: str = "es"
+):
     provider = get_provider(config)
     model = resolve_model(config)
     messages = [
-        {"role": "system", "content": system + json_contract(CycleScore)},
+        {"role": "system", "content": system + reference_rule("score", lang) + json_contract(CycleScore)},
         {"role": "user", "content": cycle_block(cycle, examples)},
     ]
     last_error: Exception | None = None
@@ -206,20 +278,21 @@ async def _score_cycle(config: dict, system: str, provenance: dict, cycle: Score
                     provenance=provenance,
                 )
             )
-            return components_from(cycle, result), usage, model
+            return components_from(cycle, result), verdicts_from(cycle, result), usage, model
         except Exception as exc:  # noqa: BLE001 — retried, then the attempt fails loudly
             last_error = exc
             logger.warning("pablo_score_cycle_failed", cycle_index=cycle.cycle_index, error=str(exc)[:300])
     raise ScoringFailed(str(last_error)[:300])
 
 
-async def score_attempt(req: ScoreRequest, config: dict) -> tuple[list[dict], list, dict]:
-    """(component rows, usage, provenance) for every cycle of the attempt."""
+async def score_attempt(req: ScoreRequest, config: dict) -> tuple[list[dict], list[dict], list, dict]:
+    """(component rows, verdicts, usage, provenance) for every cycle of the attempt."""
     lang = _lang(req)
     system, provenance = system_prompt(
         config, "ASSESSMENT_SCORE", SCORE_PROMPT, lang, req.agent_persona_name
     )
     rows: list[dict] = []
+    verdicts: list[dict] = []
     usage: list = []
     model = ""
     for cycle in sorted(req.cycles, key=lambda c: c.cycle_index):
@@ -228,20 +301,24 @@ async def score_attempt(req: ScoreRequest, config: dict) -> tuple[list[dict], li
         if not answer_text(cycle):
             failed = bool(cycle.response and cycle.response.transcription_status == "failed")
             rows += _zero(cycle, (_NO_TRANSCRIPT if failed else _NO_ANSWER)[lang], failed)
+            # An audio that could not be transcribed is the teacher's to judge.
+            if not failed:
+                verdicts += unanswered_verdicts(cycle, lang)
             continue
-        cycle_rows, cycle_usage, model = await _score_cycle(
-            config, system, provenance, cycle, examples_for(cycle, req.calibration_examples)
+        cycle_rows, cycle_verdicts, cycle_usage, model = await _score_cycle(
+            config, system, provenance, cycle, examples_for(cycle, req.calibration_examples), lang
         )
         rows += cycle_rows
+        verdicts += cycle_verdicts
         usage += cycle_usage
-    return rows, usage, {**provenance, "model_id": model or resolve_model(config)}
+    return rows, verdicts, usage, {**provenance, "model_id": model or resolve_model(config)}
 
 
 async def run(req: ScoreRequest) -> None:
     config = await jobs.llm_config(req.tenant_id, req.prompts)
     base = {"scoringVersion": req.scoring_version, "mode": req.mode, "replayId": req.replay_id or None}
     try:
-        rows, usage, provenance = await score_attempt(req, config)
+        rows, verdicts, usage, provenance = await score_attempt(req, config)
     except ScoringFailed as exc:
         logger.error("pablo_scoring_failed", attempt_id=req.attempt_id, error=str(exc))
         await backend_client.report_assessment_score(
@@ -255,6 +332,8 @@ async def run(req: ScoreRequest) -> None:
             **base,
             "status": "scored",
             "components": rows,
+            # A replay only checks points (a prompt draft); nothing else is kept.
+            **({"verdicts": verdicts} if req.mode == "publish" else {}),
             "provenance": provenance,
             "calibrationExamplesUsed": sum(
                 len(examples_for(c, req.calibration_examples)) for c in req.cycles
@@ -271,4 +350,4 @@ async def run(req: ScoreRequest) -> None:
     )
     if req.mode != "publish":
         return
-    await feedback.run(req, config, rows)
+    await feedback.run(req, config, rows, verdicts)

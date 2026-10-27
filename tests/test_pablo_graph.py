@@ -623,14 +623,16 @@ class TestFollowup:
         leaky = _plan(question="¿Y qué papel tienen las obras en todo esto?")
         _, reply, _ = await self._answer(graph, "f3", leaky)
         assert "obras" not in reply.split("una pregunta más:")[1]
-        assert "¿Puedes desarrollar un poco más tu respuesta a la Parte A, con un ejemplo?" in reply
-        assert backend["followup"].await_args.args[2]["provenance"]["fallback"] == "generic"
+        # Refused twice: a question on the student's own words instead.
+        assert "Dijiste «Dios perdona al que no lo merece, eso es gracia». ¿Por qué lo ves así?" in reply
+        provenance = backend["followup"].await_args.args[2]["provenance"]
+        assert provenance["fallback"] == "quoted" and provenance["refusal"] == "leak:obras"
 
     async def test_a_failed_call_still_asks_a_generic_one(self, backend):
         graph = build_pablo_graph(MemorySaver())
         await self._started(graph, "f4")
         _, reply, events = await self._answer(graph, "f4", FakeProvider(error=TimeoutError()))
-        assert "¿Puedes desarrollar un poco más tu respuesta" in reply
+        assert "¿Por qué lo ves así?" in reply
         assert events[0]["event"] == "followup_presented"
         assert backend["followup"].await_args.args[2]["mode"] == "deepen"
 

@@ -124,6 +124,20 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": "¿Puedes desarrollar un poco más tu respuesta a la {part}, con un ejemplo?",
         "en": "Can you develop your answer to {part} a little further, with an example?",
     },
+    # Built on the student's own words when the model's question was refused
+    # twice; picked by the cycle's position, never by the answer.
+    "followup_quoted_0": {
+        "es": "Dijiste «{quote}». ¿Por qué lo ves así?",
+        "en": "You said “{quote}”. Why do you see it that way?",
+    },
+    "followup_quoted_1": {
+        "es": "Mencionaste «{quote}». ¿Qué te lleva a pensarlo?",
+        "en": "You mentioned “{quote}”. What leads you to think so?",
+    },
+    "followup_quoted_2": {
+        "es": "Dijiste «{quote}». ¿Qué cambiaría si no fuera así?",
+        "en": "You said “{quote}”. What would change if it were not so?",
+    },
     "followup_generic_plain": {
         "es": "¿Puedes desarrollar un poco más tu respuesta, con un ejemplo?",
         "en": "Can you develop your answer a little further, with an example?",

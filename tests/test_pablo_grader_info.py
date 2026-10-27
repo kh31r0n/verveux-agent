@@ -319,7 +319,7 @@ class TestFollowup:
         leaky = GraphProvider(_plan(question="¿Y cómo entra la santificación en esto?"))
         _, reply, _ = await self._answer(graph, "fr2", leaky)
         assert "santificación" not in reply
-        assert "¿Puedes desarrollar un poco más tu respuesta" in reply
+        assert "Dijiste «Dios perdona siempre»" in reply
 
     def test_leak_guard_covers_the_reference(self):
         cycle = {
@@ -372,3 +372,59 @@ class TestHtmlEntities:
         assert "¿Qué es la gracia?" in provider.calls[0][1][1]["content"]
         message = jobs_backend["feedback"].await_args.args[1]["message"]
         assert "Tu visión es clara." in message and "Repasa la bíblica." in message and "&" not in message
+
+
+class TestFollowupRetry:
+    CYCLE = {
+        "cycle_index": 0,
+        "component_map": [{"component_id": "q1:c1", "part": "Parte A", "name": "c1", "question_snapshot_id": "q1"}],
+        "rubric_criteria": {"q1:c1": "Relaciona la gracia con la santificación"},
+        "composite_prompt": "¿Qué es la gracia?",
+    }
+    ANSWER = "La gracia es un regalo que Dios da sin que lo merezcamos. Por eso perdona."
+
+    async def _plan(self, *plans):
+        provider = GraphProvider()
+        results = list(plans)
+
+        async def generate(messages, model, schema, **_):
+            provider.messages.append(messages)
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        provider.generate_structured = generate
+        with patch(f"{FOLLOWUP}.get_provider", return_value=provider):
+            plan, usage = await followup.plan_for(CONFIG, self.CYCLE, self.ANSWER, "es", "Pablo")
+        return plan, usage, provider
+
+    async def test_a_refused_question_is_asked_again_with_the_reason(self):
+        leaky = _plan(question="¿Y la santificación?")
+        good = _plan(question="Dijiste que es un regalo: ¿qué cambia si alguien lo rechaza?")
+        plan, usage, provider = await self._plan(leaky, good)
+        assert plan["question"] == "Dijiste que es un regalo: ¿qué cambia si alguien lo rechaza?"
+        assert "fallback" not in plan["provenance"] and len(usage) == 2
+        retry = provider.messages[1][1]["content"]
+        assert "no sirvió" in retry and "santificacion" in retry
+        # The variety rule is in code, whatever the tenant's prompt says.
+        assert followup.MOVES_RULE in provider.messages[0][0]["content"]
+
+    async def test_twice_refused_falls_back_on_the_students_words(self):
+        plan, _, _ = await self._plan(_plan(question="x" * 500 + "?"), TimeoutError())
+        assert plan["question"] == "Dijiste «La gracia es un regalo que Dios da sin que lo merezcamos». ¿Por qué lo ves así?"
+        assert plan["provenance"]["fallback"] == "quoted"
+
+    def test_a_tail_after_the_question_is_dropped(self):
+        plan = _plan(target_component_id="q1:c1", question="¿Por qué dices que es un regalo? Piénsalo bien.")
+        assert followup.validated(plan, self.CYCLE, self.ANSWER)[0] == "¿Por qué dices que es un regalo?"
+        assert followup.validated(_plan(question="Explícalo mejor."), self.CYCLE, self.ANSWER)[3] == "no_question"
+
+    def test_generic_only_without_words_and_without_part_label_for_one_question(self):
+        assert followup.answer_fragment("Sí.") is None
+        assert followup.generic_question(self.CYCLE, "q1:c1", "es") == (
+            "¿Puedes desarrollar un poco más tu respuesta, con un ejemplo?"
+        )
+        assert followup.quoted_question("es un regalo", {**self.CYCLE, "cycle_index": 1}, "en") == (
+            "You mentioned “es un regalo”. What leads you to think so?"
+        )

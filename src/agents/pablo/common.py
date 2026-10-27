@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from typing import Literal
@@ -118,6 +119,14 @@ def copied_span(text: str, reference: str, n: int = 6) -> bool:
     grams = {tuple(ref[i : i + n]) for i in range(len(ref) - n + 1)}
     words = _tokens(text)
     return any(tuple(words[i : i + n]) in grams for i in range(len(words) - n + 1))
+
+
+def plain(value) -> str:
+    """Text without HTML entities. A Moodle question in plain-text format
+    keeps «&iquest;C&oacute;mo…» in its snapshot, and a model that reads
+    entities writes them back — so they are decoded on the way in and on
+    everything a student reads."""
+    return html.unescape(str(value or ""))
 
 
 def fence(tag: str, body: str) -> str:

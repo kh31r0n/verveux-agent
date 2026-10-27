@@ -7,9 +7,21 @@ onto the activity's grade range — the model never does the arithmetic.
 
 from __future__ import annotations
 
+import html
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _unescape(value):
+    """Strings (also inside lists) without HTML entities: a plain-text Moodle
+    question keeps «&iquest;», and what a model reads with entities it writes
+    back with them."""
+    if isinstance(value, str):
+        return html.unescape(value)
+    if isinstance(value, list):
+        return [html.unescape(v) if isinstance(v, str) else v for v in value]
+    return value
 
 
 # ── Cycle composition ────────────────────────────────────────────────────────
@@ -84,6 +96,8 @@ class OutcomeFeedback(BaseModel):
     learning_outcome_id: str
     comment: str
 
+    _plain = field_validator("comment")(_unescape)
+
 
 class QuestionFeedback(BaseModel):
     cycle_index: int
@@ -93,6 +107,8 @@ class QuestionFeedback(BaseModel):
     # in code.
     comment: str
 
+    _plain = field_validator("comment")(_unescape)
+
 
 class AttemptFeedbackResult(BaseModel):
     overall_summary: str
@@ -101,6 +117,10 @@ class AttemptFeedbackResult(BaseModel):
     per_question_feedback: list[QuestionFeedback] = Field(default_factory=list)
     per_outcome_feedback: list[OutcomeFeedback] = Field(default_factory=list)
     study_recommendations: list[str] = Field(default_factory=list)
+
+    _plain = field_validator("overall_summary", "strengths", "areas_for_improvement", "study_recommendations")(
+        _unescape
+    )
 
 
 # ── Class report and improvement proposals ───────────────────────────────────
@@ -162,6 +182,8 @@ class ScoreFollowup(BaseModel):
     # None = asked but never answered.
     response: ScoreResponse | None = None
 
+    _plain = field_validator("prompt")(_unescape)
+
 
 class ScoreQuestion(BaseModel):
     question_snapshot_id: str
@@ -169,6 +191,8 @@ class ScoreQuestion(BaseModel):
     # The teacher's expected answer (essay "Information for graders"); empty =
     # scored with the rubric alone. Never reaches the student.
     grader_info: str = ""
+
+    _plain = field_validator("text", "grader_info")(_unescape)
 
 
 class ScoreCycle(BaseModel):
@@ -182,6 +206,8 @@ class ScoreCycle(BaseModel):
     response: ScoreResponse | None = None
     # The follow-up question and its answer, scored together with the first.
     followup: ScoreFollowup | None = None
+
+    _plain = field_validator("composite_prompt", "learning_outcome_name")(_unescape)
 
 
 class CalibrationExample(BaseModel):

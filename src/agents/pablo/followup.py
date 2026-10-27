@@ -36,7 +36,7 @@ from ...providers.registry import get_provider, resolve_model
 from ...schemas.pablo import FollowupPlan
 from ...usage import make_usage_record
 from . import echo
-from .common import fence, json_contract, reference_rule, system_prompt
+from .common import fence, json_contract, plain, reference_rule, system_prompt
 from .prompts import FOLLOWUP_PROMPT
 from .texts import text
 
@@ -104,7 +104,7 @@ def validated(plan: FollowupPlan | None, cycle: dict, answer: str) -> tuple[str 
     if target not in ids:
         target = None
     mode = "gap" if target else "deepen"
-    question = " ".join(str(plan.question or "").split())
+    question = " ".join(plain(plan.question).split())
     if not question or len(question) > MAX_CHARS or not question.rstrip().endswith("?"):
         return None, target, mode
     rubric = " ".join(f"{c['name']} {c['criteria']}" for c in components_block(cycle))

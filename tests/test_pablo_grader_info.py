@@ -331,3 +331,44 @@ class TestFollowup:
         plan = _plan(target_component_id="q1:c1", question="¿Y la santificación?")
         assert followup.validated(plan, cycle, "Dios perdona")[0] is None
         assert followup.validated(plan, cycle, "Hablé de la santificación")[0] == "¿Y la santificación?"
+
+
+class TestHtmlEntities:
+    """A plain-text Moodle question keeps «&iquest;C&oacute;mo…»; the student
+    must never read entities, from the bank or from a model that copied them."""
+
+    def test_candidates_and_references_are_decoded(self):
+        cand = {**_candidate("q1"), "text": "&iquest;C&oacute;mo?", "grader_info": "Visi&oacute;n b&iacute;blica"}
+        [clean] = compose.usable_candidates([cand])
+        assert clean["text"] == "¿Cómo?" and clean["grader_info"] == "Visión bíblica"
+        assert compose.topic_name("La visi&oacute;n b&iacute;blica.") == "La visión bíblica"
+
+    def test_model_output_is_decoded(self):
+        parts = compose.validated_parts(
+            ComposedCycle(parts=[ComposedPart(question_snapshot_id="q1", prompt="&iquest;Qu&eacute; es?")]),
+            [_candidate("q1")], 1,
+        )
+        assert parts[0].prompt == "¿Qué es?"
+        assert "&" not in compose.render("Contr&aacute;stalo.", parts, 0, 3, "es")
+        cycle = {"component_map": [{"component_id": "q1:c1", "part": "Parte A", "name": "c",
+                                    "question_snapshot_id": "q1"}],
+                 "rubric_criteria": {}, "composite_prompt": "¿Cómo contrastarías a Marx?"}
+        plan = _plan(target_component_id="q1:c1",
+                     question="&iquest;C&oacute;mo contrastar&iacute;as a Marx con lo que dijiste?")
+        assert followup.validated(plan, cycle, "dije algo")[0] == "¿Cómo contrastarías a Marx con lo que dijiste?"
+
+    async def test_feedback_and_scoring_input_are_decoded(self, jobs_backend):  # noqa: F811
+        cycle = _cycle(0, {"text": "r"}, refs=("",))
+        cycle["questions"][0]["text"] = "&iquest;Qu&eacute; es la gracia?"
+        provider = FakeProvider({
+            "CycleScore": [CycleScore(components=[ComponentScore(component_id="q0a:c1", points=2)])],
+            "AttemptFeedbackResult": AttemptFeedbackResult(
+                overall_summary="Tu visi&oacute;n es clara.",
+                per_question_feedback=[QuestionFeedback(cycle_index=0, question_snapshot_id="q0a",
+                                                        comment="Repasa la b&iacute;blica.")],
+            ),
+        })
+        await _score_run(provider, _request([cycle]))
+        assert "¿Qué es la gracia?" in provider.calls[0][1][1]["content"]
+        message = jobs_backend["feedback"].await_args.args[1]["message"]
+        assert "Tu visión es clara." in message and "Repasa la bíblica." in message and "&" not in message

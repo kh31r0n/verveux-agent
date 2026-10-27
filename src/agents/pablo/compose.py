@@ -26,6 +26,7 @@ import json
 import re
 
 from ...schemas.pablo import ComposedCycle, ComposedPart
+from .common import plain
 from .texts import cardinal, ordinal, part_label, text
 
 MAX_PARTS = 3
@@ -33,9 +34,10 @@ MIN_PARTS = 2
 
 
 def usable_candidates(candidates: list) -> list[dict]:
-    """Candidates with an id, a text and a rubric with at least one component."""
+    """Candidates with an id, a text and a rubric with at least one component,
+    their text and reference without HTML entities."""
     return [
-        c
+        {**c, "text": plain(c["text"]), **({"grader_info": plain(c["grader_info"])} if c.get("grader_info") else {})}
         for c in candidates or []
         if isinstance(c, dict)
         and c.get("snapshot_id")
@@ -97,7 +99,7 @@ def validated_parts(
     for part in (result.parts if result else []):
         sid = part.question_snapshot_id.strip()
         if sid in by_id and sid not in seen and part.prompt.strip():
-            parts.append(ComposedPart(question_snapshot_id=sid, prompt=part.prompt.strip()))
+            parts.append(ComposedPart(question_snapshot_id=sid, prompt=plain(part.prompt).strip()))
             seen.add(sid)
         if len(parts) == limit:
             break
@@ -119,7 +121,7 @@ _TRAILING = re.compile(r"[\s.;:,…]+$")
 def topic_name(name: str) -> str:
     """An outcome's name as a topic: «Reconoce los mitos… bíblica..» loses its
     final punctuation (the templates end the sentence themselves)."""
-    return _TRAILING.sub("", " ".join(str(name or "").split()))
+    return _TRAILING.sub("", " ".join(plain(name).split()))
 
 
 def question_grader_info(parts: list[ComposedPart], candidates: list[dict]) -> dict[str, str]:
@@ -177,7 +179,7 @@ def render(
 ) -> str:
     lines = [header or text("question", lang, n=cycle_index + 1, total=total)]
     if intro.strip():
-        lines.append(intro.strip())
+        lines.append(plain(intro).strip())
     # One question needs no "Part A" label.
     if len(parts) == 1:
         lines.append(parts[0].prompt)

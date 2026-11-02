@@ -49,6 +49,7 @@ class CalebStudyState(TypedDict, total=False):
     top_k_profiles: list[dict[str, Any]]
     zone_country_analysis: list[dict[str, Any]]
     network_analysis: dict[str, Any]
+    procurement_summary: list[dict[str, Any]]
     trade_macro_summary: list[dict[str, Any]]
     source_citations: list[dict[str, Any]]
     quality_warnings: list[str]
@@ -240,6 +241,7 @@ async def collect_procurement_activity_node(
     proc_connector = connectors.get("procurement")
 
     candidates = list(state.get("candidate_entities") or [])
+    proc_summary = list(state.get("procurement_summary") or [])
     citations = list(state.get("source_citations") or [])
     warnings = list(state.get("quality_warnings") or [])
 
@@ -251,14 +253,17 @@ async def collect_procurement_activity_node(
         ] or ["CO"]
         for c_code in countries:
             res = await proc_connector.fetch({"country": c_code, "keyword": "suministros"})
-            if isinstance(res.data, dict) and isinstance(res.data.get("suppliers"), list):
-                candidates.extend(res.data["suppliers"])
+            if isinstance(res.data, dict):
+                proc_summary.append({"country": c_code, **res.data})
+                if isinstance(res.data.get("suppliers"), list):
+                    candidates.extend(res.data["suppliers"])
             citations.extend(c.to_dict() for c in res.citations)
             warnings.extend(res.warnings)
 
     return {
         "current_stage": "collect_procurement_activity",
         "candidate_entities": candidates,
+        "procurement_summary": proc_summary,
         "source_citations": citations,
         "quality_warnings": warnings,
         "completed_stages": _record_stage(state, "collect_procurement_activity"),
@@ -322,7 +327,16 @@ async def inspect_websites_and_brands_node(
             for kw in (pl.get("keywords") or [])
         ]
         enriched_candidates: list[dict[str, Any]] = []
-        for cand in candidates:
+        for idx, cand in enumerate(candidates):
+            # Privacy safeguard (§10): Natural persons are pseudonymized and NEVER sent to external inspection
+            if cand.get("isNaturalPerson"):
+                anon = dict(cand)
+                anon["entityId"] = f"persona-natural-anon-{idx + 1:04d}"
+                anon["name"] = f"Persona Natural Anonimizada #{idx + 1}"
+                anon["taxId"] = "reservado-ley-1581"
+                anon["aiRationale"] = "sin evidencia"
+                enriched_candidates.append(anon)
+                continue
             url = str(cand.get("website") or "")
             if url and url != "sin dato":
                 res = await inspector.fetch(
@@ -408,7 +422,10 @@ async def score_entities_node(
     scored: list[dict[str, Any]] = []
     for idx, item in enumerate(state.get("candidate_entities") or []):
         evaluated = evaluate_entity_rubric(item, entity_rubric, product_lines)
-        if evaluated.get("needsLlmRationale"):
+        if evaluated.get("isNaturalPerson"):
+            evaluated["qualitativeRationale"] = "sin evidencia"
+            evaluated["aiRationale"] = "sin evidencia"
+        elif evaluated.get("needsLlmRationale"):
             budget_check = tracker.reserve(f"score_entities:llm:{idx}", 0.02)
             if (
                 budget_check.allowed

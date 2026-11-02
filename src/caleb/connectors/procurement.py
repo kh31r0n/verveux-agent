@@ -36,7 +36,7 @@ PROCUREMENT_PORTAL_CATALOG: dict[str, dict[str, str]] = {
         "source_key": "PROCUREMENT_SV_COMPRASAL",
         "name": "Comprasal",
         "url": "https://www.comprasal.gob.sv/comprasalweb/api",
-        "access": "PUBLIC_PORTAL",
+        "access": "NO_OPEN_API",
     },
     "HN": {
         "source_key": "PROCUREMENT_HN_HONDUCOMPRAS",
@@ -52,9 +52,9 @@ PROCUREMENT_PORTAL_CATALOG: dict[str, dict[str, str]] = {
     },
     "CR": {
         "source_key": "PROCUREMENT_CR_SICOP",
-        "name": "SICOP Costa Rica",
+        "name": "SICOP Costa Rica (bloquea descarga automática)",
         "url": "https://www.sicop.go.cr/api",
-        "access": "PUBLIC_PORTAL",
+        "access": "NO_OPEN_API",
     },
     "PA": {
         "source_key": "PROCUREMENT_PA_PANAMACOMPRAS",

@@ -156,4 +156,4 @@ async def test_caleb_graph_compiles_and_executes_end_to_end():
     assert "sync_to_one_crm" in res_done["completed_stages"]
     assert len(res_done["scored_entities"]) == 1
     assert res_done["scored_entities"][0]["priorityBand"] == "A"
-    assert len(res_done["artifacts"]) == 3
+    assert len(res_done["artifacts"]) >= 3

@@ -17,6 +17,14 @@ from ..caleb.engines import (
     evaluate_entity_rubric,
     evaluate_zone_or_country,
 )
+from ..caleb.exporters import (
+    build_aurora_proposals,
+    build_caleb_report_model_v1,
+    build_crm_export_payload,
+    build_excel_workbook_base64,
+    export_entities_csv,
+    render_markdown_report,
+)
 from ..caleb.schema import CALEB_TIER_LIMITS, validate_study_config_v1
 
 
@@ -44,6 +52,9 @@ class CalebStudyState(TypedDict, total=False):
     trade_macro_summary: list[dict[str, Any]]
     source_citations: list[dict[str, Any]]
     quality_warnings: list[str]
+    report_model: dict[str, Any]
+    aurora_proposals: dict[str, Any]
+    crm_export_payload: dict[str, Any]
     artifacts: list[dict[str, Any]]
     crm_sync_summary: dict[str, Any]
     failure_reason: str | None
@@ -543,32 +554,50 @@ async def generate_reports_and_exports_node(state: CalebStudyState) -> dict[str,
         return {}
     cfg = state["config"]
     deliv = cfg.get("deliverables") or {}
-    artifacts: list[dict[str, Any]] = []
+    report_model = build_caleb_report_model_v1(state)
+    aurora_proposals = build_aurora_proposals(state)
+
+    artifacts: list[dict[str, Any]] = [
+        {
+            "kind": "JSON_REPORT_MODEL",
+            "filename": "informe_modelo_v1.json",
+            "schemaVersion": report_model["reportSchemaVersion"],
+            "content": report_model,
+        }
+    ]
     if deliv.get("generateMarkdownReport", True):
+        md_content = render_markdown_report(report_model)
         artifacts.append(
             {
                 "kind": "MARKDOWN_REPORT",
                 "filename": "informe_ejecutivo_caleb.md",
                 "title": cfg.get("studyTitle", "Estudio de Mercado B2B"),
+                "content": md_content,
             }
         )
     if deliv.get("generateCsvExports", True):
+        csv_content = export_entities_csv(report_model)
         artifacts.append(
             {
                 "kind": "CSV_ENTITIES",
                 "filename": "entidades_calificadas.csv",
                 "rowCount": len(state.get("scored_entities") or []),
+                "content": csv_content,
             }
         )
     if deliv.get("generateExcelWorkbook", True):
+        xlsx_b64 = build_excel_workbook_base64(report_model, state)
         artifacts.append(
             {
                 "kind": "EXCEL_WORKBOOK",
                 "filename": "estudio_mercado_caleb.xlsx",
+                "contentBase64": xlsx_b64,
             }
         )
     return {
         "current_stage": "generate_reports_and_exports",
+        "report_model": report_model,
+        "aurora_proposals": aurora_proposals,
         "artifacts": artifacts,
         "completed_stages": _record_stage(state, "generate_reports_and_exports"),
     }
@@ -582,14 +611,20 @@ def route_after_reports(state: CalebStudyState) -> str:
     return "finalize_study_run"
 
 
-async def sync_to_one_crm_node(state: CalebStudyState) -> dict[str, Any]:
-    scored = state.get("scored_entities") or []
-    band_a = [e for e in scored if e.get("priorityBand") == "A"]
+async def sync_to_one_crm_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
+    configurable = (config or {}).get("configurable") or {}
+    existing_crm_keys = set(configurable.get("existing_crm_keys") or [])
+    crm_payload = build_crm_export_payload(state, existing_crm_keys=existing_crm_keys)
     return {
         "current_stage": "sync_to_one_crm",
+        "crm_export_payload": crm_payload,
         "crm_sync_summary": {
-            "syncedCompanies": len(band_a),
-            "syncedContacts": len(band_a),
+            "syncedCompanies": crm_payload["exportedCount"],
+            "syncedContacts": crm_payload["exportedCount"],
+            "skippedDuplicates": crm_payload["skippedDuplicatesCount"],
+            "skippedUnverified": crm_payload["skippedUnverifiedCount"],
         },
         "completed_stages": _record_stage(state, "sync_to_one_crm"),
     }

@@ -41,6 +41,8 @@ class CalebStudyState(TypedDict, total=False):
     top_k_profiles: list[dict[str, Any]]
     zone_country_analysis: list[dict[str, Any]]
     network_analysis: dict[str, Any]
+    trade_macro_summary: list[dict[str, Any]]
+    source_citations: list[dict[str, Any]]
     quality_warnings: list[str]
     artifacts: list[dict[str, Any]]
     crm_sync_summary: dict[str, Any]
@@ -117,36 +119,66 @@ async def ingest_internal_baseline_node(state: CalebStudyState) -> dict[str, Any
     }
 
 
-async def discover_candidates_node(state: CalebStudyState) -> dict[str, Any]:
+async def discover_candidates_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
+    configurable = (config or {}).get("configurable") or {}
+    connectors = configurable.get("connectors") or {}
+    web_connector = connectors.get("web_search")
+
     tracker = CalebBudgetTracker(
         internal_cost_cap_usd=float(state.get("internal_cost_cap_usd") or 11.7),
         reserved_spend_usd=float(state.get("reserved_spend_usd") or 0.0),
         settled_spend_usd=float(state.get("settled_spend_usd") or 0.0),
         degradations=list(state.get("degradations") or []),
     )
-    eval_res = tracker.reserve("discover_candidates:serper", 0.50)
     candidates = list(state.get("candidate_entities") or [])
-    if eval_res.allowed and not candidates:
-        candidates = [
+    citations = list(state.get("source_citations") or [])
+    warnings = list(state.get("quality_warnings") or [])
+
+    if web_connector is not None:
+        cfg = state["config"]
+        zones = (cfg.get("geography") or {}).get("localZones") or []
+        first_zone = zones[0] if zones else {"code": "GEN", "country": "CO", "cities": ["Bogotá"]}
+        first_line = (cfg["businessProfile"].get("productLines") or [{"name": "B2B"}])[0]
+        res = await web_connector.fetch(
             {
-                "entityId": "cand-1",
-                "name": "Suministros Industriales Andinos S.A.S.",
-                "country": "CO",
-                "city": "Bogotá",
-                "zoneCode": "BOG_ZONA_INDUSTRIAL",
-                "website": "https://suministrosandinos.example.com",
-                "phone": "+57 601 5550101",
-                "source": "SERPER_GOOGLE",
-                "signals": ["importador directo", "catálogo industrial"],
+                "query": f"{first_line['name']} {(first_zone.get('cities') or [''])[0]}".strip(),
+                "country": first_zone.get("country", "CO"),
+                "city": (first_zone.get("cities") or ["sin dato"])[0],
+                "zoneCode": first_zone.get("code", "sin dato"),
+                "mode": "search",
             }
-        ]
-        tracker.settle("discover_candidates:serper", 0.35)
+        )
+        if isinstance(res.data, list):
+            candidates.extend(res.data)
+        citations.extend(c.to_dict() for c in res.citations)
+        warnings.extend(res.warnings)
+    else:
+        eval_res = tracker.reserve("discover_candidates:serper", 0.50)
+        if eval_res.allowed and not candidates:
+            candidates = [
+                {
+                    "entityId": "cand-1",
+                    "name": "Suministros Industriales Andinos S.A.S.",
+                    "country": "CO",
+                    "city": "Bogotá",
+                    "zoneCode": "BOG_ZONA_INDUSTRIAL",
+                    "website": "https://suministrosandinos.example.com",
+                    "phone": "+57 601 5550101",
+                    "source": "SERPER_GOOGLE",
+                    "signals": ["importador directo", "catálogo industrial"],
+                }
+            ]
+            tracker.settle("discover_candidates:serper", 0.35)
 
     return {
         "current_stage": "discover_candidates",
         "candidate_entities": candidates,
+        "source_citations": citations,
+        "quality_warnings": warnings,
         "reserved_spend_usd": tracker.reserved_spend_usd,
         "settled_spend_usd": tracker.settled_spend_usd,
         "degradations": tracker.degradations,
@@ -154,38 +186,169 @@ async def discover_candidates_node(state: CalebStudyState) -> dict[str, Any]:
     }
 
 
-async def collect_public_registries_node(state: CalebStudyState) -> dict[str, Any]:
+async def collect_public_registries_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
+    configurable = (config or {}).get("configurable") or {}
+    connectors = configurable.get("connectors") or {}
+    reg_connector = connectors.get("registries")
+
+    candidates = list(state.get("candidate_entities") or [])
+    citations = list(state.get("source_citations") or [])
+    warnings = list(state.get("quality_warnings") or [])
+
+    if reg_connector is not None:
+        cfg = state["config"]
+        zones = (cfg.get("geography") or {}).get("localZones") or []
+        country = zones[0].get("country", "CO") if zones else "CO"
+        city = (zones[0].get("cities") or ["Bogotá"])[0] if zones else "Bogotá"
+        res = await reg_connector.fetch({"country": country, "city": city, "keyword": "industrial"})
+        if isinstance(res.data, list):
+            candidates.extend(res.data)
+        citations.extend(c.to_dict() for c in res.citations)
+        warnings.extend(res.warnings)
+
     return {
         "current_stage": "collect_public_registries",
+        "candidate_entities": candidates,
+        "source_citations": citations,
+        "quality_warnings": warnings,
         "completed_stages": _record_stage(state, "collect_public_registries"),
     }
 
 
-async def collect_procurement_activity_node(state: CalebStudyState) -> dict[str, Any]:
+async def collect_procurement_activity_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
+    configurable = (config or {}).get("configurable") or {}
+    connectors = configurable.get("connectors") or {}
+    proc_connector = connectors.get("procurement")
+
+    candidates = list(state.get("candidate_entities") or [])
+    citations = list(state.get("source_citations") or [])
+    warnings = list(state.get("quality_warnings") or [])
+
+    if proc_connector is not None:
+        cfg = state["config"]
+        countries = [
+            tc["countryCode"]
+            for tc in ((cfg.get("geography") or {}).get("targetCountries") or [])
+        ] or ["CO"]
+        for c_code in countries:
+            res = await proc_connector.fetch({"country": c_code, "keyword": "suministros"})
+            if isinstance(res.data, dict) and isinstance(res.data.get("suppliers"), list):
+                candidates.extend(res.data["suppliers"])
+            citations.extend(c.to_dict() for c in res.citations)
+            warnings.extend(res.warnings)
+
     return {
         "current_stage": "collect_procurement_activity",
+        "candidate_entities": candidates,
+        "source_citations": citations,
+        "quality_warnings": warnings,
         "completed_stages": _record_stage(state, "collect_procurement_activity"),
     }
 
 
-async def collect_trade_flows_node(state: CalebStudyState) -> dict[str, Any]:
+async def collect_trade_flows_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
+    configurable = (config or {}).get("configurable") or {}
+    connectors = configurable.get("connectors") or {}
+    trade_connector = connectors.get("trade_macro")
+
+    trade_summary = list(state.get("trade_macro_summary") or [])
+    citations = list(state.get("source_citations") or [])
+    warnings = list(state.get("quality_warnings") or [])
+
+    if trade_connector is not None:
+        cfg = state["config"]
+        countries = [
+            tc["countryCode"]
+            for tc in ((cfg.get("geography") or {}).get("targetCountries") or [])
+        ]
+        for c_code in countries:
+            res = await trade_connector.fetch({"country": c_code, "kind": "comtrade"})
+            if isinstance(res.data, dict):
+                trade_summary.append(res.data)
+            citations.extend(c.to_dict() for c in res.citations)
+            warnings.extend(res.warnings)
+
     return {
         "current_stage": "collect_trade_flows",
+        "trade_macro_summary": trade_summary,
+        "source_citations": citations,
+        "quality_warnings": warnings,
         "completed_stages": _record_stage(state, "collect_trade_flows"),
     }
 
 
-async def inspect_websites_and_brands_node(state: CalebStudyState) -> dict[str, Any]:
+async def inspect_websites_and_brands_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
+    configurable = (config or {}).get("configurable") or {}
+    connectors = configurable.get("connectors") or {}
+    inspector = connectors.get("website_inspector")
+
+    candidates = list(state.get("candidate_entities") or [])
+    citations = list(state.get("source_citations") or [])
+    warnings = list(state.get("quality_warnings") or [])
+
+    if inspector is not None:
+        cfg = state["config"]
+        ref_brands = cfg["businessProfile"].get("referenceBrands") or []
+        prod_kws = [
+            kw
+            for pl in (cfg["businessProfile"].get("productLines") or [])
+            for kw in (pl.get("keywords") or [])
+        ]
+        enriched_candidates: list[dict[str, Any]] = []
+        for cand in candidates:
+            url = str(cand.get("website") or "")
+            if url and url != "sin dato":
+                res = await inspector.fetch(
+                    {
+                        "url": url,
+                        "referenceBrands": ref_brands,
+                        "productKeywords": prod_kws,
+                    }
+                )
+                citations.extend(c.to_dict() for c in res.citations)
+                warnings.extend(res.warnings)
+                if res.status == "OK" and isinstance(res.data, dict):
+                    updated = dict(cand)
+                    if updated.get("email") in (None, "", "sin dato") and res.data.get("email") != "sin dato":
+                        updated["email"] = res.data["email"]
+                    if updated.get("phone") in (None, "", "sin dato") and res.data.get("phone") != "sin dato":
+                        updated["phone"] = res.data["phone"]
+                    existing_brands = list(updated.get("brands") or [])
+                    for b in res.data.get("brandsFound") or []:
+                        if b not in existing_brands:
+                            existing_brands.append(b)
+                    updated["brands"] = existing_brands
+                    existing_sigs = list(updated.get("signals") or [])
+                    for s in res.data.get("signalsFound") or []:
+                        if s not in existing_sigs:
+                            existing_sigs.append(s)
+                    updated["signals"] = existing_sigs
+                    enriched_candidates.append(updated)
+                    continue
+            enriched_candidates.append(cand)
+        candidates = enriched_candidates
+
     return {
         "current_stage": "inspect_websites_and_brands",
+        "candidate_entities": candidates,
+        "source_citations": citations,
+        "quality_warnings": warnings,
         "completed_stages": _record_stage(state, "inspect_websites_and_brands"),
     }
 

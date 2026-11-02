@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from ..caleb.budget import CalebBudgetTracker
+from ..caleb.engines import (
+    analyze_customer_portfolio,
+    analyze_network_and_coverage,
+    classify_competitor_and_scale,
+    classify_entity_segment,
+    deduplicate_entities,
+    evaluate_entity_rubric,
+    evaluate_zone_or_country,
+)
 from ..caleb.schema import CALEB_TIER_LIMITS, validate_study_config_v1
 
 
@@ -24,11 +34,13 @@ class CalebStudyState(TypedDict, total=False):
     awaiting_review_stage: str | None
     checkpoint_approved: bool
     planned_quotas: dict[str, Any]
+    raw_customers: list[dict[str, Any]]
     internal_baseline: dict[str, Any]
     candidate_entities: list[dict[str, Any]]
     scored_entities: list[dict[str, Any]]
     top_k_profiles: list[dict[str, Any]]
     zone_country_analysis: list[dict[str, Any]]
+    network_analysis: dict[str, Any]
     quality_warnings: list[str]
     artifacts: list[dict[str, Any]]
     crm_sync_summary: dict[str, Any]
@@ -84,13 +96,20 @@ async def ingest_internal_baseline_node(state: CalebStudyState) -> dict[str, Any
         return {}
     cfg = state["config"]
     modules = cfg.get("modules") or []
-    baseline = state.get("internal_baseline") or {
-        "enabled": "CURRENT_CUSTOMERS" in modules,
-        "customersAnalyzed": 0,
-        "tierACount": 0,
-        "tierBCount": 0,
-        "tierCCount": 0,
-    }
+    if "CURRENT_CUSTOMERS" in modules and cfg.get("customerBaseConfig"):
+        raw_customers = list(state.get("raw_customers") or [])
+        baseline = analyze_customer_portfolio(
+            raw_customers,
+            cfg["customerBaseConfig"],
+        )
+    else:
+        baseline = state.get("internal_baseline") or {
+            "enabled": False,
+            "customersAnalyzed": 0,
+            "tierACount": 0,
+            "tierBCount": 0,
+            "tierCCount": 0,
+        }
     return {
         "current_stage": "ingest_internal_Baseline",
         "internal_baseline": baseline,
@@ -174,41 +193,69 @@ async def inspect_websites_and_brands_node(state: CalebStudyState) -> dict[str, 
 async def classify_and_deduplicate_node(state: CalebStudyState) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
-    default_seg = state["config"]["taxonomy"]["defaultSegmentCode"]
-    seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for item in state.get("candidate_entities") or []:
-        key = (item.get("name") or "").strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        enriched = dict(item)
-        enriched.setdefault("segmentCode", default_seg)
-        deduped.append(enriched)
+    cfg = state["config"]
+    taxonomy = cfg["taxonomy"]
+    bp = cfg["businessProfile"]
+    disqualifiers = bp.get("disqualifiers") or []
+    ref_brands = bp.get("referenceBrands") or []
+
+    deduped = deduplicate_entities(list(state.get("candidate_entities") or []))
+    classified: list[dict[str, Any]] = []
+    for item in deduped:
+        seg_item = classify_entity_segment(item, taxonomy, disqualifiers)
+        comp_item = classify_competitor_and_scale(seg_item, ref_brands)
+        classified.append(comp_item)
+
     return {
         "current_stage": "classify_and_deduplicate",
-        "candidate_entities": deduped,
+        "candidate_entities": classified,
         "completed_stages": _record_stage(state, "classify_and_deduplicate"),
     }
 
 
-async def score_entities_node(state: CalebStudyState) -> dict[str, Any]:
+async def score_entities_node(
+    state: CalebStudyState, config: RunnableConfig
+) -> dict[str, Any]:
     if state.get("status") == "FAILED":
         return {}
+    cfg = state["config"]
+    entity_rubric = cfg["rubrics"]["entityRubric"]
+    product_lines = cfg["businessProfile"].get("productLines") or []
+    configurable = (config or {}).get("configurable") or {}
+    rationale_fn = configurable.get("llm_rationale_fn")
+
+    tracker = CalebBudgetTracker(
+        internal_cost_cap_usd=float(state.get("internal_cost_cap_usd") or 11.7),
+        reserved_spend_usd=float(state.get("reserved_spend_usd") or 0.0),
+        settled_spend_usd=float(state.get("settled_spend_usd") or 0.0),
+        degradations=list(state.get("degradations") or []),
+    )
+
     scored: list[dict[str, Any]] = []
-    for item in state.get("candidate_entities") or []:
-        has_web = bool(item.get("website") and item.get("website") != "sin dato")
-        has_phone = bool(item.get("phone") and item.get("phone") != "sin dato")
-        score = 78.0 if (has_web and has_phone) else 52.0
-        band = "A" if score >= 70 else ("B" if score >= 45 else "C")
-        entry = dict(item)
-        entry["score"] = score
-        entry["priorityBand"] = band
-        scored.append(entry)
+    for idx, item in enumerate(state.get("candidate_entities") or []):
+        evaluated = evaluate_entity_rubric(item, entity_rubric, product_lines)
+        if evaluated.get("needsLlmRationale"):
+            budget_check = tracker.reserve(f"score_entities:llm:{idx}", 0.02)
+            if (
+                budget_check.allowed
+                and budget_check.level in ("NORMAL", "REDUCE_TOP_K_AND_QUERIES")
+                and callable(rationale_fn)
+            ):
+                evaluated["qualitativeRationale"] = rationale_fn(evaluated)
+                tracker.settle(f"score_entities:llm:{idx}", 0.015)
+            else:
+                evaluated["qualitativeRationale"] = (
+                    "Scoring determinístico aplicado por política de presupuesto."
+                )
+        scored.append(evaluated)
+
     scored.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
     return {
         "current_stage": "score_entities",
         "scored_entities": scored,
+        "reserved_spend_usd": tracker.reserved_spend_usd,
+        "settled_spend_usd": tracker.settled_spend_usd,
+        "degradations": tracker.degradations,
         "completed_stages": _record_stage(state, "score_entities"),
     }
 
@@ -218,15 +265,26 @@ async def deep_research_top_k_node(state: CalebStudyState) -> dict[str, Any]:
         return {}
     quotas = state.get("planned_quotas") or {"maxTopKDeepResearch": 5}
     top_k = int(quotas.get("maxTopKDeepResearch", 5))
-    scored = list(state.get("scored_entities") or [])
+    degradations = state.get("degradations") or []
+    if any(d.get("level") == "REDUCE_TOP_K_AND_QUERIES" for d in degradations):
+        top_k = max(1, top_k // 2)
+
+    scored = [
+        e for e in (state.get("scored_entities") or []) if not e.get("disqualified")
+    ]
     profiles = [
         {
             "entityId": e.get("entityId"),
             "name": e.get("name"),
             "priorityBand": e.get("priorityBand"),
             "score": e.get("score"),
+            "competitiveLevel": e.get("competitiveLevel", "NO_CLASIFICADO"),
+            "estimatedAnnualRevenueRangeUsd": e.get(
+                "estimatedAnnualRevenueRangeUsd", "sin dato"
+            ),
             "commercialSummary": "Cuenta B2B verificada con presencia activa en línea.",
-            "verifiedSource": e.get("source", "sin dato"),
+            "verifiedSource": e.get("source")
+            or ((e.get("sources") or ["sin dato"])[0]),
         }
         for e in scored[:top_k]
     ]
@@ -243,30 +301,38 @@ async def analyze_network_and_zones_node(state: CalebStudyState) -> dict[str, An
     cfg = state["config"]
     zones = (cfg.get("geography") or {}).get("localZones") or []
     countries = (cfg.get("geography") or {}).get("targetCountries") or []
-    analysis: list[dict[str, Any]] = []
-    for z in zones:
-        analysis.append(
-            {
-                "code": z["code"],
-                "name": z["name"],
-                "kind": "ZONE",
-                "score": 76.0,
-                "decision": "GO",
-            }
-        )
+    segments = (cfg.get("taxonomy") or {}).get("segments") or []
+    zone_rubric = (cfg.get("rubrics") or {}).get("zoneOrCountryRubric")
+
+    network_res = analyze_network_and_coverage(
+        list(state.get("scored_entities") or []),
+        zones,
+        segments,
+        zone_rubric,
+    )
+
+    analysis: list[dict[str, Any]] = list(network_res["zones"])
     for c in countries:
-        analysis.append(
-            {
-                "code": c["countryCode"],
-                "name": c["countryName"],
-                "kind": "COUNTRY",
-                "score": 68.0,
-                "decision": "EXPLORAR",
-            }
-        )
+        c_target = {
+            "code": c["countryCode"],
+            "name": c["countryName"],
+            "kind": "COUNTRY",
+            "dimensionScores": c.get("dimensionScores")
+            or {
+                "demand_density": 72.0,
+                "competitive_whitespace": 65.0,
+                "logistics_accessibility": 68.0,
+            },
+        }
+        if zone_rubric and zone_rubric.get("dimensions"):
+            analysis.append(evaluate_zone_or_country(c_target, zone_rubric))
+        else:
+            analysis.append({**c_target, "score": 68.0, "decision": "EXPLORAR"})
+
     return {
         "current_stage": "analyze_network_and_zones",
         "zone_country_analysis": analysis,
+        "network_analysis": network_res,
         "completed_stages": _record_stage(state, "analyze_network_and_zones"),
     }
 
@@ -276,7 +342,7 @@ async def quality_gate_node(state: CalebStudyState) -> dict[str, Any]:
         return {}
     warnings: list[str] = list(state.get("quality_warnings") or [])
     for item in state.get("scored_entities") or []:
-        if not item.get("source"):
+        if not item.get("source") and not item.get("sources"):
             warnings.append(f"Entidad sin fuente verificable: {item.get('name')}")
     return {
         "current_stage": "quality_gate",

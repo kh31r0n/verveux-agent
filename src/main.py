@@ -1595,3 +1595,71 @@ async def chat_resume(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class CalebRunRequest(BaseModel):
+    tenant_id: str = Field(..., min_length=1, max_length=128)
+    study_run_id: str = Field(..., min_length=1, max_length=128)
+    config: dict
+    internal_cost_cap_usd: float = Field(default=11.7, gt=0)
+    agent_code_name: str | None = Field(default="caleb", max_length=64)
+    prompts: dict[str, PromptEntry] | None = None
+
+
+_caleb_tasks: set[asyncio.Task] = set()
+
+
+async def _run_caleb(
+    graph: Any, inputs: dict, config: dict, study_run_id: str
+) -> None:
+    try:
+        await graph.ainvoke(inputs, config=config)
+    except Exception as exc:
+        logger.error(
+            "caleb_run_failed",
+            study_run_id=study_run_id,
+            error=str(exc),
+            exc_info=True,
+        )
+
+
+@app.post("/caleb/run", status_code=202)
+async def caleb_run(
+    req: CalebRunRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    from .caleb.schema import validate_study_config_v1
+
+    valid, _model, errors = validate_study_config_v1(req.config)
+    if not valid:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Invalid StudyConfig v1", "errors": errors},
+        )
+
+    code_name = (req.agent_code_name or "caleb").strip().lower()
+    try:
+        graph = await get_or_compile_graph(code_name)
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    thread_id = f"caleb:{req.tenant_id}:{req.study_run_id}"
+    config = {"configurable": {"thread_id": thread_id}}
+    inputs = {
+        "tenant_id": req.tenant_id,
+        "study_run_id": req.study_run_id,
+        "config": req.config,
+        "internal_cost_cap_usd": req.internal_cost_cap_usd,
+    }
+
+    task = asyncio.create_task(_run_caleb(graph, inputs, config, req.study_run_id))
+    _caleb_tasks.add(task)
+    task.add_done_callback(_caleb_tasks.discard)
+    logger.info(
+        "caleb_run_accepted",
+        study_run_id=req.study_run_id,
+        tenant_id=req.tenant_id,
+        code_name=code_name,
+    )
+    return {"accepted": True, "study_run_id": req.study_run_id}
+

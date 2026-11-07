@@ -98,8 +98,17 @@ def format_user_context(state) -> str:
         lines.append(f"- Escribe desde: {ctx['lms_platform']} (usuario autenticado)")
     if ctx.get("lms_current_course"):
         lines.append(f"- Curso que está viendo ahora: {ctx['lms_current_course']}")
+    if ctx.get("lms_current_activity"):
+        activity = f"- Actividad que tiene abierta en la página: «{ctx['lms_current_activity']}»"
+        if ctx.get("lms_current_activity_type"):
+            activity += f" ({ctx['lms_current_activity_type']})"
+        if ctx.get("lms_current_activity_dates"):
+            activity += f"; {ctx['lms_current_activity_dates']}"
+        lines.append(activity)
     if ctx.get("lms_courses"):
         lines.append(f"- Cursos matriculados (rol): {ctx['lms_courses']}")
+    if str(ctx.get("lms_is_teacher") or "").lower() == "true":
+        lines.append("- Es docente en el aula virtual")
 
     if not lines:
         return ""

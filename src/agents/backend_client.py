@@ -401,6 +401,30 @@ async def get_teacher_email(conversation_id: str, *, teacher_id: str, course_id:
     )
 
 
+async def get_moodle_activity_status(conversation_id: str, *, course_id: int, cmid: int) -> dict:
+    """GET /internal/conversations/:id/moodle/activity-status — the student's
+    own state in one activity (plugin 0.6.0+): quiz attempts and whether marks
+    show yet, the submission and its word limit, forum posting, the grade's
+    visibility. ``{status: OK, data}`` or ``{status: FAILED, code}``.
+    """
+    result = await _get(
+        f"/api/v1/internal/conversations/{conversation_id}/moodle/activity-status",
+        params={"courseId": course_id, "cmid": cmid},
+    )
+    return result if isinstance(result, dict) else {}
+
+
+async def get_moodle_course_outline(conversation_id: str, *, course_id: int) -> dict:
+    """GET /internal/conversations/:id/moodle/course-outline — the course's
+    sections and activities as the student sees them (plugin 0.6.0+), the
+    highlighted one marked ``current``."""
+    result = await _get(
+        f"/api/v1/internal/conversations/{conversation_id}/moodle/course-outline",
+        params={"courseId": course_id},
+    )
+    return result if isinstance(result, dict) else {}
+
+
 # ─── Prospecting (aurora — /internal/prospecting/*) ─────────────────────────
 
 

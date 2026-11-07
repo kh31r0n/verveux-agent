@@ -313,7 +313,7 @@ class TestEvaluationItems:
 
     async def test_inside_a_quiz_attempt_every_theology_question_is_guided(self, boundary):
         graph = build_ismael_graph(MemorySaver())
-        ctx = {"name": "J", "ismael_survey_done": True, "lms_page_type": "mod-quiz-attempt"}
+        ctx = {"name": "J", "ismael_survey_done": True, "lms_activity_in_progress": "true"}
         await _turn(graph, "ev4", "que es la gracia", user_context=ctx)
         assert boundary["spawn"].await_args.args[0].guide is True
 

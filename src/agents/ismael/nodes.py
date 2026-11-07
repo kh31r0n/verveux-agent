@@ -188,10 +188,12 @@ def looks_like_assessment_item(value: str) -> bool:
 
 
 def _in_quiz_attempt(state: AgentState) -> bool:
-    """The bubble is open on a quiz attempt page (plugin ≥ 0.6.0)."""
+    """The chat is open on an activity the student is in the middle of — an
+    unfinished quiz attempt, an open assignment not yet submitted (plugin
+    0.6.0+, signed by Moodle)."""
     ctx = state.get("user_context") or {}
-    page = str(ctx.get("lms_page_type") or "") if isinstance(ctx, dict) else ""
-    return page.startswith("mod-quiz-attempt")
+    flag = ctx.get("lms_activity_in_progress") if isinstance(ctx, dict) else None
+    return str(flag or "").lower() == "true"
 
 
 def _expire_survey(ismael: dict) -> bool:

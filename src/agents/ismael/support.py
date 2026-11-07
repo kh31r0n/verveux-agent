@@ -67,7 +67,7 @@ from ...schemas.ismael import (
 )
 from ...usage import make_usage_record
 from ..utils import format_user_context, latest_user_text, resolve_persona, resolve_prompt
-from . import research, teacher
+from . import moodle_context, research, teacher
 from .common import (
     DEFAULT_PERSONA,
     bounded_structured,
@@ -328,8 +328,13 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     handed_over = ismael.pop("support_question", None)
     question = handed_over or ismael.get("question") or latest_user_text(state)
 
-    started = time.monotonic()
     case = {} if handed_over else open_case(ismael)
+    user_text = handed_over or latest_user_text(state) or question
+    # The student's own classroom, read from Moodle (plugin 0.6.0+); "" otherwise.
+    classroom = await moodle_context.classroom_block(
+        state, [user_text, str(case.get("question") or ""), question]
+    )
+    started = time.monotonic()
     if case.get("awaiting"):
         # This message answers what ismael asked (or reports on the steps) last turn.
         case["clarified"] = int(case.get("clarified") or 0) + 1
@@ -344,8 +349,8 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
         + format_user_context(state)
         + support_data_block(ctx)
         + case_block(case)
+        + classroom
     )
-    user_text = handed_over or latest_user_text(state) or question
     system += activity_message_block(user_text)
     messages = [
         {"role": "system", "content": system},

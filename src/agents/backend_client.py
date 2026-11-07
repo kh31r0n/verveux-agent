@@ -240,22 +240,164 @@ async def save_ismael_survey(contact_id: str, conversation_id: str, answers: dic
     )
 
 
+async def save_ismael_rating(
+    conversation_id: str, rating: str, *, reason: str = "", message_id: str = ""
+) -> dict:
+    """POST /internal/conversations/:id/ismael-rating — the student's 👍/👎.
+
+    Stored as ``message_feedback`` on the conversation's latest outbound
+    message (the closing question that asked for it), or on ``message_id``
+    when given — how a 👎's reason, asked one turn later, reaches the same row.
+    Returns ``{"messageId": ...}``.
+    """
+    body: dict = {"rating": rating}
+    if reason:
+        body["reason"] = reason
+    if message_id:
+        body["messageId"] = message_id
+    return await _post(f"/api/v1/internal/conversations/{conversation_id}/ismael-rating", json=body)
+
+
 async def post_agent_message(
     conversation_id: str,
     *,
     job_id: str,
     text: str,
     turn_usage: list | None = None,
+    references: dict | None = None,
 ) -> dict:
     """POST /internal/conversations/:id/agent-messages — an out-of-band reply.
 
     For answers that outlive a chat turn (ismael's Brain job). The backend
     stores the message, dispatches it on the conversation's channel and bills
-    ``turn_usage``; ``job_id`` makes the whole call idempotent.
+    ``turn_usage``; ``job_id`` makes the whole call idempotent. ``references``
+    (the sources ``text`` ends with, as data) is only sent when there are any:
+    the endpoint rejects unknown fields, so a backend without it still works
+    for every answer that cites nothing.
     """
+    body: dict = {"jobId": job_id, "text": text, "turnUsage": turn_usage or []}
+    if references:
+        body["references"] = references
     return await _post(
         f"/api/v1/internal/conversations/{conversation_id}/agent-messages",
-        json={"jobId": job_id, "text": text, "turnUsage": turn_usage or []},
+        json=body,
+    )
+
+
+# ─── Assessment agent (pablo) ────────────────────────────────────────────────
+# The backend owns the attempt: eligibility, the clock, the grade mapping and
+# persistence. These calls only report what pablo composed or evaluated.
+
+
+async def get_assessment_next_cycle(attempt_id: str) -> dict:
+    """POST /internal/assessment/attempts/:id/next-cycle — the authorised
+    candidates for the next learning outcome:
+    ``{cycle_index, total_cycles, is_last, learning_outcome: {id, name},
+    candidates: [...]}`` (see ``agents/pablo/compose.py``)."""
+    return await _post(f"/api/v1/internal/assessment/attempts/{attempt_id}/next-cycle")
+
+
+async def report_assessment_cycle(attempt_id: str, cycle_index: int, cycle: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n — the composed cycle,
+    stored before the student sees it. Idempotent on (attempt, cycle)."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}", json=cycle
+    )
+
+
+async def report_assessment_response(attempt_id: str, cycle_index: int, response: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n/response — the text
+    and/or transcript that will be evaluated."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}/response",
+        json=response,
+    )
+
+
+async def report_assessment_followup(attempt_id: str, cycle_index: int, followup: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n/followup — the
+    follow-up question, stored before the student sees it. Idempotent."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}/followup",
+        json=followup,
+    )
+
+
+async def report_assessment_followup_response(attempt_id: str, cycle_index: int, response: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/cycles/:n/followup/response —
+    the follow-up's text and/or transcript, scored with the first answer."""
+    return await _post(
+        f"/api/v1/internal/assessment/attempts/{attempt_id}/cycles/{cycle_index}/followup/response",
+        json=response,
+    )
+
+
+async def report_assessment_score(attempt_id: str, payload: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/score — component points; the
+    backend maps them onto the activity's grade range and publishes."""
+    return await _post(f"/api/v1/internal/assessment/attempts/{attempt_id}/score", json=payload)
+
+
+async def report_assessment_feedback(attempt_id: str, payload: dict) -> dict:
+    """POST /internal/assessment/attempts/:id/feedback — the academic
+    feedback; the backend stores it and posts ``message`` to the attempt's
+    conversation."""
+    return await _post(f"/api/v1/internal/assessment/attempts/{attempt_id}/feedback", json=payload)
+
+
+async def report_assessment_insights(assessment_id: str, payload: dict) -> dict:
+    """POST /internal/assessment/assessments/:id/insights — the class report
+    narrative and the improvement proposals (all pending human approval)."""
+    return await _post(
+        f"/api/v1/internal/assessment/assessments/{assessment_id}/insights", json=payload
+    )
+
+
+async def get_moodle_teachers(conversation_id: str) -> dict:
+    """GET /internal/conversations/:id/moodle/teachers — the student's courses
+    and each course's teachers (with Moodle conversation links), derived by the
+    backend from the conversation's own contact. ``messagingEnabled`` says
+    whether ismael may send, or only suggest the link.
+    """
+    result = await _get(f"/api/v1/internal/conversations/{conversation_id}/moodle/teachers")
+    return result if isinstance(result, dict) else {}
+
+
+async def post_teacher_message(
+    conversation_id: str,
+    *,
+    teacher_id: str,
+    course_id: int,
+    text: str,
+    idempotency_key: str,
+    language: str,
+) -> dict:
+    """POST /internal/conversations/:id/moodle/teacher-messages — deliver the
+    student's confirmed message to a teacher through Moodle's own messaging,
+    with the student as sender. Refusals come back as 200 + ``status: FAILED``
+    and a ``code``; ``idempotency_key`` makes a replay return the first result.
+    """
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/moodle/teacher-messages",
+        json={
+            "teacherId": teacher_id,
+            "courseId": course_id,
+            "text": text,
+            "idempotencyKey": idempotency_key,
+            "language": language,
+        },
+    )
+
+
+async def get_teacher_email(conversation_id: str, *, teacher_id: str, course_id: int) -> dict:
+    """POST /internal/conversations/:id/moodle/teacher-email — a teacher's email
+    for the conversation's student, asked of the Moodle plugin (0.5.0+) at the
+    moment of need. ``{status: OK, email}`` or ``{status: FAILED, code}``
+    (e.g. ``email_hidden`` when the teacher does not show it to participants).
+    """
+    return await _post(
+        f"/api/v1/internal/conversations/{conversation_id}/moodle/teacher-email",
+        json={"teacherId": teacher_id, "courseId": course_id},
     )
 
 

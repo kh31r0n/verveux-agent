@@ -1,0 +1,187 @@
+"""Helpers shared by ismael's nodes (triage/survey, Moodle support, teacher)."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+import unicodedata
+
+from langchain_core.messages import AIMessage
+from langgraph.config import get_stream_writer
+
+from ...graphs.state import AgentState
+from ...schemas.ismael import IsmaelIntent
+from ..utils import emit_quick_replies
+
+DEFAULT_PERSONA = "Ismael"
+
+# A multi-turn latch (the teacher flow, a support case, the rating question) is
+# forgotten after this long: the next message is a fresh turn, not an answer to
+# something asked yesterday.
+FLOW_TTL_SECONDS = 30 * 60
+
+
+def latch_fresh(latch: object) -> bool:
+    """True while a latch dict was touched within ``FLOW_TTL_SECONDS``."""
+    if not isinstance(latch, dict):
+        return False
+    return time.time() - float(latch.get("touched_at") or 0) < FLOW_TTL_SECONDS
+
+
+def mark_helped(ismael: dict) -> dict:
+    """Record that ismael just helped (an answer, steps, a ticket, a teacher's
+    contact): the next closing may then ask the student to rate the service."""
+    ismael["helped_at"] = time.time()
+    return ismael
+
+
+def ismael_dict(state: AgentState) -> dict:
+    """A copy of ``state["ismael"]`` — nodes return the whole dict back."""
+    value = state.get("ismael")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def user_ctx(state: AgentState) -> dict:
+    ctx = state.get("user_context") or {}
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def reply(message: str, **updates) -> dict:
+    get_stream_writer()({"type": "token", "content": message})
+    return {"messages": [AIMessage(content=message)], **updates}
+
+
+def numbered(question: str, labels: list[str]) -> str:
+    """A question plus the numbered list the backend matches quick replies on."""
+    return "\n".join([question, *(f"{n}) {label}" for n, label in enumerate(labels, start=1))])
+
+
+def ask_options(question: str, labels: list[str], **updates) -> dict:
+    """Reply with a closed question: numbered text everywhere, buttons where drawn."""
+    result = reply(numbered(question, labels), **updates)
+    emit_quick_replies(labels)
+    return result
+
+
+def history_messages(state: AgentState, limit: int = 6) -> list[dict]:
+    """The turns before the current one, as provider messages."""
+    return [
+        {"role": "assistant" if getattr(m, "type", "") == "ai" else "user", "content": m.content}
+        for m in (state.get("messages") or [])[-(limit + 1) : -1]
+        if getattr(m, "content", None)
+    ]
+
+
+def fold(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.lower())
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).strip()
+
+
+def match_option(reply_text: str, options: list[list[str]]) -> int | None:
+    """0-based index of the option a reply names, or None when it takes an LLM.
+
+    ``options[i]`` holds every accepted label of option i (one per language).
+    A quick-reply button sends its label verbatim, so an exact match comes
+    first; then a bare number; then a label contained in the reply, only when
+    exactly one option matches.
+    """
+    folded = fold(reply_text)
+    if not folded:
+        return None
+    for index, labels in enumerate(options):
+        if folded in (fold(label) for label in labels):
+            return index
+    number = re.fullmatch(r"\D{0,12}?(\d{1,2})\D{0,12}", folded)
+    if number:
+        n = int(number.group(1))
+        return n - 1 if 1 <= n <= len(options) else None
+    hits = {
+        index
+        for index, labels in enumerate(options)
+        if any(fold(label) and fold(label) in folded for label in labels)
+    }
+    return hits.pop() if len(hits) == 1 else None
+
+
+
+async def bounded_structured(
+    provider,
+    messages: list[dict],
+    model: str,
+    schema,
+    *,
+    timeout: float,
+    thinking_budget: int | None,
+):
+    """``provider.generate_structured`` with a deadline and a thinking cap.
+
+    ``asyncio.wait_for`` cancels the request when it overruns — that is what
+    frees the conversation's lock — and raises, so the caller's ``except``
+    sends its fallback reply within the backend's 60 s turn.
+    """
+    return await asyncio.wait_for(
+        provider.generate_structured(messages, model, schema, thinking_budget=thinking_budget),
+        timeout=timeout,
+    )
+
+
+# Keyword fallback for when triage's LLM call fails or times out. Matched on
+# folded text (no accents, lower case) as whole-word prefixes. Deliberately
+# small: it only has to beat "everything is theology", which sent a Moodle
+# error to the library on 2026-10-06.
+_TEACHER_WORDS = ("profesor", "profe", "docente", "tutor", "maestr")
+_MOODLE_WORDS = (
+    "moodle", "aula virtual", "plataforma", "error", "contrasena", "usuario",
+    "matricul", "inscrib", "inscripc", "tarea", "entrega", "calificac", "nota",
+    "cuestionario", "examen", "foro", "acceso", "ingresar", "iniciar sesion",
+    "login", "curso", "pago", "certificado", "no me deja", "no puedo",
+    "no carga", "no abre", "no aparece",
+)
+
+
+# A message made only of these words (and punctuation or emoji) is a thank-you
+# or an acknowledgement — routed to the closing without an LLM call. At least
+# one word must be in _CLOSING_ANCHORS: "muy" or "de" alone close nothing.
+_CLOSING_ANCHORS = {
+    "gracias", "graciass", "ok", "okay", "oki", "listo", "perfecto", "vale",
+    "entendido", "chao", "adios", "bendiciones", "amable", "excelente", "genial",
+    "acuerdo", "buenisimo", "thanks", "thank", "bye",
+}
+_CLOSING_FILLER = {
+    "muchas", "mil", "muchisimas", "hasta", "luego", "pronto", "dios", "te", "le",
+    "bendiga", "muy", "de", "super", "ya", "entonces", "bueno", "you", "so", "much",
+    "great", "y", "por", "todo", "tu", "su", "ayuda",
+}
+
+
+def is_bare_closing(message: str, persona: str = "") -> bool:
+    """True for "gracias", "ok 👍", "Gracias...", "listo, gracias Salomón"."""
+    words = re.sub(r"[^a-z\s]", " ", fold(message)).split()
+    if not words or len(words) > 8:
+        return False
+    allowed = _CLOSING_ANCHORS | _CLOSING_FILLER | set(fold(persona).split())
+    return all(w in allowed for w in words) and any(w in _CLOSING_ANCHORS for w in words)
+
+
+def mentions(folded: str, words: tuple[str, ...]) -> bool:
+    """True when ``folded`` holds one of ``words`` as a whole-word prefix."""
+    return any(re.search(r"\b" + re.escape(word), folded) for word in words)
+
+
+def fallback_intent(fragments: list[str]) -> IsmaelIntent:
+    """Best guess at the intent without an LLM, newest fragment first.
+
+    The newest message decides when it says something recognizable, because
+    an unanswered burst can still hold older fragments from failed turns.
+    A teacher request wins over a Moodle problem within one fragment (it
+    usually comes with one). Anything unrecognized stays theology, where
+    Brain judges off-corpus questions itself.
+    """
+    for fragment in reversed(fragments):
+        folded = fold(fragment)
+        if mentions(folded, _TEACHER_WORDS):
+            return IsmaelIntent.CONTACT_TEACHER
+        if mentions(folded, _MOODLE_WORDS):
+            return IsmaelIntent.MOODLE_SUPPORT
+    return IsmaelIntent.THEOLOGY

@@ -1330,6 +1330,31 @@ class TestEnrichmentEndpoint:
             )
         assert response.status_code == 400
 
+    def test_runs_on_the_platforms_cheap_model_not_the_tenants(self) -> None:
+        creds = {
+            "provider": "GEMINI",
+            "model": "gemini-3.5-flash",
+            "backgroundModel": "gemini-3.1-flash-lite",
+            "geminiCredentials": {},
+            "geminiProjectId": "p",
+            "geminiLocation": "global",
+        }
+        run = AsyncMock()
+        with (
+            patch("src.main.get_or_compile_graph", AsyncMock(return_value=object())),
+            patch("src.main.fetch_agent_credentials", AsyncMock(return_value=creds)),
+            patch("src.main._run_enrichment", run),
+        ):
+            response = self._client().post(
+                "/enrichment/run",
+                json=self.BODY,
+                headers={"x-agent-key": settings.webhook_api_key},
+            )
+        assert response.status_code == 202
+        config = run.call_args.args[2]
+        assert config["configurable"]["llm_provider"] == "gemini"
+        assert config["configurable"]["llm_model"] == "gemini-3.1-flash-lite"
+
 
 # ── Website discovery (contacts that arrive with no website) ─────────────────
 

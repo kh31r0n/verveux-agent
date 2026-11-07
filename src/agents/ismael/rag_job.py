@@ -15,11 +15,17 @@ unavailable (tests, local runs without it).
 
 If the instance dies mid-job the answer is lost; the store entry expires after
 `JOB_TTL_SECONDS` and the student can ask again. Acceptable at this volume.
+
+A question that names a book (triage's ``work``) is asked of that document
+alone when it matches one in the library's catalog: Brain never searches
+titles, so «¿y el libro Las llaves del poder?» came back insufficient_evidence
+on 2026-10-15 although the book is in the library.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +38,7 @@ from ...providers.registry import get_provider, resolve_model
 from ...services import brain
 from ...usage import make_usage_record
 from .. import backend_client
+from .common import fold
 from .prompts import GENERAL_PROMPT
 from .texts import text
 
@@ -61,6 +68,8 @@ class RagJob:
     # provider, model, the provider's credentials and the prompt payloads. Kept
     # in memory only — never in graph state, never logged.
     llm_config: dict
+    # The book, document or author the question names (triage), or "".
+    work: str = ""
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
@@ -129,37 +138,157 @@ async def _record(job: RagJob, status: str) -> None:
         logger.info("ismael_job_store_write_failed", error=str(exc), status=status)
 
 
-def format_answer(answer: dict, lang: str) -> str:
-    """Brain's answer text plus a References block built from its citations.
+# A title that is really a file name: "07-LlavesDelPoder-INT.pdf.corrected".
+_FILE_EXTENSIONS = re.compile(r"(?:\.(?:pdf|epub|docx?|txt|corrected))+$", re.IGNORECASE)
+_FILE_MARKERS = re.compile(r"(?:[-_ ]+(?:int(?:-s)?|s|corregido|corrected))+$", re.IGNORECASE)
+_LEADING_NUMBER = re.compile(r"^\d+\s*[.\-_)]+\s*")
+_CAMEL = re.compile(r"(?<=[a-záéíóúñ])(?=[A-ZÁÉÍÓÚÑ])")
 
-    Brain verifies every citation server-side, so the text is sent as written —
-    an LLM rewrite could detach a claim from the source that supports it.
-    References are listed once per (title, page), in citation order.
+
+def clean_title(title: str) -> str:
+    """A library title fit to show: file names lose their extension, numbering
+    and markers ("Llaves Del Poder"); real titles keep their punctuation."""
+    title = " ".join((title or "").split())
+    filename_like = bool(_FILE_EXTENSIONS.search(title)) or " " not in title
+    cleaned = _FILE_EXTENSIONS.sub("", title)
+    cleaned = _FILE_MARKERS.sub("", cleaned)
+    cleaned = _LEADING_NUMBER.sub("", cleaned)
+    if filename_like:
+        cleaned = _CAMEL.sub(" ", cleaned)
+        cleaned = " ".join(re.sub(r"[-_]+", " ", cleaned).split())
+    return cleaned.strip() or title
+
+
+# A recording's locator: "00:12:34 · https://www.youtube.com/watch?v=…&t=754s"
+# (or an s3:// URL a student cannot open). Brain builds it from facts that never
+# move, so it is parsed rather than rebuilt.
+_TIMED_LOCATOR = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})\s*·\s*(\S+)")
+MAX_REFERENCE_DETAIL = 200  # REFERENCE_LIMITS.maxDetailLength in the backend
+MAX_REFERENCE_TITLE = 300
+
+
+def _source_title(ev: dict, fallback: str) -> str:
+    """«Las llaves del poder — Darío Silva-Silva (2004)» from the evidence's
+    record facts (Brain's ficha); just the clean title when it has none."""
+    title = clean_title(ev.get("title") or fallback)
+    if not title:
+        return ""
+    who = (ev.get("author") or ev.get("source_name") or "").strip()
+    year = ev.get("published_year")
+    if who and who.lower() not in title.lower():
+        title = f"{title} — {who}"
+    if isinstance(year, int) and str(year) not in title:
+        title = f"{title} ({year})"
+    return title[:MAX_REFERENCE_TITLE]
+
+
+def _timed_detail(locator: str) -> str | None:
+    """«min 12:34 · <link that opens it there>» for a recording, else None."""
+    match = _TIMED_LOCATOR.match(locator or "")
+    if not match:
+        return None
+    hours, minutes, seconds, where = match.groups()
+    at = f"{minutes}:{seconds}" if hours.strip("0") == "" else f"{int(hours)}:{minutes}:{seconds}"
+    detail = f"min {at}"
+    if where.startswith(("http://", "https://")) and len(detail) + 3 + len(where) <= MAX_REFERENCE_DETAIL:
+        detail = f"{detail} · {where}"
+    return detail
+
+
+def _reference_items(answer: dict, lang: str) -> list[tuple[str, str | None]]:
+    """(title, detail) per cited source: once per (title, page), in citation order.
+
+    The title carries the author and year when Brain's ficha knows them; a
+    recording's detail is the minute it was said, with its link.
     """
-    body = (answer.get("text") or "").strip()
     evidence = {e.get("chunk_id"): e for e in answer.get("evidence") or [] if isinstance(e, dict)}
-    refs: list[str] = []
+    items: list[tuple[str, str | None]] = []
     seen: set[tuple[str, str]] = set()
     for citation in answer.get("citations") or []:
         if not isinstance(citation, dict):
             continue
         ev = evidence.get(citation.get("chunk_id")) or {}
-        title = (ev.get("title") or citation.get("section_title") or "").strip()
+        title = _source_title(ev, citation.get("section_title") or "")
         if not title:
             continue
         page = citation.get("page") or ev.get("page")
         where = (citation.get("section_title") or "").strip()
-        detail = f"{text('page', lang)} {page}" if page else where
+        if ev.get("kind") == "ficha":
+            detail = None  # the record itself: nothing to point into
+        elif timed := _timed_detail(citation.get("locator") or ev.get("locator") or ""):
+            detail = timed
+        else:
+            detail = f"{text('page', lang)} {page}" if page else where
         key = (title, str(detail))
         if key in seen:
             continue
         seen.add(key)
-        refs.append(f"- {title}" + (f", {detail}" if detail and detail != title else ""))
-        if len(refs) >= MAX_REFERENCES:
+        items.append((title, detail if detail and detail != title else None))
+        if len(items) >= MAX_REFERENCES:
             break
-    if not refs:
+    return items
+
+
+# Brain's model sometimes opens with "Según los textos proporcionados, …": the
+# student never sees those texts, so the lead-in reads as noise. Only this
+# opening clause is removed; the claims that follow are untouched.
+_SOURCE_PREAMBLE = re.compile(
+    r"^(?:"
+    r"(?:según|de acuerdo con|con base en|basándome en|a partir de)\s+(?:los|las)\s+"
+    r"(?:textos|fragmentos|fuentes|documentos|pasajes)"
+    # One adjective may sit in between: "los textos bíblicos citados".
+    r"(?:\s+(?:bíblic|biblic|teológic|teologic)[oa]s)?"
+    r"(?:\s+(?:proporcionad|disponibl|consultad|dad|citad|recibid)[oae]s)?"
+    r"|"
+    r"(?:según|de acuerdo con|con base en)\s+la\s+documentación"
+    r"(?:\s+(?:proporcionad|disponibl|consultad|dad|citad|recibid)a)?"
+    r"|"
+    r"(?:according to|based on)\s+the\s+(?:provided\s+)?"
+    r"(?:texts|fragments|sources|documents|passages|excerpts)(?:\s+provided)?"
+    r")\s*,\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_source_preamble(body: str) -> str:
+    """``body`` without a leading "according to the provided texts," clause."""
+    match = _SOURCE_PREAMBLE.match(body)
+    rest = body[match.end():] if match else ""
+    if not rest.strip():
         return body
-    return f"{body}\n\n{text('references', lang)}\n" + "\n".join(refs)
+    return rest[0].upper() + rest[1:]
+
+
+def format_answer(answer: dict, lang: str) -> str:
+    """Brain's answer text plus a References block built from its citations.
+
+    Brain verifies every citation server-side, so the text is sent as written —
+    an LLM rewrite could detach a claim from the source that supports it. The
+    one exception is a "según los textos proporcionados," lead-in, which carries
+    no claim (``strip_source_preamble``).
+    """
+    body = strip_source_preamble((answer.get("text") or "").strip())
+    items = _reference_items(answer, lang)
+    if not items:
+        return body
+    lines = [f"- {title}" + (f", {detail}" if detail else "") for title, detail in items]
+    return f"{body}\n\n{text('references', lang)}\n" + "\n".join(lines)
+
+
+def answer_references(answer: dict, lang: str) -> dict | None:
+    """The same References block as data, for the widget's citation list.
+
+    The backend keeps it only while ``format_answer``'s text ends with exactly
+    this block (``referencesSuffix`` in src/messages/references.ts) — both are
+    built from ``_reference_items``, so they cannot drift apart.
+    """
+    items = _reference_items(answer, lang)
+    if not items or not (answer.get("text") or "").strip():
+        return None
+    return {
+        "heading": text("references", lang),
+        "items": [{"title": title, "detail": detail} for title, detail in items],
+    }
 
 
 async def _general_answer(job: RagJob) -> tuple[str, list]:
@@ -181,48 +310,155 @@ async def _general_answer(job: RagJob) -> tuple[str, list]:
     reply = (reply or "").strip()
     if not reply:
         raise brain.BrainError("general answer came back empty")
-    return f"{reply}\n\n{text('general_notice', job.language)}", usage
+    return reply, usage
 
 
-async def _compose(job: RagJob) -> tuple[str, list, str]:
-    """(message, usage, outcome) for the job — never raises."""
+_ARTICLES = {"el", "la", "los", "las", "lo", "un", "una", "del", "de", "the", "a", "an", "libro", "book"}
+# Honorifics in an author field ("Rev. Darío Silva Silva") name no one.
+_HONORIFICS = {"rev", "dr", "pastor", "pr", "mons", "padre", "fr"}
+
+
+def _words(value: str) -> list[str]:
+    return re.sub(r"[^a-z0-9]+", " ", fold(value or "")).split()
+
+
+def _core(value: str) -> str:
+    """Folded words without leading articles: «el libro Las llaves» → «llaves …»."""
+    words = _words(value)
+    while words and words[0] in _ARTICLES:
+        words.pop(0)
+    return " ".join(words)
+
+
+def _surnames(author: str) -> set[str]:
+    return {w for w in _words(author) if len(w) >= 4 and w not in _HONORIFICS}
+
+
+def _long_enough(core: str) -> bool:
+    return len(core.split()) >= 2 or len(core) >= 8
+
+
+def match_work(work: str, documents: list[dict]) -> dict | None:
+    """The one catalog document ``work`` names, or None when none (or several) do.
+
+    A title matches when one title contains the other as whole words (at least
+    two words or eight letters), the title plus its subtitle included; an
+    author (or any contributor in Brain's ficha) alone matches only when they
+    have a single document. A title shared by several documents is settled by
+    the author.
+    """
+    wanted = _core(work)
+    if not wanted:
+        return None
+    wanted_words = set(wanted.split())
+    padded = f" {wanted} "
+    by_title, by_author = [], []
+    for doc in documents:
+        base = clean_title(doc.get("title") or "")
+        # The full title too: «Las llaves del poder: autoridad espiritual» is
+        # also how a student may name it, once Brain's ficha has a subtitle.
+        titles = {_core(base)}
+        if doc.get("subtitle"):
+            titles.add(_core(f"{base} {doc['subtitle']}"))
+        if any(
+            title and (
+                (_long_enough(title) and f" {title} " in padded)
+                or (_long_enough(wanted) and padded in f" {title} ")
+            )
+            for title in titles
+        ):
+            by_title.append(doc)
+        people = " ".join([doc.get("author") or "", *(doc.get("contributors") or [])])
+        if _surnames(people) & wanted_words:
+            by_author.append(doc)
+    if len(by_title) == 1:
+        return by_title[0]
+    if len(by_title) > 1:
+        both = [d for d in by_title if d in by_author]
+        return both[0] if len(both) == 1 else None
+    return by_author[0] if len(by_author) == 1 else None
+
+
+async def _work_filter(job: RagJob) -> dict[str, str] | None:
+    """``{"document_id": …}`` when the question names one catalog document."""
+    if not job.work.strip():
+        return None
+    try:
+        documents = await brain.list_documents()
+    except Exception as exc:  # noqa: BLE001 — an unscoped question still gets answered
+        logger.info("ismael_catalog_unavailable", error=str(exc))
+        return None
+    doc = match_work(job.work, documents)
+    return {"document_id": doc["id"]} if doc else None
+
+
+def _log_answer(job: RagJob, outcome: dict, filters: dict | None) -> None:
+    """Why Brain answered as it did — an insufficient_evidence used to leave no trace."""
+    answer = outcome.get("answer") if isinstance(outcome.get("answer"), dict) else {}
+    titles = []
+    for ev in answer.get("evidence") or []:
+        title = clean_title(ev.get("title") or "") if isinstance(ev, dict) else ""
+        if title and title not in titles:
+            titles.append(title)
+    logger.info(
+        "ismael_brain_answer",
+        job_id=job.job_id,
+        state=answer.get("state") or outcome.get("state"),
+        reason=(answer.get("reason") or "")[:300] or None,
+        citations=len(answer.get("citations") or []),
+        evidence_titles=titles[:5],
+        document_id=(filters or {}).get("document_id"),
+    )
+
+
+async def _compose(job: RagJob) -> tuple[str, list, str, dict | None]:
+    """(message, usage, outcome, references) for the job — never raises."""
     try:
         await brain.ensure_started()
         boot_deadline = time.monotonic() + settings.brain_boot_timeout_seconds
         if not await brain.wait_healthy(boot_deadline):
-            return text("failed", job.language), [], "boot_timeout"
+            return text("failed", job.language), [], "boot_timeout", None
 
-        question_id = await brain.ask(job.question)
+        filters = await _work_filter(job)
+        question_id = await brain.ask(job.question, filters=filters)
         answer_deadline = time.monotonic() + settings.brain_answer_timeout_seconds
         outcome = await brain.wait_answer(question_id, answer_deadline)
         if outcome is None:
-            return text("failed", job.language), [], "answer_timeout"
+            return text("failed", job.language), [], "answer_timeout", None
+        _log_answer(job, outcome, filters)
         if outcome.get("state") != "done" or not isinstance(outcome.get("answer"), dict):
             logger.warning("ismael_brain_failed", error=outcome.get("error"))
-            return text("failed", job.language), [], "brain_failed"
+            return text("failed", job.language), [], "brain_failed", None
 
         answer = outcome["answer"]
         if answer.get("state") == "answered" and (answer.get("text") or "").strip():
-            return format_answer(answer, job.language), [], "answered"
+            return (
+                format_answer(answer, job.language),
+                [],
+                "answered",
+                answer_references(answer, job.language),
+            )
 
-        # insufficient_evidence / off_corpus: a short general answer, labelled.
+        # insufficient_evidence / off_corpus: a short general answer, unlabelled
+        # (the outcome below still tells them apart in the logs).
         message, usage = await _general_answer(job)
-        return message, usage, f"general:{answer.get('state')}"
+        return message, usage, f"general:{answer.get('state')}", None
     except Exception as exc:  # noqa: BLE001 — the student still gets a reply
         logger.error("ismael_job_error", job_id=job.job_id, error=str(exc))
-        return text("failed", job.language), [], "error"
+        return text("failed", job.language), [], "error", None
 
 
 async def run(job: RagJob) -> None:
     started = time.monotonic()
     try:
-        message, usage, outcome = await _compose(job)
+        message, usage, outcome, references = await _compose(job)
         try:
             await backend_client.post_agent_message(
                 job.conversation_id,
                 job_id=job.job_id,
                 text=message,
                 turn_usage=usage,
+                references=references,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("ismael_delivery_failed", job_id=job.job_id, error=str(exc))

@@ -15,16 +15,100 @@ from pydantic import BaseModel, Field
 
 class IsmaelIntent(StrEnum):
     THEOLOGY = "theology"
+    # How to use the Moodle classroom, a technical problem, or an
+    # administrative errand (enrolment, payments) to redirect.
+    MOODLE_SUPPORT = "moodle_support"
+    # Wants to talk to / write to their teacher.
+    CONTACT_TEACHER = "contact_teacher"
     GREETING = "greeting"
+    # Thanks, "ok", "listo", a goodbye: the conversation is winding down.
+    CLOSING = "closing"
     OTHER = "other"
+
+
+class TeacherTopic(StrEnum):
+    """What a "contact my teacher" request is about, so ismael can offer to
+    help first with the branch that fits."""
+
+    THEOLOGY = "theology"
+    MOODLE_SUPPORT = "moodle_support"
+    NONE = "none"
 
 
 class TriageResult(BaseModel):
     intent: IsmaelIntent
     # The question rewritten to stand on its own ("¿y qué dice Pablo?" → "¿Qué
     # dice Pablo sobre la justificación por la fe?"). Brain sees only this text,
-    # never the conversation, so a follow-up must carry its own context.
+    # never the conversation, so a follow-up must carry its own context. For
+    # moodle_support it is the request in one sentence; for contact_teacher,
+    # the reason or the message for the teacher, when the user gave one.
     question: str = Field(default="", max_length=1000)
+    teacher_topic: TeacherTopic = TeacherTopic.NONE
+    # Id of the institution FAQ (among the candidates shown to triage) that
+    # answers the message — or the teacher request's reason — or "" when none
+    # does. Validated against the candidates in code; never trusted blindly.
+    faq_id: str = Field(default="", max_length=64)
+    # The book, document or author a theology question names, as the user
+    # wrote it ("Las llaves del poder", "Darío Silva"), or "". Matched against
+    # Brain's library catalog in code so the question can be asked of that one
+    # document: Brain searches chunk text only, never titles.
+    work: str = ""
+
+
+class MoodleSupportOutcome(StrEnum):
+    ANSWERED = "answered"
+    # The reply is a clarifying question: something is still missing to help.
+    ASK = "ask"
+    NEEDS_TICKET = "needs_ticket"
+    REDIRECT = "redirect"
+    # A grade, a quiz's content or its answers: the teacher's call, not support's.
+    TEACHER = "teacher"
+    # The institution's support form itself fails to submit. Answered with
+    # tips in code; the ticket block is never pasted again.
+    FORM_FAILED = "form_failed"
+
+
+# Outcomes that send the student somewhere else. Code holds them back until the
+# student has answered at least one clarifying question.
+ESCALATIONS = frozenset(
+    {MoodleSupportOutcome.NEEDS_TICKET, MoodleSupportOutcome.REDIRECT, MoodleSupportOutcome.TEACHER}
+)
+
+
+class MoodleSupportResult(BaseModel):
+    reply: str = Field(max_length=2000)
+    outcome: MoodleSupportOutcome = MoodleSupportOutcome.ANSWERED
+    # First-person description for the institution's support form; only
+    # meaningful with needs_ticket. The form link and the user's data are
+    # appended in code, never by the model.
+    ticket_description: str = Field(default="", max_length=1000)
+    # The one or two things still worth asking (course, activity, the exact
+    # message, what they tried). Code sends it instead of escalating when the
+    # student has not been asked anything yet.
+    clarifying_question: str = Field(default="", max_length=600)
+    # A web search for a concrete error the model cannot explain (in English,
+    # with Moodle's error code when it recognizes one), or "". Code runs it
+    # against Moodle's documentation only (research.py).
+    research_query: str = ""
+
+
+class ResearchedSupportResult(MoodleSupportResult):
+    # The fetched page the reply relies on, or "" when none answered the case.
+    # Validated against the pages actually read; the link is appended in code.
+    source_url: str = ""
+
+
+class TeacherStepAnswer(BaseModel):
+    # 1-based number of the option the user chose; 0 when none fits.
+    choice: int = 0
+    # True when the reply is something else entirely (a new question), which
+    # abandons the teacher flow.
+    is_new_question: bool = False
+
+
+class TeacherDraft(BaseModel):
+    # The message for the teacher, in the student's voice.
+    message: str = Field(max_length=1500)
 
 
 class SurveyAnswer(BaseModel):
@@ -33,3 +117,8 @@ class SurveyAnswer(BaseModel):
     # True when the reply is a NEW theology question instead of an answer; it
     # then replaces the pending question.
     is_new_question: bool = False
+
+
+class FaqAnswer(BaseModel):
+    # The FAQ's answer adapted to the exact question, adding nothing it lacks.
+    reply: str = Field(max_length=2000)

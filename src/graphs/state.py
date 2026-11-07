@@ -192,12 +192,22 @@ class AgentState(TypedDict):
     lead_submitted: bool
 
     # ── Theology flow (ismael) ────────────────────────────────────────
-    # {question, pending_question, survey_step, survey_answers} — see
-    # src/agents/ismael/nodes.py. Readers must use .get(): other graphs'
-    # checkpoints never carry it.
+    # {question, pending_question, survey_step, survey_answers, teacher,
+    # support_question} — see src/agents/ismael/nodes.py and teacher.py.
+    # Readers must use .get(): other graphs' checkpoints never carry it.
     ismael: dict
-    # Per-turn branch chosen by ismael_triage (written every turn).
+    # Per-turn branch chosen by ismael_triage (written every turn); the
+    # teacher flow overwrites it to hand the turn over ("start",
+    # "moodle_support", "retriage") or to end it ("done").
     ismael_route: str
+
+    # ── Assessment flow (pablo) ───────────────────────────────────────
+    # {attempt_id, assessment_id, total_cycles, current_cycle, modality,
+    # phase, used_question_ids, cycle} — see src/agents/pablo/nodes.py.
+    # Responses, scores and feedback live in the backend, never here.
+    pablo: dict
+    # Per-turn branch chosen by pablo_triage from the backend's turn kind.
+    pablo_route: str
 
     # ── Deals ──────────────────────────────────────────────────────────
     deal_created: bool

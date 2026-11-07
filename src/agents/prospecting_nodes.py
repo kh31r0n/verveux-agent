@@ -52,7 +52,13 @@ from ..services.serper import (
     serper_call_count,
     start_serper_accounting,
 )
+from ..services.serper import serper_account_balance
 from ..services.serper import serper_post as _serper_post
+from ..services.google_places import (
+    places_call_count,
+    places_configured,
+    places_text_search,
+)
 from ..usage import make_usage_record
 from . import backend_client
 from .dedup import (
@@ -186,6 +192,9 @@ class ProspectingState(TypedDict, total=False):
     enough_quality: bool
     created: list[dict]
     turn_usage: Annotated[list[dict], operator.add]
+    # One entry per extraction that produced nothing because the LLM call
+    # failed: "rate_limited" (429 after the provider's own retries) or "error".
+    extract_failures: Annotated[list[str], operator.add]
     metrics: dict
 
 
@@ -229,6 +238,49 @@ def _fold(text: str) -> str:
     return _WS_RE.sub(" ", stripped).strip().casefold()
 
 
+# Municipalities of each metropolitan area, keyed by the core city a tenant
+# configures. Prospects there were tagged out-of-region until 2026-10-16 —
+# Envigado, Sabaneta, Itagüí, Yumbo, Dosquebradas and Zipaquirá were the
+# commonest — although a business in Envigado IS a Medellín prospect. Colombia
+# only: the names mean nothing elsewhere (see `_is_colombia`).
+METRO_AREAS: dict[str, list[str]] = {
+    "Bogotá": [
+        "Soacha", "Chía", "Cota", "Funza", "Mosquera", "Madrid", "Cajicá",
+        "Zipaquirá", "La Calera", "Tocancipá", "Sopó", "Tabio", "Tenjo",
+    ],
+    "Medellín": [
+        "Envigado", "Sabaneta", "Itagüí", "Bello", "La Estrella", "Caldas",
+        "Copacabana", "Girardota", "Barbosa",
+    ],
+    "Cali": ["Yumbo", "Jamundí", "Palmira", "Candelaria"],
+    "Barranquilla": ["Soledad", "Malambo", "Puerto Colombia", "Galapa"],
+    "Bucaramanga": ["Floridablanca", "Girón", "Piedecuesta"],
+    "Pereira": ["Dosquebradas", "La Virginia", "Santa Rosa de Cabal"],
+    "Cúcuta": ["Villa del Rosario", "Los Patios", "El Zulia"],
+    "Cartagena": ["Turbaco"],
+    "Manizales": ["Villamaría"],
+}
+
+
+def _is_colombia(location: dict | None) -> bool:
+    location = location or {}
+    if str(location.get("gl") or "").strip().lower() == "co":
+        return True
+    return _fold(str(location.get("country") or "")) == "colombia"
+
+
+def _region_names(location: dict | None) -> list[str]:
+    """Configured cities plus, in Colombia, their metropolitan municipalities."""
+    configured = [c for c in ((location or {}).get("cities") or []) if c]
+    if not _is_colombia(location):
+        return configured
+    metro = {_fold(core): towns for core, towns in METRO_AREAS.items()}
+    names = list(configured)
+    for city in configured:
+        names.extend(metro.get(_fold(city), []))
+    return names
+
+
 def city_in_region(city: str | None, location: dict | None) -> bool | None:
     """Is ``city`` one of the tenant's configured cities?
 
@@ -241,6 +293,9 @@ def city_in_region(city: str | None, location: dict | None) -> bool | None:
     Substring matching is intentional and one-directional: a page saying
     "Zipaquirá, Cundinamarca" or "Chía (Sabana Centro)" is the configured city,
     while a bare "Bogotá" matches no configured entry and is correctly flagged.
+
+    In Colombia a configured core city also covers its metropolitan area
+    (``METRO_AREAS``): with "Medellín" configured, "Envigado" is in region.
     """
     configured = [c for c in ((location or {}).get("cities") or []) if c]
     if not city or not city.strip() or not configured:
@@ -248,7 +303,7 @@ def city_in_region(city: str | None, location: dict | None) -> bool | None:
     folded = _fold(city)
     if not folded:
         return None
-    return any(_fold(c) in folded for c in configured)
+    return any(_fold(c) in folded for c in _region_names(location))
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
@@ -579,6 +634,88 @@ async def _serper_places(query: str, location: dict | None = None) -> list[dict]
     return parse_places(data)
 
 
+def places_provider() -> str:
+    """Which source answers business-listing searches this run."""
+    if not settings.prospecting_places_enabled:
+        return "off"
+    choice = settings.prospecting_places_provider
+    if choice == "google" and not places_configured():
+        return "serper"
+    return choice
+
+
+async def _places_search(query: str, location: dict | None = None) -> list[dict]:
+    """Business listings for one query, from the configured provider.
+
+    Google Places is not geo-biased by a `location` string: the city is already
+    in the query text ("… en Envigado Colombia"), which text search honours.
+    """
+    provider = places_provider()
+    if provider == "google":
+        location = location or DEFAULT_LOCATION
+        return await places_text_search(
+            query,
+            region_code=str(location.get("gl") or "co"),
+            language_code=str(location.get("hl") or "es"),
+        )
+    if provider == "serper":
+        return await _serper_places(query, location)
+    return []
+
+
+# Hosts whose pages never describe ONE prospect: business directories, job
+# boards, document dumps, maps, and government portals. On the healthy runs of
+# 2026-10-06..13 they were ~40 % of failed fetches (403/429 bot walls), and each
+# still cost an extraction call that read only the SERP snippet. Matched on the
+# registrable domain (and `.gov.co` as a suffix). Business-listing rows (Places)
+# are kept even when their website is one of these — the business exists; only
+# the useless website is dropped.
+_BLOCKED_DOMAINS = frozenset(
+    {
+        "paginasamarillas.com.co", "paginasamarillas.com",
+        "paginasamarillasinternet.com", "amarillasinternet.com",
+        "tupaginaamarilla.com", "cylex.com.co", "infoisinfo.com.co",
+        "informacolombia.com", "einforma.co", "empresite.com",
+        "computrabajo.com", "indeed.com", "jooble.org", "elempleo.com",
+        "scribd.com", "issuu.com", "waze.com", "mercadolibre.com.co",
+        "tripadvisor.com", "tripadvisor.co",
+    }
+)
+_BLOCKED_SUFFIXES = (".gov.co",)
+
+# Single-business pages that refuse an anonymous fetch (login walls). They stay
+# in the fan-out — the SERP title/snippet still names the business — but the
+# doomed page fetch is skipped.
+_NO_FETCH_DOMAINS = frozenset(
+    {"facebook.com", "instagram.com", "linkedin.com", "tiktok.com", "x.com", "twitter.com"}
+)
+
+
+def _blocked_domains() -> frozenset[str]:
+    extra = {
+        d.strip().lower()
+        for d in (settings.prospecting_blocked_domains or "").split(",")
+        if d.strip()
+    }
+    return _BLOCKED_DOMAINS | extra
+
+
+def is_blocked_url(url: str | None) -> bool:
+    if not url:
+        return False
+    domain = normalize_domain(url)
+    if not domain:
+        return False
+    if domain in _blocked_domains():
+        return True
+    host = (httpx.URL(url).host if "://" in url else url).lower()
+    return any(host.endswith(sfx) or domain.endswith(sfx) for sfx in _BLOCKED_SUFFIXES)
+
+
+def _skip_fetch(url: str) -> bool:
+    return normalize_domain(url) in _NO_FETCH_DOMAINS
+
+
 async def web_search_node(state: ProspectingState, config: RunnableConfig) -> dict:
     queries = state.get("queries", [])
     location = state.get("location") or DEFAULT_LOCATION
@@ -586,12 +723,35 @@ async def web_search_node(state: ProspectingState, config: RunnableConfig) -> di
     seen: set[str] = set()
     results: list[dict] = []
     new_urls: list[str] = []
+    blocked = 0
+    budget = settings.prospecting_max_serper_calls_per_run
+    searched: list[str] = []
 
     for query in queries:
-        combined = list(await _serper_search(query, location)) + list(
-            await _serper_places(query, location)
-        )
-        for hit in combined:
+        if budget > 0 and serper_call_count() >= budget:
+            logger.warning(
+                "prospecting_search_budget_reached",
+                run_id=state.get("run_id"),
+                serper_calls=serper_call_count(),
+                budget=budget,
+                skipped_queries=len(queries) - len(searched),
+            )
+            break
+        searched.append(query)
+        organic = list(await _serper_search(query, location))
+        listings = list(await _places_search(query, location))
+        kept: list[dict] = []
+        for hit in organic:
+            if is_blocked_url(hit.get("url")):
+                blocked += 1
+                continue
+            kept.append(hit)
+        for hit in listings:
+            if is_blocked_url(hit.get("url")):
+                blocked += 1
+                hit = {**hit, "url": ""}
+            kept.append(hit)
+        for hit in kept:
             url = hit.get("url", "")
             # Places rows may have no website; dedupe those by title instead.
             key = url or ("title:" + (hit.get("title", "") or "").strip().lower())
@@ -602,20 +762,28 @@ async def web_search_node(state: ProspectingState, config: RunnableConfig) -> di
             if url:
                 new_urls.append(url)
 
+    prior_metrics = state.get("metrics") or {}
     logger.info(
         "prospecting_search",
         run_id=state.get("run_id"),
         iteration=state.get("iteration"),
-        queries=len(queries),
+        queries=len(searched),
         results=len(results),
+        blocked=blocked,
+        places_provider=places_provider(),
+        serper_calls=serper_call_count(),
+        places_calls=places_call_count(),
     )
     return {
         "search_results": results,
-        "searched_queries": list(queries),
+        "searched_queries": searched,
         "seen_urls": new_urls,
         "metrics": {
-            **(state.get("metrics") or {}),
+            **prior_metrics,
             "search_results": len(results),
+            # Cumulative across refinement passes, unlike `search_results`.
+            "blocked_results": int(prior_metrics.get("blocked_results") or 0) + blocked,
+            "places_provider": places_provider(),
         },
     }
 
@@ -685,6 +853,14 @@ async def _fetch_page_text(url: str) -> str:
         return ""
 
 
+def _failure_kind(exc: Exception) -> str:
+    text = str(exc)
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code == 429 or "429" in text or "RESOURCE_EXHAUSTED" in text:
+        return "rate_limited"
+    return "error"
+
+
 def _parse_extraction(raw: str) -> dict | None:
     text = raw.strip()
     # Strip ```json fences if the model added them.
@@ -705,7 +881,7 @@ async def extract_and_enrich_node(state: dict, config: RunnableConfig) -> dict:
     graph state."""
     result: dict = state.get("result") or {}
     url = result.get("url", "")
-    page_text = await _fetch_page_text(url) if url else ""
+    page_text = await _fetch_page_text(url) if url and not _skip_fetch(url) else ""
     if not page_text:
         # Fall back to the SERP snippet so a fetch failure still yields a name.
         page_text = f"{result.get('title', '')}\n{result.get('snippet', '')}".strip()
@@ -763,7 +939,7 @@ async def extract_and_enrich_node(state: dict, config: RunnableConfig) -> dict:
                 f"El proveedor LLM rechazó la petición por configuración "
                 f"({type(exc).__name__}): {exc}"
             ) from exc
-        return {}
+        return {"extract_failures": [_failure_kind(exc)]}
 
     usage = dict(
         make_usage_record(
@@ -791,7 +967,9 @@ async def extract_and_enrich_node(state: dict, config: RunnableConfig) -> dict:
     if phone:
         notes = f"{notes} · Tel: {phone}" if notes else f"Tel: {phone}"
 
-    city = (parsed.get("city") or None)
+    # A business listing names its municipality in structured data; trust that
+    # over whatever city the LLM read off the page.
+    city = (result.get("locality") or parsed.get("city") or None)
     # None (unknown city / no cities configured) must NOT become True: the tag
     # means "we placed it elsewhere", not "we couldn't place it".
     in_region = city_in_region(city, location)
@@ -1204,6 +1382,20 @@ async def report_node(state: ProspectingState, config: RunnableConfig) -> dict:
     # its own snapshotted GlobalPlatformSettings.serperSearchPrice — the agent
     # only reports the count, never a cost.
     metrics["serper_calls"] = serper_call_count()
+    metrics["places_calls"] = places_call_count()
+    failures = list(state.get("extract_failures") or [])
+    metrics["extract_failed"] = len(failures)
+    metrics["extract_rate_limited"] = failures.count("rate_limited")
+    balance = await serper_account_balance()
+    if balance is not None:
+        metrics["serper_balance"] = balance
+        if balance < settings.prospecting_serper_low_balance:
+            logger.warning(
+                "serper_low_balance",
+                run_id=run_id,
+                balance=balance,
+                threshold=settings.prospecting_serper_low_balance,
+            )
     metrics["iterations"] = int(state.get("iteration", 0)) + 1
     metrics["niche"] = niche_key_of(state.get("niche"))
     metrics["location"] = (state.get("location") or DEFAULT_LOCATION).get("country")

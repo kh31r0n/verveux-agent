@@ -1,12 +1,41 @@
 import hashlib
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.config import get_stream_writer
 
 _LANGUAGE_NAMES = {
     "es": "Spanish",
     "en": "English",
     "pt": "Portuguese",
 }
+
+
+def emit_quick_replies(options: list[str], allow_other: bool = False) -> None:
+    """Offer the options of a closed question as buttons (web and Moodle widget).
+
+    A stream event, not a state field: it lives for this run only, so it can
+    never leak into a later turn through the checkpointer. The reply text must
+    still end with the numbered list the backend expects —
+    ``"\n" + "\n".join(f"{n}) {option}")`` — because every channel that does not
+    draw buttons (WhatsApp, Flutter, the CRM inbox, older widgets) shows that
+    text as is; a mismatch makes the backend drop the buttons, never the text.
+    """
+    get_stream_writer()(
+        {"type": "quick_replies", "options": list(options), "allow_other": allow_other}
+    )
+
+
+def emit_pending_followup(label: str, ttl_seconds: int = 600) -> None:
+    """Keep a "still working on it" indicator up until a later message arrives.
+
+    For replies that promise an answer delivered out of band (ismael's library
+    lookup). Like ``emit_quick_replies`` it is a per-run stream event, never
+    state; the reply text must say the same in words for the channels that
+    draw no indicator. The backend caps ``ttl_seconds`` at 15 minutes.
+    """
+    get_stream_writer()(
+        {"type": "pending_followup", "label": label, "ttl_seconds": ttl_seconds}
+    )
 
 
 def latest_user_messages(state) -> list[str]:

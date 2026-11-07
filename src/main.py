@@ -4,7 +4,7 @@ import traceback
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 import structlog
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -16,7 +16,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.postgres.aio import AsyncPostgresStore  # long-term prospecting memory
 from langgraph.types import Command
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.responses import Response
 
 import asyncio
@@ -35,10 +35,28 @@ from .agents.backend_client import (
 )
 from .agents.clara import runner as clara_runner
 from .agents.clara.runner import EmailDraftRequest, EmailFollowUpRequest, EmailSyncRequest
+from .agents.pablo import insights as pablo_insights
+from .agents.pablo import jobs as pablo_jobs
+from .agents.pablo import scoring as pablo_scoring
+from .schemas.pablo import InsightsRequest, ScoreRequest
 from .agents.prospecting_nodes import DEFAULT_LOCATION
+from .providers.registry import background_model
 from .graphs.clara_graph import EMAIL_GRAPH_NAME
 from .services.gmail import GmailError
-from .services.serper import serper_call_count, start_serper_accounting
+from .services.google_places import (
+    PlacesAuthError,
+    PlacesQuotaExhaustedError,
+    places_call_count,
+    places_configured,
+    start_places_accounting,
+)
+from .services.serper import (
+    SerperAuthError,
+    SerperQuotaExhaustedError,
+    serper_account_balance,
+    serper_call_count,
+    start_serper_accounting,
+)
 from .config import settings
 from .db.postgres import (
     close_pool,
@@ -283,6 +301,10 @@ class ChatStreamRequest(BaseModel):
     # send it. When False, graphs route every non-urgent turn to
     # faq_response, which splices the {AGENT_TYPE}_OUTSIDE_HOURS prompt.
     within_business_hours: bool = True
+    # pablo (assessment) only: what happened in the attempt this turn
+    # ({kind: start|answer|continue|timeout, attempt_id, cycle_index, …}). The
+    # backend owns the attempt; the graph routes on `kind`, never on the text.
+    assessment_turn: dict = {}
 
 
 
@@ -498,6 +520,27 @@ async def _coalesced_stream(
         _checkin_turn_state(thread_id, state)
 
 
+# Graphs whose turns are events sent by the backend, not chat fragments: an
+# answer and the following "continue" must never merge into one turn, and the
+# settle window would only delay a turn the student is waiting on.
+_UNCOALESCED_CODE_NAMES = {"pablo"}
+
+
+async def _serialized_stream(
+    inputs: dict, config: dict, graph, agent_code_name: str, thread_id: str
+) -> AsyncGenerator[str, None]:
+    """One graph run per request, serialized per thread (no merging)."""
+    state = _checkout_turn_state(thread_id)
+    try:
+        async with state.lock:
+            async for event in _stream_graph(
+                inputs, config, graph=graph, agent_code_name=agent_code_name
+            ):
+                yield event
+    finally:
+        _checkin_turn_state(thread_id, state)
+
+
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
@@ -599,6 +642,27 @@ async def _stream_graph(
                         "contact_id": event_data.get("contact_id", ""),
                         "conversation_id": event_data.get("conversation_id", ""),
                         "stage_position": event_data.get("stage_position", 0),
+                    })
+
+                elif event_kind == "pending_followup":
+                    yield _sse_event({
+                        "type": "pending_followup",
+                        "label": event_data.get("label", ""),
+                        "ttl_seconds": event_data.get("ttl_seconds", 0),
+                    })
+
+                elif event_kind == "assessment":
+                    # pablo: drives the attempt's clock and the activity UI
+                    # (e.g. cycle_presented restarts the timer).
+                    yield _sse_event(event_data)
+
+                elif event_kind == "quick_replies":
+                    # Forwarded untouched: the backend validates the options
+                    # against the reply's numbered suffix and never renumbers.
+                    yield _sse_event({
+                        "type": "quick_replies",
+                        "options": event_data.get("options", []),
+                        "allow_other": event_data.get("allow_other", False),
                     })
 
             elif chunk_type == "updates":
@@ -738,26 +802,63 @@ async def metrics() -> Response:
 _prospecting_tasks: set[asyncio.Task] = set()
 
 
+def prospecting_failure(exc: Exception) -> dict:
+    """``{reason, provider?}`` for a run that raised.
+
+    The search-provider reasons are a contract with the backend, which opens a
+    platform incident and pauses every tenant's prospecting on
+    ``search_quota_exhausted`` / ``search_auth_failed`` instead of failing each
+    tenant's run, every day, into the same wall. Anything else is reported as
+    ``agent_error: <message>``.
+    """
+    if isinstance(exc, SerperQuotaExhaustedError):
+        return {"reason": "search_quota_exhausted", "provider": "serper"}
+    if isinstance(exc, PlacesQuotaExhaustedError):
+        return {"reason": "search_quota_exhausted", "provider": "google_places"}
+    if isinstance(exc, SerperAuthError):
+        return {"reason": "search_auth_failed", "provider": "serper"}
+    if isinstance(exc, PlacesAuthError):
+        return {"reason": "search_auth_failed", "provider": "google_places"}
+    return {"reason": f"agent_error: {exc}"}
+
+
+async def _checkpointed_usage(graph, config: dict) -> list[dict]:
+    """LLM usage the failed run had already checkpointed — best effort.
+
+    Those calls were made and must be billed; before 2026-10-16 the FAILED
+    report sent none (an exhausted-Serper run still paid for `refine_queries`).
+    """
+    try:
+        snapshot = await graph.aget_state(config)
+        return list((snapshot.values or {}).get("turn_usage") or [])
+    except Exception:  # noqa: BLE001 — never block the FAILED report
+        return []
+
+
 async def _run_prospecting(
     graph, inputs: dict, config: dict, run_id: str
 ) -> None:
     """Run one prospecting graph to completion in the background.
 
     The graph's ``report`` node reports COMPLETED on success. If the run raises
-    before reaching it, mark the run FAILED here so the backend's daily lock is
-    released and the (bounded) usage that did happen is not lost. The backend
-    reaper is the final backstop if even this report never lands.
+    before reaching it, mark the run FAILED here — with a reason the backend can
+    act on (see :func:`prospecting_failure`) — so the daily lock is released and
+    the usage that did happen is billed. The backend reaper is the final
+    backstop if even this report never lands.
     """
-    # Install the run-scoped Serper credit counter HERE, in the parent
-    # coroutine: LangGraph node tasks each get a copy of the context, so a
-    # ContextVar set inside a node would never be visible to `report_node`.
+    # Install the run-scoped credit counters HERE, in the parent coroutine:
+    # LangGraph node tasks each get a copy of the context, so a ContextVar set
+    # inside a node would never be visible to `report_node`.
     start_serper_accounting()
+    start_places_accounting()
     try:
         await graph.ainvoke(inputs, config)
     except Exception as exc:  # noqa: BLE001 — background task must not crash the loop
+        failure = prospecting_failure(exc)
         logger.error(
             "prospecting_run_failed",
             run_id=run_id,
+            reason=failure["reason"],
             error=str(exc),
             traceback=traceback.format_exc(),
         )
@@ -765,12 +866,14 @@ async def _run_prospecting(
             await report_prospecting_run(
                 run_id,
                 "FAILED",
-                # Serper credits were spent even though the run failed, so the
+                # Search credits were spent even though the run failed, so the
                 # platform cost report must still see them.
                 metrics={
-                    "reason": f"agent_error: {exc}",
+                    **failure,
                     "serper_calls": serper_call_count(),
+                    "places_calls": places_call_count(),
                 },
+                usage=await _checkpointed_usage(graph, config),
             )
         except Exception:  # noqa: BLE001
             logger.error("prospecting_fail_report_failed", run_id=run_id)
@@ -792,6 +895,34 @@ def prospecting_thread_id(tenant_id: str, run_id: str, run_date: str) -> str:
     clean. run_date is the fallback for older backends that omit run_id.
     """
     return f"prospecting:{tenant_id}:{run_id or run_date}"
+
+
+@app.get("/prospecting/search-health")
+async def prospecting_search_health(
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    """Can aurora search right now? Free to call — bills no search credit.
+
+    The backend asks this before its daily sweep while a search-provider
+    incident is open, and resolves the incident once the provider reports
+    ``ok: true``. ``ok: null`` means "could not tell" (keep the pause).
+
+    Serper exposes its balance on the free ``GET /account``. Google Places has
+    no free quota probe, so it reports ``ok`` when a key is configured: a daily
+    quota resets on its own, and if it has not the next run reopens the
+    incident.
+    """
+    balance = await serper_account_balance()
+    return {
+        "serper": {
+            "ok": None if balance is None else balance > 0,
+            "balance": balance,
+        },
+        "google_places": {
+            "ok": places_configured(),
+            "configured": places_configured(),
+        },
+    }
 
 
 @app.post("/prospecting/run", status_code=202)
@@ -827,7 +958,8 @@ async def prospecting_run(
     try:
         creds = await fetch_agent_credentials(req.tenant_id)
         llm_provider = creds.get("provider", "OPENAI").lower()
-        llm_model = creds.get("model") or ""
+        # Not a chat agent: the platform's cheap model for this provider.
+        llm_model = background_model(creds)
         if llm_provider == "openai":
             provider_config["openai_api_key"] = creds.get("apiKey", "")
         elif llm_provider == "anthropic":
@@ -950,7 +1082,8 @@ async def enrichment_run(
     try:
         creds = await fetch_agent_credentials(req.tenant_id)
         llm_provider = creds.get("provider", "OPENAI").lower()
-        llm_model = creds.get("model") or ""
+        # Not a chat agent: the platform's cheap model for this provider.
+        llm_model = background_model(creds)
         if llm_provider == "openai":
             provider_config["openai_api_key"] = creds.get("apiKey", "")
         elif llm_provider == "anthropic":
@@ -1107,6 +1240,47 @@ async def email_drafts(
         )
 
 
+# ---------------------------------------------------------------------------
+# Assessment agent (pablo). The backend starts scoring once the student's UX
+# survey is submitted or skipped, and the class report once every student has
+# finished; both report back through /internal/assessment/*.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/assessment/score", status_code=202)
+async def assessment_score(
+    req: ScoreRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    if req.mode not in ("publish", "replay"):
+        raise HTTPException(status_code=400, detail="mode must be publish or replay")
+    key = f"score:{req.attempt_id}:{req.scoring_version}:{req.mode}:{req.replay_id}"
+    started = pablo_jobs.spawn(key, pablo_scoring.run(req))
+    logger.info(
+        "assessment_score_accepted",
+        attempt_id=req.attempt_id,
+        scoring_version=req.scoring_version,
+        mode=req.mode,
+        duplicate=not started,
+    )
+    return {"accepted": True, "attempt_id": req.attempt_id, "duplicate": not started}
+
+
+@app.post("/assessment/insights", status_code=202)
+async def assessment_insights(
+    req: InsightsRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    started = pablo_jobs.spawn(f"insights:{req.report_id}", pablo_insights.run(req))
+    logger.info(
+        "assessment_insights_accepted",
+        assessment_id=req.assessment_id,
+        report_id=req.report_id,
+        duplicate=not started,
+    )
+    return {"accepted": True, "report_id": req.report_id, "duplicate": not started}
+
+
 @app.post("/chat/stream")
 async def chat_stream(
     req: ChatStreamRequest,
@@ -1151,6 +1325,11 @@ async def chat_stream(
     # never logged or emitted via SSE (stripped by _SECRET_KEYS).
     llm_provider = req.llm_provider or "openai"
     llm_model = req.llm_model or ""
+    # The platform's cheap model for the tenant's provider. Chat graphs keep
+    # `llm_model` for what a customer reads; a graph may opt into this one for
+    # steps where speed matters more (ismael's whole chat turn). Empty = no
+    # split: `resolve_background_model` falls back to `llm_model`.
+    llm_background_model = ""
     provider_config: dict = {}
 
     if req.tenant_id:
@@ -1158,6 +1337,7 @@ async def chat_stream(
             creds = await fetch_agent_credentials(req.tenant_id)
             llm_provider = creds.get("provider", "OPENAI").lower()
             llm_model = creds.get("model") or llm_model
+            llm_background_model = creds.get("backgroundModel") or ""
 
             if llm_provider == "openai":
                 provider_config["openai_api_key"] = creds.get("apiKey", "")
@@ -1198,6 +1378,7 @@ async def chat_stream(
             "thread_id": thread_id,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
+            "llm_background_model": llm_background_model,
             "prompts": prompts_dict,
             "turn_request_id": req.turn_request_id,
             "normalization_enabled": req.query_normalization_enabled,
@@ -1215,7 +1396,11 @@ async def chat_stream(
         "agent_persona_name": req.agent_persona_name,
         "agent_version": req.agent_version,
         "capabilities": {"agent_type": agent_type, "capabilities": req.capabilities},
-        "domain_state": {},
+        # Reset every request: a backend turn (pablo's assessment_turn) must
+        # never be replayed from the checkpoint.
+        "domain_state": (
+            {"assessment_turn": req.assessment_turn} if req.assessment_turn else {}
+        ),
         "product_catalog": req.product_catalog,
         # Overwritten every turn (like product_catalog) so an admin flipping the
         # CATALOG toggle takes effect on the next turn — the checkpointer can't
@@ -1265,6 +1450,7 @@ async def chat_stream(
         agent_type=agent_type,
         provider=llm_provider,
         model=llm_model,
+        background_model=llm_background_model,
         catalog_count=len(req.product_catalog),
         catalog_access_enabled=req.catalog_access_enabled,
         faq_count=len(req.rawFaqs or []),
@@ -1276,6 +1462,13 @@ async def chat_stream(
             if v.id
         },
     )
+
+    if code_name in _UNCOALESCED_CODE_NAMES:
+        return StreamingResponse(
+            _serialized_stream(inputs, config, graph, code_name, thread_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     return StreamingResponse(
         _coalesced_stream(
@@ -1402,3 +1595,70 @@ async def chat_resume(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class CalebRunRequest(BaseModel):
+    tenant_id: str = Field(..., min_length=1, max_length=128)
+    study_run_id: str = Field(..., min_length=1, max_length=128)
+    config: dict
+    internal_cost_cap_usd: float = Field(default=11.7, gt=0)
+    agent_code_name: str | None = Field(default="caleb", max_length=64)
+
+
+_caleb_tasks: set[asyncio.Task] = set()
+
+
+async def _run_caleb(
+    graph: Any, inputs: dict, config: dict, study_run_id: str
+) -> None:
+    try:
+        await graph.ainvoke(inputs, config=config)
+    except Exception as exc:
+        logger.error(
+            "caleb_run_failed",
+            study_run_id=study_run_id,
+            error=str(exc),
+            exc_info=True,
+        )
+
+
+@app.post("/caleb/run", status_code=202)
+async def caleb_run(
+    req: CalebRunRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    from .caleb.schema import validate_study_config_v1
+
+    valid, _model, errors = validate_study_config_v1(req.config)
+    if not valid:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Invalid StudyConfig v1", "errors": errors},
+        )
+
+    code_name = (req.agent_code_name or "caleb").strip().lower()
+    try:
+        graph = await get_or_compile_graph(code_name)
+    except UnknownCodeNameError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    thread_id = f"caleb:{req.tenant_id}:{req.study_run_id}"
+    config = {"configurable": {"thread_id": thread_id}}
+    inputs = {
+        "tenant_id": req.tenant_id,
+        "study_run_id": req.study_run_id,
+        "config": req.config,
+        "internal_cost_cap_usd": req.internal_cost_cap_usd,
+    }
+
+    task = asyncio.create_task(_run_caleb(graph, inputs, config, req.study_run_id))
+    _caleb_tasks.add(task)
+    task.add_done_callback(_caleb_tasks.discard)
+    logger.info(
+        "caleb_run_accepted",
+        study_run_id=req.study_run_id,
+        tenant_id=req.tenant_id,
+        code_name=code_name,
+    )
+    return {"accepted": True, "study_run_id": req.study_run_id}
+

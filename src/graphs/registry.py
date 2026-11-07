@@ -24,11 +24,13 @@ from typing import Callable, Iterable, Mapping
 import structlog
 
 from .appointments_graph import build_appointments_graph
+from .caleb_graph import build_caleb_graph
 from .camila_graph import build_camila_graph
 from .clara_graph import build_clara_graph
 from .enrichment_graph import build_enrichment_graph
 from .ismael_graph import build_ismael_graph
 from .leads_graph import build_leads_graph
+from .pablo_graph import build_pablo_graph
 from .prospecting_graph import build_prospecting_graph
 from .restaurant_graph import build_restaurant_graph
 from .sales_graph import build_sales_graph
@@ -53,6 +55,8 @@ CODE_NAME_REGISTRY: dict[str, GraphBuilder] = {
     "sherlock": build_enrichment_graph,
     "clara": build_clara_graph,
     "ismael": build_ismael_graph,
+    "pablo": build_pablo_graph,
+    "caleb": build_caleb_graph,
 }
 
 
@@ -91,6 +95,8 @@ AGENT_TYPE_FALLBACK: Mapping[str, str] = {
     "prospecting": "aurora",
     "enrichment": "sherlock",
     "theology": "ismael",
+    "market-study": "caleb",
+    "market_study": "caleb",
 }
 
 

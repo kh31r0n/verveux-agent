@@ -111,6 +111,27 @@ email_sync_runs_total = Counter(
     ["agent_code_name", "outcome"],
 )
 
+# ── Theology agent (ismael) ──────────────────────────────────────────────────
+# outcome: answered | unresolved | no_results | no_pages | search_failed |
+# timeout | error
+pablo_feedback_reference_leaks_total = Counter(
+    "pablo_feedback_reference_leaks_total",
+    "Feedback that kept copying the teacher's reference and was rewritten without it",
+)
+
+ismael_research_total = Counter(
+    "ismael_research_total",
+    "Web lookups of a reported Moodle error by ismael's support branch",
+    ["outcome"],
+)
+
+# kind: search | page · result: hit | miss
+ismael_research_cache_total = Counter(
+    "ismael_research_cache_total",
+    "ismael research cache lookups (a hit spends no Serper credit)",
+    ["kind", "result"],
+)
+
 
 def record_node_invocation(node: str, agent_code_name: str = "unknown") -> None:
     agent_node_invocations_total.labels(

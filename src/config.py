@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +18,13 @@ class Settings(BaseSettings):
     )
 
     database_url: str
+    # asyncpg pool bounds (the LangGraph checkpointer and store each hold one
+    # more connection of their own). Production's db-f1-micro is shared with
+    # the backend, rocky and the WhatsApp gateway, and this service scales to 3
+    # instances: the old fixed 2..10 per instance helped exhaust its connection
+    # limit on 2026-10-16. Set per deployment.
+    database_pool_min: int = 1
+    database_pool_max: int = 5
     # ── Service-to-service authentication (src/auth/service_auth.py) ─────────
     # `service_auth_audience` is this service's own Cloud Run URL: the `aud`
     # claim callers must request their ID token for. Empty disables OIDC
@@ -86,7 +95,26 @@ class Settings(BaseSettings):
     # Caps how many extract_and_enrich branches of the Send fan-out run at once.
     # Applied to the prospecting graph ONLY when the tenant's provider is Gemini
     # (its RPM quota is the tight one); other providers keep unbounded fan-out.
-    prospecting_gemini_extract_concurrency: int = 5
+    # Lowered from 5 on 2026-10-16: at 5 a run still lost ~17 extractions to
+    # 429 RESOURCE_EXHAUSTED after the provider's own retries (2026-10-13).
+    prospecting_gemini_extract_concurrency: int = 3
+    # ── Prospecting search sources & credit control ──────────────────────────
+    # Business listings come from Google Places API (New) when its key is set
+    # ("google"); "serper" keeps Serper /places; "off" skips listings. Without a
+    # key "google" falls back to "serper" (logged at run start).
+    google_places_api_key: str = ""
+    prospecting_places_provider: Literal["google", "serper", "off"] = "google"
+    # Rows per Places text search. Every row becomes one extraction LLM call, so
+    # this is a cost knob, not just a recall one; 10 matches what Serper gave.
+    prospecting_places_page_size: int = 10
+    # Hard cap on billable Serper calls in ONE run (retries and geo fallbacks
+    # included). Healthy runs spend 20-40; the cap stops a misbehaving one.
+    prospecting_max_serper_calls_per_run: int = 60
+    # Warn (`serper_low_balance`) when the account drops below this many credits.
+    prospecting_serper_low_balance: int = 300
+    # Extra registrable domains never sent to extraction, comma-separated, on
+    # top of the built-in list in prospecting_nodes._BLOCKED_DOMAINS.
+    prospecting_blocked_domains: str = ""
     # ── Prospecting self-improvement ─────────────────────────────────────────
     # In-run refinement loop: when a run's quality survivors fall short of
     # `prospecting_min_quality_prospects`, the graph refines its own queries and
@@ -168,6 +196,72 @@ class Settings(BaseSettings):
     clara_max_body_chars: int = 12_000
     clara_max_messages_per_sync: int = 25
     clara_initial_backfill_query: str = "in:inbox newer_than:1d"
+    # ismael: every chat-turn LLM call is bounded so a slow or hung Gemini
+    # request can never outlive the backend's 60 s turn — a call that did
+    # (no timeout, unbounded thinking) kept the conversation's lock for ~5 min
+    # and every later message timed out behind it (2026-10-06). Budgets: the
+    # classifiers and the FAQ/draft rewrites need no thinking, and support
+    # none either (an eval on Vertex showed no quality gain from 1024 tokens,
+    # only latency). Worst path (step + triage + answer + settle) < 60 s.
+    # Vertex answered a 66-token triage in 15 s once (and in 1.5 s minutes
+    # later): the triage deadline leaves room for that, and a miss still
+    # routes by keyword (common.fallback_intent) instead of to the library.
+    ismael_timeout_triage_seconds: float = 20.0
+    ismael_timeout_step_seconds: float = 8.0
+    ismael_timeout_answer_seconds: float = 25.0
+    ismael_thinking_classify: int | None = 0
+    ismael_thinking_support: int | None = 0
+    ismael_thinking_answer: int | None = 0
+    # ismael's support branch looks up a concrete error it cannot explain
+    # (a Moodle restore error on 2026-10-18 got a generic ticket) in Moodle's
+    # own documentation: one Serper query (~1 credit) restricted to these
+    # domains, then up to `ismael_research_max_pages` pages read through the
+    # SSRF-hardened fetcher. Search + fetch share one deadline, so with the
+    # second answer call the turn stays inside the backend's 60 s.
+    ismael_research_enabled: bool = True
+    ismael_research_domains: str = "docs.moodle.org,moodle.org,tracker.moodle.org"
+    ismael_research_timeout_seconds: float = 12.0
+    ismael_research_max_pages: int = 2
+    ismael_research_page_chars: int = 6000
+    # Every moodle.org host answers our fetcher with a Cloudflare challenge
+    # (403), so a page that refuses it is read through Serper's scrape
+    # endpoint instead — at ~10 credits a page, only this many per lookup
+    # (the top result first); the rest keep their search snippet.
+    ismael_research_scrape_pages: int = 1
+    # Searches and page texts are cached platform-wide in the shared store
+    # (public documentation): a repeated error then spends no credits. A
+    # search that found nothing is retried sooner, the docs may gain a page.
+    ismael_research_cache_days: float = 30.0
+    ismael_research_negative_cache_days: float = 7.0
+    # pablo (assessment): a chat turn only composes a question or records an
+    # answer, both while the attempt's timer is paused, but still inside the
+    # backend's 60 s turn. Scoring and feedback run as background jobs.
+    pablo_timeout_compose_seconds: float = 30.0
+    # The acknowledgement's quote (one short call while the timer is paused);
+    # past this the plain acknowledgement goes out.
+    pablo_timeout_ack_seconds: float = 6.0
+    pablo_thinking_ack: int | None = 0
+    # The follow-up question (one call per answer, tenant model); past this a
+    # generic question in code goes out instead.
+    pablo_timeout_followup_seconds: float = 8.0
+    pablo_thinking_followup: int | None = 0
+    pablo_timeout_score_seconds: float = 60.0
+    pablo_timeout_feedback_seconds: float = 60.0
+    pablo_thinking_compose: int | None = 0
+    pablo_thinking_score: int | None = None
+    pablo_score_retries: int = 1
+    pablo_max_calibration_examples: int = 5
+    pablo_job_concurrency: int = 4
+    # Speech-to-Text v2 (ADC). Empty project = the ADC project.
+    pablo_stt_project_id: str = ""
+    pablo_stt_location: str = "global"
+    pablo_stt_model: str = "long"
+    pablo_stt_languages: str = "es:es-US,en:en-US"
+    pablo_stt_timeout_seconds: float = 40.0
+    pablo_stt_attempts: int = 3
+    pablo_max_audio_bytes: int = 10 * 1024 * 1024
+    # Local stacks serve uploads over http; production URLs are pre-signed https.
+    pablo_allow_http_audio: bool = False
     clara_thinking_triage: int | None = 0
     clara_thinking_extract_task: int | None = 0
     clara_thinking_draft: int | None = None

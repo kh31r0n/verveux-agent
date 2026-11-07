@@ -14,6 +14,9 @@ in AWS that is stopped whenever nobody uses it, so this module does two things:
   ``done`` (with the answer) or ``failed``. Auth is a Brain service key sent as
   ``X-Api-Key``; the key is bound to one Brain tenant, which is therefore never
   sent.
+* **List the library** (`list_documents`): titles and authors, so a question
+  that names a book can be asked of that one document (``filters``). Brain
+  searches chunk text only — a book's own title is never matched otherwise.
 
 boto3 is synchronous, so the two AWS calls run in a worker thread.
 """
@@ -138,13 +141,68 @@ async def wait_healthy(deadline: float, restart_every: float = 30.0) -> bool:
     return False
 
 
-async def ask(text: str) -> str:
-    """Hand a question to Brain; returns its question id."""
+# The library changes when someone indexes a book, not between two questions.
+_CATALOG_TTL_SECONDS = 3600.0
+_catalog: tuple[float, list[dict]] | None = None
+
+
+def _catalog_entry(d: dict) -> dict:
+    metadata = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+    contributors = [
+        str(c["name"]) for c in metadata.get("contributors") or []
+        if isinstance(c, dict) and c.get("name")
+    ]
+    year = metadata.get("published_year")
+    return {
+        "id": str(d["id"]),
+        "title": d.get("title") or "",
+        "author": d.get("author") or "",
+        "subtitle": d.get("subtitle") or "",
+        "contributors": contributors,
+        "content_type": d.get("content_type") or "",
+        "published_year": year if isinstance(year, int) else None,
+    }
+
+
+async def list_documents() -> list[dict]:
+    """``[{id, title, author, subtitle, contributors, content_type,
+    published_year}]`` of the library's present documents, cached.
+
+    The record fields come from Brain's ficha (2026-10): absent on an older
+    Brain, so every one but ``id``/``title``/``author`` defaults to empty.
+
+    Raises :class:`BrainError` when Brain refuses (an older Brain lets the
+    service key reach ``/ask`` only); callers then ask without a filter.
+    """
+    global _catalog
+    if _catalog and time.monotonic() - _catalog[0] < _CATALOG_TTL_SECONDS:
+        return _catalog[1]
+    url = f"{settings.brain_api_url}/libraries/{settings.brain_library_id}/documents"
+    async with httpx.AsyncClient(timeout=settings.brain_request_timeout_seconds) as c:
+        resp = await c.get(url, headers=_headers())
+    if resp.status_code != 200:
+        raise BrainError(f"GET /libraries/…/documents → {resp.status_code}: {resp.text[:300]}")
+    documents = [
+        _catalog_entry(d)
+        for d in (resp.json().get("documents") or [])
+        if isinstance(d, dict) and d.get("id")
+    ]
+    _catalog = (time.monotonic(), documents)
+    return documents
+
+
+async def ask(text: str, filters: dict[str, str] | None = None) -> str:
+    """Hand a question to Brain; returns its question id.
+
+    ``filters`` narrows retrieval (``{"document_id": …}``: one book).
+    """
     body: dict[str, Any] = {
         "library_id": settings.brain_library_id,
         "text": text,
         "effort": settings.brain_ask_effort,
     }
+    if filters:
+        body["filters"] = filters
     async with httpx.AsyncClient(timeout=settings.brain_request_timeout_seconds) as c:
         resp = await c.post(f"{settings.brain_api_url}/ask", json=body, headers=_headers())
     if resp.status_code != 200:

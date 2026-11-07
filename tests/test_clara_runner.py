@@ -250,6 +250,21 @@ async def test_credentials_failure_never_falls_back_to_the_platform_key():
             await runner.llm_configurable("ten")
 
 
+async def test_carries_the_tenants_model_and_the_cheap_one():
+    creds = {"provider": "GEMINI", "model": "gemini-3.5-flash", "backgroundModel": "gemini-3.1-flash-lite"}
+    with patch.object(runner, "fetch_agent_credentials", AsyncMock(return_value=creds)):
+        cfg = await runner.llm_configurable("ten")
+    assert cfg["llm_model"] == "gemini-3.5-flash"
+    assert cfg["llm_background_model"] == "gemini-3.1-flash-lite"
+
+
+async def test_an_older_backend_without_background_model_means_no_split():
+    creds = {"provider": "GEMINI", "model": "gemini-3.5-flash"}
+    with patch.object(runner, "fetch_agent_credentials", AsyncMock(return_value=creds)):
+        cfg = await runner.llm_configurable("ten")
+    assert cfg["llm_background_model"] == "gemini-3.5-flash"
+
+
 # ── sync_mailbox ─────────────────────────────────────────────────────────────
 
 

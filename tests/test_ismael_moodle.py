@@ -851,10 +851,29 @@ class TestTicketOnce:
         assert "Adjunta una captura JPG, PNG o PDF de hasta 2 MB." in reply
         assert reply.endswith(text("support_form_ask_error", "es"))
         assert "https://ryca.unidadeducativa.org/soporte" not in reply
-        # A bare "Sale error" right after is still about the form.
+        # A bare "Sale error" right after is still about the form — and the
+        # tips are not pasted a second time (four times on 2026-11-03).
         _, reply, _ = await go(graph, "t2", "Sale error")
-        assert reply.startswith(text("support_form_failed", "es"))
+        assert reply.startswith(text("support_form_broken", "es"))
+        assert "uebogota.matriculas@casaroca.org" in reply
+        assert text("support_form_failed", "es") not in reply
         assert "1020304050" not in reply
+
+    async def test_an_error_page_from_the_forms_server_skips_the_tips(self, b):
+        graph = build_ismael_graph(MemorySaver())
+        await _ticket_given(b, graph, "t2b")
+        _, reply, _ = await go(
+            graph, "t2b", "No permite enviar el formulario.... Dice: No se encontro la clase App/Http/controladores/"
+        )
+        assert reply.startswith(text("support_form_broken", "es"))
+        assert "uebogota.matriculas@casaroca.org" in reply
+
+    async def test_without_contacts_the_broken_form_points_to_the_office(self, b):
+        ctx = {k: v for k, v in CTX.items() if k != "lms_other_contacts"}
+        graph = build_ismael_graph(MemorySaver())
+        await _ticket_given(b, graph, "t2c")
+        _, reply, _ = await go(graph, "t2c", "Error 500 al enviar el formulario", ctx=ctx)
+        assert reply == f"{text('support_form_broken', 'es')} {text('support_form_no_contacts', 'es')}"
 
     async def test_the_models_own_form_failed_gets_the_same_tips(self, b):
         graph = build_ismael_graph(MemorySaver())
@@ -971,3 +990,82 @@ class TestNamedCourse:
         await go(graph, "n3", "no")
         _, reply, _ = await go(graph, "n3", "Le escribo yo")
         assert reply == text("teacher_none_no_url", "es", course="Teología I")
+
+
+# ── Third round (2026-11-07) ─────────────────────────────────────────────────
+
+
+class TestThirdRound:
+    async def test_pablos_recording_message_is_explained_to_the_model(self, b):
+        triage(b, IsmaelIntent.MOODLE_SUPPORT, "no puede grabar")
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="Permite el micrófono.")
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p1", "No se pudo usar la grabación. Inténtalo de nuevo o escribe tu respuesta.")
+        system = next(m for name, m in b["provider"].calls if name == "MoodleSupportResult")[0]["content"]
+        assert "Mensaje reconocido" in system and "evaluación conversacional" in system
+
+    async def test_an_ordinary_message_gets_no_activity_block(self, b):
+        triage(b, IsmaelIntent.MOODLE_SUPPORT, "foro")
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(reply="Así.")
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p2", "¿cómo participo en el foro?")
+        system = next(m for name, m in b["provider"].calls if name == "MoodleSupportResult")[0]["content"]
+        assert "Mensaje reconocido" not in system
+
+    async def test_a_teacher_is_never_sent_to_their_teacher(self, b):
+        ctx = {**CTX, "lms_is_teacher": "true"}
+        triage(b, IsmaelIntent.MOODLE_SUPPORT, "en qué unidad vamos")
+        graph = build_ismael_graph(MemorySaver())
+        await clarify_first(b, graph, "p3", "¿En qué unidad temática vamos?", ctx=ctx)
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
+            reply="Revisa la estructura de secciones del curso.", outcome=MoodleSupportOutcome.TEACHER
+        )
+        nodes, reply, _ = await go(graph, "p3", "TEOLOGÍA BÁSICA-IBLI-I-G2-2026-2", ctx=ctx)
+        assert nodes == ["ismael_triage", "ismael_moodle_support"]
+        assert reply == "Revisa la estructura de secciones del curso."
+        system = next(m for name, m in b["provider"].calls if name == "MoodleSupportResult")[0]["content"]
+        assert text("support_user_teaches", "es") in system
+        b["lookup"].assert_not_called()
+
+    async def test_the_teacher_did_not_reply_goes_to_the_institution(self, b):
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p4", "quiero hablar con mi profesor")
+        _, reply, _ = await go(graph, "p4", "escribí al profesor pero no me respondió")
+        assert reply.startswith(text("teacher_no_reply", "es"))
+        assert "uebogota.matriculas@casaroca.org" in reply
+        b["lookup"].assert_not_called()
+
+    async def test_support_does_not_send_back_to_a_teacher_who_does_not_reply(self, b):
+        triage(b, IsmaelIntent.MOODLE_SUPPORT, "no puede presentar")
+        graph = build_ismael_graph(MemorySaver())
+        await clarify_first(b, graph, "p5", "no alcancé a presentar una evaluación")
+        b["provider"].results[MoodleSupportResult] = MoodleSupportResult(
+            reply="Eso lo revisa tu profesor.", outcome=MoodleSupportOutcome.TEACHER
+        )
+        nodes, reply, _ = await go(graph, "p5", "le escribí al profesor y no contesta")
+        assert nodes == ["ismael_triage", "ismael_moodle_support"]
+        assert reply.startswith(text("teacher_no_reply", "es"))
+
+    async def test_no_offer_again_once_the_teachers_contact_was_given(self, b):
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        graph = build_ismael_graph(MemorySaver())
+        config = {"configurable": {"thread_id": "p6"}}
+        await go(graph, "p6", "quiero hablar con mi profesor")
+        snapshot = await graph.aget_state(config)
+        ismael = dict(snapshot.values["ismael"])
+        ismael["teacher_given"] = {"name": "Prof. Juan", "at": __import__("time").time()}
+        ismael.pop("teacher", None)
+        await graph.aupdate_state(config, {"ismael": ismael})
+        _, reply, _ = await go(graph, "p6", "quiero escribirle otra vez al profesor")
+        assert not reply.startswith(text("teacher_offer", "es"))
+
+    async def test_two_unreadable_answers_to_the_offer_go_to_the_teacher(self, b):
+        triage(b, IsmaelIntent.CONTACT_TEACHER)
+        b["provider"].results[TeacherStepAnswer] = TeacherStepAnswer(choice=0)
+        graph = build_ismael_graph(MemorySaver())
+        await go(graph, "p7", "quiero hablar con mi profesor")
+        _, reply, _ = await go(graph, "p7", "cuestinoario motivos (20%)")
+        assert reply.startswith(text("teacher_offer", "es"))
+        _, reply, _ = await go(graph, "p7", "hermeneutica")
+        assert not reply.startswith(text("teacher_offer", "es"))

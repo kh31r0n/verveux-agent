@@ -127,7 +127,7 @@ _AGENT_PROFILES: dict[str, tuple[str, dict[str, str]]] = {
         },
     ),
     "ismael": (
-        "Ismael",
+        "Salomón",
         {
             "es": "el asistente de teología cristiana",
             "en": "the Christian theology assistant",

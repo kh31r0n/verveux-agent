@@ -31,6 +31,20 @@ in code, never the ticket again — also when the model says ``needs_ticket``.
 
 A concrete error the model cannot explain is looked up in Moodle's
 documentation first (``research.py``); the reply then cites the page it used.
+
+Third round (2026-11-07, after Casa Roca's 21-10 → 05-11 conversations):
+
+- The form tips go out once per case. A second failure, or an error page from
+  the form's own server («No se encontró la clase App/Http/controladores…»),
+  gets the institution's other contacts instead: on 2026-11-03 a student got
+  the same tips four times for a form that was broken on the school's side.
+- A message from our own assessment activity (Pablo, ``mod_vervuxassess``) is
+  recognised in code and explained (``ACTIVITY_MESSAGES``): «No se pudo usar la
+  grabación…» earned a technical ticket on 2026-11-02.
+- A teacher (``lms_is_teacher``, from the backend) is never told to contact
+  their teacher: on 2026-10-29 the director of studies was.
+- «Le escribí y no me responde» never hands over to the teacher again
+  (``teacher.teacher_did_not_reply``).
 """
 
 from __future__ import annotations
@@ -90,7 +104,80 @@ def support_data_block(ctx: dict) -> str:
     if ctx.get("lms_teacher_messaging") == "false":
         # Only the backend's explicit "false": an absent key may be an older plugin.
         lines.append(f"- {text('support_messaging_off', 'es')}")
+    if user_teaches(ctx):
+        lines.append(f"- {text('support_user_teaches', 'es')}")
+    lines.append(f"- {text('support_roles_rule', 'es')}")
     return "\n\nDatos de soporte de la institución:\n" + "\n".join(lines)
+
+
+def user_teaches(ctx: dict) -> bool:
+    """The user teaches in the classroom (the backend checks the course
+    contacts the plugin signed), so "ask your teacher" is never the answer."""
+    return str(ctx.get("lms_is_teacher") or "").lower() == "true"
+
+
+# Messages of our own assessment activity (Pablo, mod_vervuxassess), folded
+# prefixes of its lang strings → what it means and what to do. They are not
+# Moodle errors and the school's technical support cannot fix them.
+ACTIVITY_MESSAGES: tuple[tuple[str, str], ...] = (
+    (
+        "no se pudo usar la grabacion",
+        "«No se pudo usar la grabación…» es un aviso de la actividad de evaluación "
+        "conversacional del aula (Pablo), no un error de Moodle: el navegador no dio acceso "
+        "al micrófono o la grabación no se pudo subir. Qué hacer: permitir el micrófono para "
+        "este sitio (el ícono del candado junto a la dirección), cerrar otras aplicaciones que "
+        "lo estén usando, probar en Chrome actualizado o, si no funciona, escribir la "
+        "respuesta en el cuadro de texto, que vale igual. No es motivo de ticket en el primer "
+        "mensaje.",
+    ),
+    (
+        "no pudimos comunicarnos con el servidor",
+        "«No pudimos comunicarnos con el servidor…» es un aviso de la actividad de evaluación "
+        "conversacional (Pablo): se cortó la conexión. Qué hacer: revisar la conexión a "
+        "internet y volver a intentar; la respuesta no se pierde si vuelve a la actividad.",
+    ),
+    (
+        "la actividad aun no esta lista",
+        "«La actividad aún no está lista» lo muestra la actividad de evaluación conversacional "
+        "(Pablo) cuando el profesor no terminó de configurarla: es del profesor, no de soporte "
+        "técnico.",
+    ),
+    (
+        "no te quedan intentos",
+        "«No te quedan intentos» lo muestra la actividad de evaluación conversacional (Pablo): "
+        "solo el profesor puede dar otro intento.",
+    ),
+)
+
+
+def activity_message_block(message: str) -> str:
+    folded = fold(message)
+    facts = [fact for prefix, fact in ACTIVITY_MESSAGES if prefix in folded]
+    if not facts:
+        return ""
+    return "\n\nMensaje reconocido:\n" + "\n".join(f"- {fact}" for fact in facts)
+
+
+# An error page from the support form's own server: the form is broken on the
+# institution's side, so tips about screenshots cannot help.
+_SERVER_ERROR = re.compile(
+    r"app[/\\]http|controlador|no se encontr[oó] la clase|class .* not found|"
+    r"error\s*50\d|server error|exception|sqlstate|stack ?trace",
+    re.IGNORECASE,
+)
+
+
+def form_server_error(message: str) -> bool:
+    return bool(_SERVER_ERROR.search(message or ""))
+
+
+def form_still_failing_message(ctx: dict, lang: str) -> str:
+    """The form failed again, or its server errors: stop the tips, give a way out."""
+    if ctx.get("lms_other_contacts"):
+        way_out = text("support_form_contacts", lang, contacts=ctx["lms_other_contacts"])
+    else:
+        way_out = text("support_form_no_contacts", lang)
+    return f"{text('support_form_broken', lang)} {way_out}"
 
 
 def ticket_block(ctx: dict, description: str, lang: str) -> str:
@@ -259,6 +346,7 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
         + case_block(case)
     )
     user_text = handed_over or latest_user_text(state) or question
+    system += activity_message_block(user_text)
     messages = [
         {"role": "system", "content": system},
         *history_messages(state),
@@ -286,9 +374,17 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
         logger.warning("ismael_moodle_support_failed", error=str(exc) or type(exc).__name__)
         result = fallback_support_result(ctx, question, lang)
 
-    if reports_form_failure(user_text, case):
+    if reports_form_failure(user_text, case) or (
+        case.get("ticket_given_at") and form_server_error(user_text)
+    ):
         # The model may still say "needs_ticket": the form is what failed.
         result = MoodleSupportResult(reply=result.reply, outcome=MoodleSupportOutcome.FORM_FAILED)
+    if result.outcome == MoodleSupportOutcome.TEACHER and (
+        user_teaches(ctx) or teacher.teacher_did_not_reply(user_text)
+    ):
+        # A teacher is not sent to "their teacher", and a student whose teacher
+        # does not answer is not sent back to them.
+        result = _not_the_teacher(result, ctx, user_text, lang)
     result = hold_escalation(result, case, lang)
     logger.info(
         "ismael_moodle_support",
@@ -306,8 +402,11 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
     if result.outcome == MoodleSupportOutcome.ASK:
         message = ask_message(result, lang)
     elif result.outcome == MoodleSupportOutcome.FORM_FAILED:
+        if case.get("form_failed") or form_server_error(user_text):
+            message = form_still_failing_message(ctx, lang)
+        else:
+            message = form_failed_message(ctx, lang)
         case["form_failed"] = True
-        message = form_failed_message(ctx, lang)
         mark_helped(ismael)
     else:
         message = result.reply.strip()
@@ -328,6 +427,19 @@ async def ismael_moodle_support_node(state: AgentState, config: RunnableConfig) 
             case["ticket_given_at"] = time.time()
         message = f"{message}\n\n{block}".strip()
     return reply(message, ismael=ismael, turn_usage=usage, ismael_route="done")
+
+
+def _not_the_teacher(
+    result: MoodleSupportResult, ctx: dict, user_text: str, lang: str
+) -> MoodleSupportResult:
+    if user_teaches(ctx):
+        return MoodleSupportResult(
+            reply=result.reply.strip() or text("support_clarify", lang),
+            outcome=MoodleSupportOutcome.ANSWERED if result.reply.strip() else MoodleSupportOutcome.ASK,
+        )
+    return MoodleSupportResult(
+        reply=teacher.no_reply_message(ctx, lang), outcome=MoodleSupportOutcome.ANSWERED
+    )
 
 
 # The research pass must leave room for its second call inside the backend's

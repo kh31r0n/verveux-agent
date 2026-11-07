@@ -98,6 +98,42 @@ def from_support(reason: str) -> dict:
     return flow
 
 
+# "Le escribí y no me responde": the student already reached the teacher.
+# Folded substrings.
+_NO_REPLY = (
+    "no responde", "no me responde", "no contesta", "no me contesta", "no respondio",
+    "no me respondio", "no ha respondido", "no me ha respondido", "no contesto",
+    "no me contesto", "no ha contestado", "no me ha contestado", "sin respuesta",
+    "no he recibido respuesta", "no recibi respuesta",
+)
+# How long a teacher's contact counts as "already given" (no offer again).
+TEACHER_GIVEN_TTL_SECONDS = 24 * 3600
+
+
+def teacher_did_not_reply(message: str) -> bool:
+    folded = fold(message or "")
+    return any(phrase in folded for phrase in _NO_REPLY)
+
+
+def no_reply_message(ctx: dict, lang: str) -> str:
+    """Where to turn when the teacher does not answer (2026-10-28: the student
+    was offered "can I help you first?" twice instead)."""
+    if ctx.get("lms_other_contacts"):
+        way_out = text("teacher_fallback_contacts", lang, contacts=ctx["lms_other_contacts"])
+    elif ctx.get("lms_support_url"):
+        way_out = text("teacher_no_reply_coordination", lang)
+    else:
+        way_out = text("teacher_fallback_generic", lang)
+    return f"{text('teacher_no_reply', lang)} {way_out}"
+
+
+def recently_given(ismael: dict) -> bool:
+    given = ismael.get("teacher_given")
+    if not isinstance(given, dict):
+        return False
+    return time.time() - float(given.get("at") or 0) < TEACHER_GIVEN_TTL_SECONDS
+
+
 def flow_open(ismael: dict) -> bool:
     flow = ismael.get("teacher")
     return isinstance(flow, dict) and bool(flow.get("step")) and latch_fresh(flow)
@@ -163,6 +199,10 @@ class _Turn:
         self.ismael.pop("teacher", None)
         if helped:
             mark_helped(self.ismael)
+            teacher = self.flow.get("teacher")
+            if isinstance(teacher, dict) and teacher.get("name"):
+                # The next request does not offer "can I help you first?" again.
+                self.ismael["teacher_given"] = {"name": teacher["name"], "at": time.time()}
         return reply(self._say(message), ismael=self.ismael, turn_usage=self.usage, ismael_route="done")
 
     def hand_off(self, route: str) -> dict:
@@ -233,6 +273,11 @@ async def _on_offer(turn: _Turn) -> dict:
     if new_question:
         return turn.hand_off("retriage")
     if index is None:
+        misses = int(turn.flow.get("offer_misses") or 0) + 1
+        turn.flow["offer_misses"] = misses
+        if misses >= 2:
+            # Asked twice and still no yes or no: they want the teacher.
+            return await _begin_contact(turn)
         return _offer(turn)
     if index == 0:
         reason = turn.flow.get("reason") or ""
@@ -579,9 +624,15 @@ _HANDLERS = {
 async def ismael_teacher_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("ismael_teacher")
     turn = _Turn(state, config)
-    handler = _HANDLERS.get(str(turn.flow.get("step") or ""))
+    step = str(turn.flow.get("step") or "")
+    handler = _HANDLERS.get(step)
+    if step in ("", "offer_help") and teacher_did_not_reply(turn.text):
+        return turn.finish(no_reply_message(user_ctx(state), turn.lang), helped=False)
     if handler is None and turn.flow.pop("skip_offer", False):
         turn.intro = text("teacher_from_support", turn.lang)
+        return await _begin_contact(turn)
+    if handler is None and recently_given(turn.ismael):
+        # The contact went out earlier today: no "can I help you first?" again.
         return await _begin_contact(turn)
     if handler is None:
         return _offer(turn)

@@ -16,6 +16,20 @@ unavailable (tests, local runs without it).
 If the instance dies mid-job the answer is lost; the store entry expires after
 `JOB_TTL_SECONDS` and the student can ask again. Acceptable at this volume.
 
+A theology question that arrives while a job runs is queued (at most
+`MAX_QUEUED`) instead of dropped: on 2026-10-29 «¿Quién es Oscar Archila?» and
+«¿Qué significa ser católico?» got «después puedes hacerme otra» and were never
+answered. The queue holds only the question — never credentials — in the same
+store, under its own key, so any instance can add to it; the job that finishes
+takes the next one and runs it with its own (same-tenant) LLM config.
+
+When Brain retrieved fragments but judged them insufficient — they covered
+part of the question, or did not define it in so many words — the general
+answer is grounded on them (`_grounded_answer`): on 2026-10-29 the course's own
+book «TEOLOGÍA SOCIAL» and a definition of «vitalismo espiritual» were found
+and thrown away, and the director got an ungrounded comparison of traditions
+instead. Only the fragments the answer says it used become References.
+
 A question that names a book (triage's ``work``) is asked of that document
 alone when it matches one in the library's catalog: Brain never searches
 titles, so «¿y el libro Las llaves del poder?» came back insufficient_evidence
@@ -28,13 +42,14 @@ import asyncio
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 import structlog
 
 from ...config import settings
 from ...providers.registry import get_provider, resolve_model
+from ...schemas.ismael import GroundedAnswer
 from ...services import brain
 from ...usage import make_usage_record
 from .. import backend_client
@@ -50,11 +65,48 @@ JOB_TTL_SECONDS = (
     settings.brain_boot_timeout_seconds + settings.brain_answer_timeout_seconds + 120
 )
 MAX_REFERENCES = 5
+# Questions waiting behind the running job, per conversation.
+MAX_QUEUED = 2
+# A Spanish answer this long with no accented letter lost its accents
+# (gemini-3.5-flash, 2026-10-29: «teologicos», «Catolica», «salvacion»).
+_ACCENT_CHECK_MIN_WORDS = 40
+_ACCENTED = re.compile(r"[áéíóúñü¿¡ÁÉÍÓÚÑÜ]")
+_ACCENT_RETRY_NOTE = (
+    "\n- IMPORTANTE: escribe en español correcto, con TODAS las tildes (á, é, í, ó, ú), "
+    "la ñ y los signos de apertura (¿ ¡). Una respuesta sin tildes no sirve."
+)
+# Fragments handed to a grounded general answer, and how much of each.
+MAX_GROUNDING_FRAGMENTS = 5
+MAX_FRAGMENT_CHARS = 1500
+GROUNDED_TIMEOUT_SECONDS = 45.0
+GROUNDING_RULE = """
+
+La búsqueda en la biblioteca de la institución encontró los fragmentos de abajo, pero no bastan para responder toda la pregunta{reason}. Úsalos primero:
+- Lo que respondas a partir de ellos va primero y se lo atribuyes a su obra (y a su autor, si aparece): «Darío Silva-Silva, en Las llaves del poder, sostiene…».
+- Completa con conocimiento general solo lo que los fragmentos no cubren, siguiendo las reglas de arriba, y no se lo atribuyas a ellos.
+- No escribas los identificadores de los fragmentos en el texto.
+- En used, los id (F1, F2…) de los fragmentos de los que sacaste algo; una lista vacía si no usaste ninguno.
+
+Responde SOLO con un objeto JSON con las claves answer (el texto para el estudiante) y used (la lista de ids)."""
+# A refusal Brain explains as its own model's failure says nothing about the
+# question; it is left out of the grounding hint.
+_MODEL_FAILURE_REASON = re.compile(r"^el modelo\b", re.IGNORECASE)
+
+# Appended in code to the general prompt for a question copied from an
+# evaluation: the concept is explained, the item is never answered.
+GUIDE_RULE = (
+    "\n- La pregunta viene de una evaluación del estudiante (cuestionario o tarea). "
+    "Explica el concepto de fondo y termina con una o dos preguntas que lo ayuden a "
+    "razonar. NO elijas ni descartes opciones (a, b, c…), NO digas cuál es la respuesta "
+    "correcta y NO redactes la respuesta por él."
+)
 
 # Strong refs: asyncio keeps only weak references to tasks.
 _tasks: set[asyncio.Task] = set()
 # conversation_id → (job_id, question, started monotonic) — fallback registry.
 _local_jobs: dict[str, tuple[str, str, float]] = {}
+# conversation_id → queued questions — fallback for the store-backed queue.
+_local_queues: dict[str, list[dict]] = {}
 
 
 @dataclass
@@ -70,6 +122,8 @@ class RagJob:
     llm_config: dict
     # The book, document or author the question names (triage), or "".
     work: str = ""
+    # The question was copied from an evaluation: explain, never answer the item.
+    guide: bool = False
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
@@ -136,6 +190,107 @@ async def _record(job: RagJob, status: str) -> None:
         await store.aput(_namespace(job.tenant_id), job.conversation_id, value)
     except Exception as exc:  # noqa: BLE001 — the local registry still holds
         logger.info("ismael_job_store_write_failed", error=str(exc), status=status)
+
+
+# ── The queue behind the running job ────────────────────────────────────────
+
+
+def _queue_key(conversation_id: str) -> str:
+    return f"{conversation_id}:queue"
+
+
+def _queue_item(job: RagJob) -> dict:
+    """What a queued question keeps: never the LLM config or its credentials."""
+    return {"question": job.question, "work": job.work, "guide": job.guide, "queued_at": _now_iso()}
+
+
+def _fresh(items: list) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    out = []
+    for item in items or []:
+        if not isinstance(item, dict) or not item.get("question"):
+            continue
+        try:
+            age = (now - datetime.fromisoformat(item.get("queued_at") or "")).total_seconds()
+        except ValueError:
+            continue
+        if age <= JOB_TTL_SECONDS * (MAX_QUEUED + 1):
+            out.append(item)
+    return out
+
+
+async def _read_queue(tenant_id: str, conversation_id: str) -> list[dict] | None:
+    """The queue, or None when the store cannot be read (use the local one)."""
+    store = get_store_or_none()
+    if store is None:
+        return None
+    try:
+        item = await store.aget(_namespace(tenant_id), _queue_key(conversation_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.info("ismael_queue_read_failed", error=str(exc))
+        return None
+    value = getattr(item, "value", None) if item else None
+    return _fresh((value or {}).get("items") or [])
+
+
+async def _write_queue(tenant_id: str, conversation_id: str, items: list[dict]) -> bool:
+    store = get_store_or_none()
+    if store is None:
+        return False
+    try:
+        await store.aput(_namespace(tenant_id), _queue_key(conversation_id), {"items": items})
+    except Exception as exc:  # noqa: BLE001
+        logger.info("ismael_queue_write_failed", error=str(exc))
+        return False
+    return True
+
+
+async def enqueue(job: RagJob) -> int | None:
+    """Queue ``job``'s question behind the running one: its 1-based position,
+    or None when the queue is full."""
+    items = await _read_queue(job.tenant_id, job.conversation_id)
+    local = items is None
+    if local:
+        items = _fresh(_local_queues.get(job.conversation_id, []))
+    if len(items) >= MAX_QUEUED:
+        return None
+    items.append(_queue_item(job))
+    if local or not await _write_queue(job.tenant_id, job.conversation_id, items):
+        _local_queues[job.conversation_id] = items
+    logger.info("ismael_question_queued", conversation_id=job.conversation_id, position=len(items))
+    return len(items)
+
+
+async def take_next(tenant_id: str, conversation_id: str) -> dict | None:
+    """Pop the oldest queued question, or None."""
+    items = await _read_queue(tenant_id, conversation_id)
+    if items is not None and items:
+        head, rest = items[0], items[1:]
+        if await _write_queue(tenant_id, conversation_id, rest):
+            return head
+    local = _fresh(_local_queues.get(conversation_id, []))
+    if not local:
+        _local_queues.pop(conversation_id, None)
+        return None
+    _local_queues[conversation_id] = local[1:]
+    return local[0]
+
+
+async def _spawn_next(job: RagJob) -> bool:
+    """Start the next queued question with this job's LLM config."""
+    item = await take_next(job.tenant_id, job.conversation_id)
+    if not item:
+        return False
+    await spawn(
+        replace(
+            job,
+            question=str(item.get("question") or ""),
+            work=str(item.get("work") or ""),
+            guide=bool(item.get("guide")),
+            job_id=uuid.uuid4().hex,
+        )
+    )
+    return True
 
 
 # A title that is really a file name: "07-LlavesDelPoder-INT.pdf.corrected".
@@ -291,26 +446,134 @@ def answer_references(answer: dict, lang: str) -> dict | None:
     }
 
 
-async def _general_answer(job: RagJob) -> tuple[str, list]:
-    """Concise general-knowledge answer for a question the library does not cover."""
-    config = {"configurable": job.llm_config}
+def _general_system(job: RagJob) -> str:
+    """The tenant's THEOLOGY_GENERAL (or the default), filled in, plus the guide rule."""
     prompts = job.llm_config.get("prompts") or {}
     payload = prompts.get("THEOLOGY_GENERAL") or {}
     template = (payload.get("content") if isinstance(payload, dict) else "") or GENERAL_PROMPT
     language_rule = "Always respond in English." if job.language == "en" else "Responde siempre en español."
     system = template.replace("{persona}", job.persona).replace("{language_rule}", language_rule)
+    return system + GUIDE_RULE if job.guide else system
+
+
+async def _general_answer(job: RagJob) -> tuple[str, list]:
+    """Concise general-knowledge answer for a question the library does not cover."""
+    config = {"configurable": job.llm_config}
+    system = _general_system(job)
 
     provider = get_provider(config)
     model = resolve_model(config)
-    reply = await provider.chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": job.question}],
-        model,
-    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": job.question}]
+    reply = (await provider.chat(messages, model) or "").strip()
     usage = [make_usage_record(node="ismael_general_answer", provider=provider, model=model)]
-    reply = (reply or "").strip()
+    if lacks_accents(reply, job.language):
+        retried = await provider.chat(
+            [{"role": "system", "content": system + _ACCENT_RETRY_NOTE}, messages[1]], model
+        )
+        usage.append(make_usage_record(node="ismael_general_answer", provider=provider, model=model))
+        retried = (retried or "").strip()
+        logger.info("ismael_general_accents_retry", fixed=bool(retried) and not lacks_accents(retried, job.language))
+        if retried and not lacks_accents(retried, job.language):
+            reply = retried
     if not reply:
         raise brain.BrainError("general answer came back empty")
     return reply, usage
+
+
+def _grounding_fragments(answer: dict) -> list[dict]:
+    """The usable fragments of a refusal, best first, with an id each."""
+    out = []
+    evidence = [e for e in answer.get("evidence") or [] if isinstance(e, dict)]
+    evidence.sort(key=lambda e: -float(e.get("score") or 0))
+    for ev in evidence:
+        body = (ev.get("text") or "").strip()
+        if not body or ev.get("kind") == "ficha":
+            continue
+        out.append({**ev, "_id": f"F{len(out) + 1}", "_text": body[:MAX_FRAGMENT_CHARS]})
+        if len(out) >= MAX_GROUNDING_FRAGMENTS:
+            break
+    return out
+
+
+def _fragments_block(fragments: list[dict]) -> str:
+    parts = []
+    for fragment in fragments:
+        work = _source_title(fragment, "") or "Sin título"
+        where = (fragment.get("breadcrumb") or "").strip()
+        head = f"<<<FUENTE id={fragment['_id']} | obra: {work}" + (f" | sección: {where}" if where else "")
+        body = fragment["_text"].replace("FUENTE>>>", "")
+        parts.append(f"{head}\n{body}\nFUENTE>>>")
+    return "\n\n" + "\n\n".join(parts)
+
+
+async def _grounded_answer(job: RagJob, answer: dict) -> tuple[dict, list] | None:
+    """A general answer built on the fragments a refusal still carries.
+
+    Returns ``(answer_dict, usage)`` shaped like Brain's — text, citations for
+    the fragments used, their evidence — so `format_answer` and
+    `answer_references` render it; None when there is nothing to ground on or
+    the call fails (the plain general answer follows).
+    """
+    fragments = _grounding_fragments(answer)
+    if not fragments:
+        return None
+    reason = (answer.get("reason") or "").strip()
+    hint = "" if not reason or _MODEL_FAILURE_REASON.match(reason) else f" (lo que notó la búsqueda: {reason[:300]})"
+    config = {"configurable": job.llm_config}
+    system = (
+        _general_system(job)
+        + GROUNDING_RULE.replace("{reason}", hint)
+        + _fragments_block(fragments)
+    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": job.question}]
+    usage: list = []
+    try:
+        provider = get_provider(config)
+        model = resolve_model(config)
+        result = await _structured(provider, messages, model)
+        usage.append(make_usage_record(node="ismael_grounded_answer", provider=provider, model=model))
+        if lacks_accents(result.answer, job.language):
+            messages[0] = {"role": "system", "content": system + _ACCENT_RETRY_NOTE}
+            retried = await _structured(provider, messages, model)
+            usage.append(make_usage_record(node="ismael_grounded_answer", provider=provider, model=model))
+            if retried.answer.strip() and not lacks_accents(retried.answer, job.language):
+                result = retried
+    except Exception as exc:  # noqa: BLE001 — the plain general answer still follows
+        logger.warning("ismael_grounded_answer_failed", error=str(exc) or type(exc).__name__)
+        return None
+    body = result.answer.strip()
+    if not body:
+        return None
+    by_id = {f["_id"]: f for f in fragments}
+    used = [by_id[i] for i in dict.fromkeys(i.strip().upper() for i in result.used) if i in by_id]
+    logger.info("ismael_grounded_answer", shown=len(fragments), used=len(used))
+    citations = [
+        {
+            "chunk_id": f.get("chunk_id"),
+            "page": f.get("page"),
+            "section_title": (f.get("breadcrumb") or "").strip() or None,
+            "locator": f.get("locator") or "",
+        }
+        for f in used
+    ]
+    evidence = [{k: v for k, v in f.items() if not k.startswith("_")} for f in used]
+    return {"text": body, "citations": citations, "evidence": evidence}, usage
+
+
+async def _structured(provider, messages: list[dict], model: str) -> GroundedAnswer:
+    return await asyncio.wait_for(
+        provider.generate_structured(
+            messages, model, GroundedAnswer, thinking_budget=settings.ismael_thinking_answer
+        ),
+        timeout=GROUNDED_TIMEOUT_SECONDS,
+    )
+
+
+def lacks_accents(reply: str, language: str) -> bool:
+    """A long Spanish answer without a single accented letter lost its accents."""
+    if language == "en" or len(reply.split()) < _ACCENT_CHECK_MIN_WORDS:
+        return False
+    return not _ACCENTED.search(reply)
 
 
 _ARTICLES = {"el", "la", "los", "las", "lo", "un", "una", "del", "de", "the", "a", "an", "libro", "book"}
@@ -433,19 +696,42 @@ async def _compose(job: RagJob) -> tuple[str, list, str, dict | None]:
         answer = outcome["answer"]
         if answer.get("state") == "answered" and (answer.get("text") or "").strip():
             return (
-                format_answer(answer, job.language),
+                _guided(job, format_answer(answer, job.language)),
                 [],
                 "answered",
                 answer_references(answer, job.language),
             )
 
+        if answer.get("state") == "insufficient_evidence":
+            grounded = await _grounded_answer(job, answer)
+            if grounded is not None:
+                built, usage = grounded
+                return (
+                    _guided(job, format_answer(built, job.language)),
+                    usage,
+                    "grounded:insufficient_evidence",
+                    answer_references(built, job.language),
+                )
+
         # insufficient_evidence / off_corpus: a short general answer, unlabelled
         # (the outcome below still tells them apart in the logs).
         message, usage = await _general_answer(job)
-        return message, usage, f"general:{answer.get('state')}", None
+        return _guided(job, message), usage, f"general:{answer.get('state')}", None
     except Exception as exc:  # noqa: BLE001 — the student still gets a reply
-        logger.error("ismael_job_error", job_id=job.job_id, error=str(exc))
+        # str() of a timeout is "": on 2026-10-26 two failures logged nothing.
+        logger.error(
+            "ismael_job_error",
+            job_id=job.job_id,
+            error=str(exc) or type(exc).__name__,
+            error_type=type(exc).__name__,
+        )
         return text("failed", job.language), [], "error", None
+
+
+def _guided(job: RagJob, message: str) -> str:
+    """An answer to a question copied from an evaluation opens with the note
+    that the item is the student's to answer."""
+    return f"{text('guide_note', job.language)}\n\n{message}" if job.guide else message
 
 
 async def run(job: RagJob) -> None:
@@ -470,6 +756,12 @@ async def run(job: RagJob) -> None:
             outcome=outcome,
             seconds=round(time.monotonic() - started, 1),
         )
+        try:
+            # Before "finished" is recorded: the next job takes the slot, so a
+            # question arriving now queues behind it instead of racing it.
+            await _spawn_next(job)
+        except Exception as exc:  # noqa: BLE001 — the student can ask again
+            logger.error("ismael_queue_next_failed", job_id=job.job_id, error=str(exc))
     finally:
         await _record(job, "finished")
 

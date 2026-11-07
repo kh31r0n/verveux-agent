@@ -89,18 +89,25 @@ async def _turn(graph, thread: str, message: str, **extra) -> tuple[list[str], s
 @pytest.fixture(autouse=True)
 def _clean_local_jobs():
     rag_job._local_jobs.clear()
+    rag_job._local_queues.clear()
     yield
     rag_job._local_jobs.clear()
+    rag_job._local_queues.clear()
 
 
 @pytest.fixture
 def boundary():
     """Patch everything that leaves the process; yields the mocks."""
     triage = FakeProvider(TriageResult(intent=IsmaelIntent.THEOLOGY, question="¿Qué es la gracia?"))
+
+    async def _running(job):
+        # Like the real spawn: the conversation is busy until the job ends.
+        rag_job._local_jobs[job.conversation_id] = (job.job_id, job.question, time.monotonic())
+
     with (
         patch(f"{NODES}.get_provider", return_value=triage),
         patch(f"{NODES}.resolve_background_model", return_value="gpt-test"),
-        patch(f"{NODES}.rag_job.spawn", new=AsyncMock()) as spawn,
+        patch(f"{NODES}.rag_job.spawn", new=AsyncMock(side_effect=_running)) as spawn,
         patch(f"{NODES}.rag_job.start_host_in_background") as start_host,
         patch(f"{NODES}.backend_client.save_ismael_survey", new=AsyncMock()) as save,
         patch("src.agents.ismael.rag_job.get_store_or_none", return_value=None),
@@ -112,16 +119,19 @@ def boundary():
 
 
 class TestFirstQuestion:
-    async def test_new_contact_gets_the_survey_while_brain_boots(self, boundary):
+    async def test_new_contact_gets_the_survey_and_the_answer_starts_at_once(self, boundary):
         graph = build_ismael_graph(MemorySaver())
         nodes, reply = await _turn(graph, "th1", "que es la gracia")
 
         assert nodes == ["ismael_triage", "ismael_start"]
-        boundary["start_host"].assert_called_once()
-        boundary["spawn"].assert_not_called()  # the answer waits for the survey
+        # The answer no longer waits for the survey: two students who stopped
+        # at 2/3 never got theirs (2026-10-23, 11-03).
+        boundary["spawn"].assert_awaited_once()
+        assert boundary["spawn"].await_args.args[0].question == "¿Qué es la gracia?"
         assert "Ana" in reply and "1/3" in reply and "Estudiante" in reply
+        assert "aunque no las contestes" in reply
 
-    async def test_full_survey_saves_stats_and_spawns_the_pending_question(self, boundary):
+    async def test_full_survey_saves_stats_without_a_second_job(self, boundary):
         graph = build_ismael_graph(MemorySaver())
         await _turn(graph, "th2", "que es la gracia")
 
@@ -129,17 +139,45 @@ class TestFirstQuestion:
         assert nodes == ["ismael_triage", "ismael_survey"] and "2/3" in reply
         _, reply = await _turn(graph, "th2", "Historia de la Iglesia")
         assert "3/3" in reply
+        rag_job._local_jobs.clear()  # the answer already went out
         _, reply = await _turn(graph, "th2", "la 2")
 
-        assert reply == text("survey_done", "es")
+        assert reply == text("survey_thanks", "es")
         boundary["save"].assert_awaited_once_with(
             "k1", "c1", {"level": "student", "topic": "church_history", "intendedUse": "coursework"}
         )
         job = boundary["spawn"].await_args.args[0]
         assert job.question == "¿Qué es la gracia?"
         assert (job.tenant_id, job.conversation_id, job.language) == ("t1", "c1", "es")
+        boundary["spawn"].assert_awaited_once()
         # Survey turns are deterministic: only the first turn called the LLM.
         assert boundary["triage"].calls == 1
+
+    async def test_survey_ending_while_the_job_runs_promises_the_answer(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "th2b", "que es la gracia")
+        await _turn(graph, "th2b", "1")
+        await _turn(graph, "th2b", "1")
+        _, reply = await _turn(graph, "th2b", "1")
+        assert reply == text("survey_done", "es")
+
+    async def test_an_abandoned_survey_expires_and_frees_triage(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "th2c", "que es la gracia")
+        await _turn(graph, "th2c", "1")
+        config = _config("th2c")
+        snapshot = await graph.aget_state(config)
+        ismael = dict(snapshot.values["ismael"])
+        ismael["survey_touched_at"] = time.time() - 31 * 60
+        await graph.aupdate_state(config, {"ismael": ismael})
+        rag_job._local_jobs.clear()
+
+        nodes, _ = await _turn(graph, "th2c", "¿qué es la fe?")
+        assert nodes == ["ismael_triage", "ismael_start"]
+        boundary["save"].assert_awaited_once_with(
+            "k1", "c1", {"level": "student", "topic": "no_answer", "intendedUse": "no_answer"}
+        )
+        assert boundary["spawn"].await_count == 2
 
     async def test_contact_who_answered_before_is_not_asked_again(self, boundary):
         graph = build_ismael_graph(MemorySaver())
@@ -163,21 +201,25 @@ class TestFirstQuestion:
             _, reply = await _turn(graph, "th4", "prefiero no decirlo")
         assert "2/3" in reply
 
-    async def test_a_new_question_during_the_survey_replaces_the_pending_one(self, boundary):
+    async def test_a_new_question_during_the_survey_is_answered_too(self, boundary):
         graph = build_ismael_graph(MemorySaver())
         await _turn(graph, "th5", "que es la gracia")
         with patch(
             f"{NODES}._classify_survey_answer",
             new=AsyncMock(return_value=(SurveyAnswer(is_new_question=True), [])),
         ):
-            await _turn(graph, "th5", "¿mejor explícame la Trinidad?")
-        await _turn(graph, "th5", "1")
-        await _turn(graph, "th5", "1")
-        assert boundary["spawn"].await_args.args[0].question == "¿mejor explícame la Trinidad?"
+            _, reply = await _turn(graph, "th5", "¿mejor explícame la Trinidad?")
+        assert "2/3" in reply  # the survey goes on
+        # Queued behind the first answer, which is still on its way.
+        boundary["spawn"].assert_awaited_once()
+        assert [i["question"] for i in rag_job._local_queues["c1"]] == ["¿mejor explícame la Trinidad?"]
 
 
-class TestOtherBranches:
-    async def test_running_job_holds_theology_questions_in_pending(self, boundary):
+class TestQueue:
+    """A question while a job runs is queued, never dropped (2026-10-29)."""
+
+    async def test_a_message_that_is_not_a_question_gets_the_pending_note(self, boundary):
+        boundary["triage"]._result = TriageResult(intent=IsmaelIntent.OTHER)
         rag_job._local_jobs["c1"] = ("job-1", "¿Qué es la gracia?", time.monotonic())
         graph = build_ismael_graph(MemorySaver())
         nodes, reply = await _turn(graph, "th6", "¿ya tienes la respuesta?")
@@ -186,12 +228,126 @@ class TestOtherBranches:
         assert "¿Qué es la gracia?" in reply
         boundary["spawn"].assert_not_called()
 
+    async def test_a_theology_question_is_queued_behind_the_running_one(self, boundary):
+        boundary["triage"]._result = TriageResult(
+            intent=IsmaelIntent.THEOLOGY, question="¿Quién es Oscar Archila?"
+        )
+        rag_job._local_jobs["c1"] = ("job-1", "¿Qué es el vitalismo?", time.monotonic())
+        graph = build_ismael_graph(MemorySaver())
+        nodes, reply = await _turn(
+            graph, "th6b", "Quien es Oscar Archila?", user_context={"name": "J", "ismael_survey_done": True}
+        )
+
+        assert nodes == ["ismael_triage", "ismael_start"]
+        assert reply == text("queued", "es", question="¿Quién es Oscar Archila?")
+        boundary["spawn"].assert_not_called()
+        assert [i["question"] for i in rag_job._local_queues["c1"]] == ["¿Quién es Oscar Archila?"]
+
+    async def test_a_full_queue_says_so_instead_of_dropping_silently(self, boundary):
+        rag_job._local_jobs["c1"] = ("job-1", "q0", time.monotonic())
+        graph = build_ismael_graph(MemorySaver())
+        ctx = {"name": "J", "ismael_survey_done": True}
+        for i in range(rag_job.MAX_QUEUED):
+            boundary["triage"]._result = TriageResult(intent=IsmaelIntent.THEOLOGY, question=f"q{i + 1}")
+            await _turn(graph, "th6c", f"q{i + 1}", user_context=ctx)
+        boundary["triage"]._result = TriageResult(intent=IsmaelIntent.THEOLOGY, question="q9")
+        _, reply = await _turn(graph, "th6c", "q9", user_context=ctx)
+        assert reply == text("queue_full", "es", question="q9")
+
+    async def test_the_finishing_job_runs_the_next_queued_question(self):
+        job = rag_job.RagJob("t1", "c1", "q1", "es", "Salomón", {"llm_model": "m"})
+        rag_job._local_queues["c1"] = [
+            {"question": "q2", "work": "", "guide": True, "queued_at": rag_job._now_iso()}
+        ]
+        with (
+            patch("src.agents.ismael.rag_job.get_store_or_none", return_value=None),
+            patch("src.agents.ismael.rag_job._compose", new=AsyncMock(return_value=("a", [], "answered", None))),
+            patch("src.agents.ismael.rag_job.backend_client.post_agent_message", new=AsyncMock()),
+            patch("src.agents.ismael.rag_job.spawn", new=AsyncMock()) as spawn,
+        ):
+            await rag_job.run(job)
+        nxt = spawn.await_args.args[0]
+        assert (nxt.question, nxt.guide, nxt.llm_config) == ("q2", True, {"llm_model": "m"})
+        assert nxt.job_id != job.job_id
+        assert rag_job._local_queues["c1"] == []
+
+    async def test_the_queue_lives_in_the_shared_store(self):
+        from langgraph.store.memory import InMemoryStore
+
+        store = InMemoryStore()
+        job = rag_job.RagJob("t1", "c9", "q1", "es", "Salomón", {"openai_api_key": "sk-secret"})
+        with patch("src.agents.ismael.rag_job.get_store_or_none", return_value=store):
+            assert await rag_job.enqueue(job) == 1
+            item = await store.aget(("ismael_jobs", "t1"), "c9:queue")
+            assert "sk-secret" not in json.dumps(item.value)  # never credentials
+            assert (await rag_job.take_next("t1", "c9"))["question"] == "q1"
+            assert await rag_job.take_next("t1", "c9") is None
+
+
+class TestEvaluationItems:
+    """A question copied from a quiz is explained, never answered (decision of 2026-11-07)."""
+
+    QUIZ = (
+        "«¿Por qué se dice que la ciencia nos permite acceder a un conocimiento de Dios? "
+        "Pregunta 1Respuesta a. Porque facilita el entendimiento del orden b. Porque ayuda c.…»"
+    )
+
+    async def test_a_quiz_item_runs_the_job_in_guide_mode(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "ev1", self.QUIZ, user_context={"name": "J", "ismael_survey_done": True})
+        assert boundary["spawn"].await_args.args[0].guide is True
+
+    async def test_the_model_flag_alone_is_enough(self, boundary):
+        boundary["triage"]._result = TriageResult(
+            intent=IsmaelIntent.THEOLOGY, question="La revelación natural", assessment_item=True
+        )
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "ev2", "«¿Es un mandato bíblico? ¿Por qué?»", user_context={"name": "J", "ismael_survey_done": True})
+        job = boundary["spawn"].await_args.args[0]
+        assert job.guide is True and job.question == "La revelación natural"
+
+    async def test_a_plain_question_is_not_guided(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        await _turn(graph, "ev3", "que es la gracia", user_context={"name": "J", "ismael_survey_done": True})
+        assert boundary["spawn"].await_args.args[0].guide is False
+
+    async def test_inside_a_quiz_attempt_every_theology_question_is_guided(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        ctx = {"name": "J", "ismael_survey_done": True, "lms_page_type": "mod-quiz-attempt"}
+        await _turn(graph, "ev4", "que es la gracia", user_context=ctx)
+        assert boundary["spawn"].await_args.args[0].guide is True
+
+    def test_item_detection(self):
+        from src.agents.ismael.nodes import looks_like_assessment_item
+
+        assert looks_like_assessment_item(self.QUIZ)
+        assert looks_like_assessment_item("Elige: a) la gracia b) la ley")
+        assert not looks_like_assessment_item("¿Qué es la gracia según Pablo?")
+        assert not looks_like_assessment_item("Juan 3. 16 dice que")
+
+    async def test_guided_answers_open_with_the_note(self):
+        job = rag_job.RagJob("t1", "c1", "q", "es", "Salomón", {}, guide=True)
+        assert rag_job._guided(job, "Texto").startswith(text("guide_note", "es"))
+        job.guide = False
+        assert rag_job._guided(job, "Texto") == "Texto"
+
+    async def test_own_text_is_not_answered_as_a_question(self, boundary):
+        boundary["triage"]._result = TriageResult(intent=IsmaelIntent.THEOLOGY, question="q", own_text=True)
+        graph = build_ismael_graph(MemorySaver())
+        nodes, reply = await _turn(graph, "ev5", "Tema: La familia… Pregunta para mis compañeros: ¿…?")
+        assert nodes == ["ismael_triage", "ismael_off_topic"]
+        assert reply == text("own_text", "es")
+        boundary["spawn"].assert_not_called()
+
+
+class TestOtherBranches:
+
     async def test_off_topic(self, boundary):
         boundary["triage"]._result = TriageResult(intent=IsmaelIntent.OTHER)
         graph = build_ismael_graph(MemorySaver())
         nodes, reply = await _turn(graph, "th7", "¿cuándo es el examen?")
         assert nodes == ["ismael_triage", "ismael_off_topic"]
-        assert "Ismael" in reply and "teología" in reply
+        assert "Salomón" in reply and "teología" in reply
 
     async def test_greeting_uses_the_shared_greeting_node(self, boundary):
         boundary["triage"]._result = TriageResult(intent=IsmaelIntent.GREETING)
@@ -199,7 +355,7 @@ class TestOtherBranches:
         with patch("src.agents.greeting_response.get_provider", side_effect=RuntimeError("no llm")):
             nodes, reply = await _turn(graph, "th8", "hola")
         assert nodes == ["ismael_triage", "greeting_response"]
-        assert "Ismael" in reply and "teología" in reply
+        assert "Salomón" in reply and "teología" in reply
 
     async def test_triage_failure_treats_the_message_as_a_question(self, boundary):
         with patch(f"{NODES}.get_provider", side_effect=RuntimeError("provider down")):
@@ -343,9 +499,16 @@ class TestPendingFollowUp:
         )
         assert _followups(events) == [self.WORKING]
 
-        rag_job._local_jobs["c1"] = ("job-1", "¿Qué es la gracia?", time.monotonic())
+        boundary["triage"]._result = TriageResult(intent=IsmaelIntent.OTHER)
         nodes, events = await _events(graph, "pf3", "¿ya está?")
         assert nodes[-1] == "ismael_pending" and _followups(events) == [self.WORKING]
+
+    async def test_a_queued_question_promises_it_too(self, boundary):
+        graph = build_ismael_graph(MemorySaver())
+        ctx = {"name": "Ana", "ismael_survey_done": True}
+        await _events(graph, "pf5", "que es la gracia", user_context=ctx)
+        nodes, events = await _events(graph, "pf5", "y la fe?", user_context=ctx)
+        assert nodes[-1] == "ismael_start" and _followups(events) == [self.WORKING]
 
     async def test_in_english(self, boundary):
         graph = build_ismael_graph(MemorySaver())
@@ -568,6 +731,48 @@ class TestCompose:
             message, usage = await rag_job._general_answer(_job())
         assert message == "Breve."
         assert usage[0]["node"] == "ismael_general_answer"
+
+    async def test_an_answer_without_accents_is_asked_again(self):
+        flat = " ".join(["La salvacion es unica y la teologia catolica difiere"] * 6)
+        fixed = "La salvación es única; la teología católica difiere."
+        replies = iter([flat, fixed])
+        prompts: list[str] = []
+
+        class Provider(FakeProvider):
+            async def chat(self, messages, model, **_):
+                prompts.append(messages[0]["content"])
+                return next(replies)
+
+        with patch("src.agents.ismael.rag_job.get_provider", return_value=Provider(None)):
+            message, usage = await rag_job._general_answer(_job())
+        assert message == fixed and len(usage) == 2
+        assert "TODAS las tildes" in prompts[1] and "TODAS las tildes" not in prompts[0]
+
+    def test_short_or_english_answers_are_not_checked_for_accents(self):
+        assert not rag_job.lacks_accents("Sola fide.", "es")
+        assert not rag_job.lacks_accents(" ".join(["grace"] * 60), "en")
+        assert rag_job.lacks_accents(" ".join(["salvacion"] * 60), "es")
+
+    async def test_guide_mode_adds_the_rule_to_the_general_prompt(self):
+        seen: list[str] = []
+
+        class Provider(FakeProvider):
+            async def chat(self, messages, model, **_):
+                seen.append(messages[0]["content"])
+                return "Breve."
+
+        job = _job()
+        job.guide = True
+        with patch("src.agents.ismael.rag_job.get_provider", return_value=Provider(None)):
+            await rag_job._general_answer(job)
+        assert "NO elijas ni descartes opciones" in seen[0]
+
+    async def test_an_error_without_a_message_logs_its_type(self, brain):
+        brain["ask"].side_effect = TimeoutError()
+        with patch("src.agents.ismael.rag_job.logger") as log:
+            await rag_job._compose(_job())
+        kwargs = log.error.call_args.kwargs
+        assert kwargs["error"] == "TimeoutError" and kwargs["error_type"] == "TimeoutError"
 
     async def test_boot_timeout_apologises(self, brain):
         brain["healthy"].return_value = False
@@ -896,6 +1101,7 @@ class TestAskOneDocument:
         )
         graph = build_ismael_graph(MemorySaver())
         await _turn(graph, "w2", "las llaves del poder", user_context={"ismael_survey_done": "true"})
+        rag_job._local_jobs.clear()  # that answer went out
         boundary["triage"]._result = TriageResult(intent=IsmaelIntent.OTHER, work="ignored")
         await _turn(graph, "w2", "¿qué hora es?", user_context={"ismael_survey_done": "true"})
         state = await graph.aget_state({"configurable": {"thread_id": "w2"}})
@@ -969,3 +1175,118 @@ class TestBrainCatalog:
         await brain_service.ask("b", filters={"document_id": "d1"})
         assert "filters" not in bodies[0]
         assert bodies[1]["filters"] == {"document_id": "d1"}
+
+
+
+# ── Grounded general answers (2026-11-07) ────────────────────────────────────
+
+
+REFUSAL = {
+    "state": "done",
+    "answer": {
+        "state": "insufficient_evidence",
+        "text": "",
+        "reason": "Los fragmentos definen la noción de vitalismo espiritual, pero no contienen un ejemplo.",
+        "evidence": [
+            {
+                "chunk_id": "c-low", "title": "Otro libro", "text": "Texto marginal.", "score": 0.2,
+                "kind": "text", "breadcrumb": "Cap. 9",
+            },
+            {
+                "chunk_id": "c-top", "title": "El reto de Dios", "author": "Darío Silva-Silva",
+                "text": "El vitalismo espiritual es la vida de Dios en el creyente. FUENTE>>> fin",
+                "score": 0.9, "kind": "text", "breadcrumb": "2. El vitalismo", "page": 14,
+            },
+            {"chunk_id": "c-ficha", "title": "Ficha", "text": "Resumen", "score": 0.95, "kind": "ficha"},
+        ],
+    },
+}
+
+
+class GroundingProvider(FakeProvider):
+    def __init__(self, result):
+        super().__init__(result)
+        self.messages = None
+
+    async def generate_structured(self, messages, model, schema, **_):
+        self.messages = messages
+        self.calls += 1
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+class TestGroundedAnswer:
+    async def test_a_refusal_with_fragments_is_answered_from_them_first(self, brain):
+        from src.schemas.ismael import GroundedAnswer
+
+        brain["wait"].return_value = REFUSAL
+        provider = GroundingProvider(
+            GroundedAnswer(
+                answer="Darío Silva-Silva, en El reto de Dios, define el vitalismo espiritual como la vida de Dios en el creyente. Un ejemplo es la oración diaria.",
+                used=["F1", "F9"],
+            )
+        )
+        with patch("src.agents.ismael.rag_job.get_provider", return_value=provider):
+            message, usage, outcome, references = await rag_job._compose(_job())
+
+        assert outcome == "grounded:insufficient_evidence"
+        assert usage[0]["node"] == "ismael_grounded_answer"
+        # Only the fragment it used, never an id it invented.
+        assert references["items"] == [
+            {"title": "El reto de Dios — Darío Silva-Silva", "detail": "p. 14"}
+        ]
+        assert message.endswith("- El reto de Dios — Darío Silva-Silva, p. 14")
+        system = provider.messages[0]["content"]
+        assert "<<<FUENTE id=F1 | obra: El reto de Dios — Darío Silva-Silva | sección: 2. El vitalismo" in system
+        assert "id=F2 | obra: Otro libro" in system  # best first
+        assert "Ficha" not in system  # a ficha is not a passage
+        assert "no contienen un ejemplo" in system  # Brain's reason as a hint
+        assert system.count("FUENTE>>>") == 2  # the body cannot close the fence
+
+    async def test_an_answer_that_used_no_fragment_has_no_references(self, brain):
+        from src.schemas.ismael import GroundedAnswer
+
+        brain["wait"].return_value = REFUSAL
+        provider = GroundingProvider(GroundedAnswer(answer="Respuesta general.", used=[]))
+        with patch("src.agents.ismael.rag_job.get_provider", return_value=provider):
+            message, _, outcome, references = await rag_job._compose(_job())
+        assert (message, outcome, references) == ("Respuesta general.", "grounded:insufficient_evidence", None)
+
+    async def test_a_failed_grounded_call_falls_back_to_the_plain_answer(self, brain):
+        brain["wait"].return_value = REFUSAL
+        provider = GroundingProvider(RuntimeError("boom"))
+        with (
+            patch("src.agents.ismael.rag_job.get_provider", return_value=provider),
+            patch(
+                "src.agents.ismael.rag_job._general_answer",
+                new=AsyncMock(return_value=("Plano.", [])),
+            ),
+        ):
+            composed = await rag_job._compose(_job())
+        assert composed == ("Plano.", [], "general:insufficient_evidence", None)
+
+    async def test_off_corpus_is_not_grounded(self, brain):
+        refusal = {"state": "done", "answer": {**REFUSAL["answer"], "state": "off_corpus"}}
+        brain["wait"].return_value = refusal
+        with (
+            patch("src.agents.ismael.rag_job._grounded_answer", new=AsyncMock()) as grounded,
+            patch("src.agents.ismael.rag_job._general_answer", new=AsyncMock(return_value=("G.", []))),
+        ):
+            await rag_job._compose(_job())
+        grounded.assert_not_called()
+
+    async def test_the_tenants_general_prompt_governs_the_grounded_answer(self, brain):
+        from src.schemas.ismael import GroundedAnswer
+
+        brain["wait"].return_value = REFUSAL
+        provider = GroundingProvider(GroundedAnswer(answer="X.", used=["F1"]))
+        job = _job()
+        job.llm_config = {"prompts": {"THEOLOGY_GENERAL": {"content": "Eres {persona}. Fe evangélica. {language_rule}"}}}
+        with patch("src.agents.ismael.rag_job.get_provider", return_value=provider):
+            await rag_job._compose(job)
+        assert provider.messages[0]["content"].startswith("Eres Ismael. Fe evangélica. Responde siempre en español.")
+
+    def test_a_model_failure_reason_is_not_a_hint(self):
+        assert rag_job._MODEL_FAILURE_REASON.match("el modelo agotó su límite")
+        assert not rag_job._MODEL_FAILURE_REASON.match("Los fragmentos no mencionan")

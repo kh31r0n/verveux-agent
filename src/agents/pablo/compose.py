@@ -151,7 +151,16 @@ def progress_line(payload: dict, cycle_index: int, total: int, lang: str) -> str
         return text("question", lang, n=cycle_index + 1, total=total)
     round_ = payload.get("round")
     round_ = round_ if isinstance(round_, int) else cycle_index // count
-    if round_ > 0:
+    if count == 1 and total > 1:
+        # One topic, said in the opening: count the questions, never repeat
+        # «Volvemos al tema «…»» (every cycle after the first said it).
+        line = (
+            text("progress_single", lang, ordinal=ordinal(cycle_index + 1, lang, feminine=True).capitalize(),
+                 count=cardinal(total, lang, feminine=True))
+            if total <= 3
+            else text("question", lang, n=cycle_index + 1, total=total) + "."
+        )
+    elif round_ > 0:
         line = text("progress_again", lang, name=name)
     elif count == 1:
         line = text("progress_only", lang, name=name)
@@ -187,6 +196,12 @@ def render(
         for index, part in enumerate(parts):
             lines.append(f"{part_label(index, lang)}: {part.prompt}")
     return "\n\n".join(lines)
+
+
+def question_texts(parts: list[ComposedPart], candidates: list[dict]) -> dict[str, str]:
+    """{question_snapshot_id: the bank's text} for the chosen parts."""
+    by_id = {c["snapshot_id"]: c for c in candidates}
+    return {p.question_snapshot_id: str(by_id[p.question_snapshot_id].get("text") or "")[:4000] for p in parts}
 
 
 def component_criteria(parts: list[ComposedPart], candidates: list[dict]) -> dict[str, str]:

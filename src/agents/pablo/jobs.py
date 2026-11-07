@@ -13,6 +13,7 @@ import asyncio
 import structlog
 
 from ...config import settings
+from ...providers.registry import background_model
 from .. import backend_client
 
 logger = structlog.get_logger(__name__)
@@ -33,11 +34,13 @@ async def llm_config(tenant_id: str, prompts: dict) -> dict:
     """A RunnableConfig for the tenant's chat model (never logged)."""
     provider = "openai"
     model = ""
+    cheap = ""
     keys: dict = {}
     try:
         creds = await backend_client.fetch_agent_credentials(tenant_id)
         provider = creds.get("provider", "OPENAI").lower()
         model = creds.get("model") or ""
+        cheap = background_model(creds)
         if provider == "openai":
             keys["openai_api_key"] = creds.get("apiKey", "")
         elif provider == "anthropic":
@@ -53,6 +56,8 @@ async def llm_config(tenant_id: str, prompts: dict) -> dict:
         "configurable": {
             "llm_provider": provider,
             "llm_model": model,
+            # The platform's cheap model, for checks no student reads.
+            "llm_background_model": cheap,
             "prompts": prompts or {},
             **keys,
         }

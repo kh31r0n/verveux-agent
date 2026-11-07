@@ -243,13 +243,20 @@ class Settings(BaseSettings):
     pablo_thinking_ack: int | None = 0
     # The follow-up question (one call per answer, tenant model); past this a
     # generic question in code goes out instead.
-    pablo_timeout_followup_seconds: float = 8.0
+    pablo_timeout_followup_seconds: float = 20.0
+    # The follow-up's calls (first + retry) share this, counted from the start
+    # of the answer turn — transcription included — under the backend's 60 s.
+    pablo_followup_budget_seconds: float = 40.0
     pablo_thinking_followup: int | None = 0
     pablo_timeout_score_seconds: float = 60.0
     pablo_timeout_feedback_seconds: float = 60.0
     pablo_thinking_compose: int | None = 0
     pablo_thinking_score: int | None = None
     pablo_score_retries: int = 1
+    # A verdict caps the points of its question's components (share of the
+    # max): "partial" never reaches the max, "incorrect" never passes half.
+    pablo_partial_cap: float = 0.8
+    pablo_incorrect_cap: float = 0.5
     pablo_max_calibration_examples: int = 5
     pablo_job_concurrency: int = 4
     # Speech-to-Text v2 (ADC). Empty project = the ADC project.

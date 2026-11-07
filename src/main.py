@@ -36,9 +36,10 @@ from .agents.backend_client import (
 from .agents.clara import runner as clara_runner
 from .agents.clara.runner import EmailDraftRequest, EmailFollowUpRequest, EmailSyncRequest
 from .agents.pablo import insights as pablo_insights
+from .agents.pablo import reference_check as pablo_reference_check
 from .agents.pablo import jobs as pablo_jobs
 from .agents.pablo import scoring as pablo_scoring
-from .schemas.pablo import InsightsRequest, ScoreRequest
+from .schemas.pablo import InsightsRequest, ReferenceCheckRequest, ScoreRequest
 from .agents.prospecting_nodes import DEFAULT_LOCATION
 from .providers.registry import background_model
 from .graphs.clara_graph import EMAIL_GRAPH_NAME
@@ -1264,6 +1265,17 @@ async def assessment_score(
         duplicate=not started,
     )
     return {"accepted": True, "attempt_id": req.attempt_id, "duplicate": not started}
+
+
+@app.post("/assessment/reference-check")
+async def assessment_reference_check(
+    req: ReferenceCheckRequest,
+    _auth: Annotated[dict, Depends(verify_service_caller)],
+) -> dict:
+    """Which REQUIRED points of each question's reference the statement does
+    not ask for (and which are optional). Synchronous: the backend calls it in
+    the background after a configuration sync."""
+    return await pablo_reference_check.check(req)
 
 
 @app.post("/assessment/insights", status_code=202)

@@ -62,15 +62,25 @@ MOVES_RULE = (
     "plantear una consecuencia o un caso que la ponga a prueba; pedir que conecte dos ideas que mencionó "
     "o una idea suya con la pregunta; pedir que precise un término que usó. Pedir un ejemplo es solo una "
     "opción más, úsala únicamente si es lo que más aporta.\n"
-    "- Una sola pregunta, que termine en «?». Nada después del signo."
+    "- No reformules la consigna original ni le pidas otra vez lo que ya respondió: avanza sobre algo "
+    "que él dijo y que la consigna no le daba hecho.\n"
+    "- Sin saludos ni elogios. Una sola pregunta, que empiece con «¿» y termine en «?». Nada después del signo."
 )
+# The opening the model fell back on in production (21 of 47 follow-ups).
+_STOCK_OPENING = "como se relaciona"
 _REFUSALS = {
     "empty": "estaba vacía",
     "too_long": "era demasiado larga (máximo dos frases cortas)",
     "no_question": "no era una pregunta (debe ser una sola pregunta que termine en «?»)",
     "failed": "no llegó o no se pudo leer",
+    "repeated_opening": (
+        "empezaba igual que una repregunta anterior de este intento; cambia la forma y la apertura "
+        "(no empieces con «¿Cómo se relaciona…»)"
+    ),
 }
-_QUOTE_WORDS = (3, 14)
+_QUOTE_WORDS = (3, 20)
+# The retry is tried only with at least this much of the turn's budget left.
+_MIN_RETRY_SECONDS = 8.0
 _WORD = re.compile(r"[a-zñ]{5,}")
 # Words any follow-up may use whatever the rubric says: asking for an
 # example or a reason names no content.
@@ -81,6 +91,11 @@ _GENERIC = frozenset(
     consecuencias practica practicas respuesta respuestas pregunta preguntas parte partes mencionaste
     dijiste dices comentaste afirmaste profundizar profundiza detalle detalles concreto concreta
     situacion caso casos relacion relaciona relacionas cuenta contar cuentame sobre entonces ademas
+    entre forma formas desde hacia hasta cuando donde mientras tiene tienen tener puede pueden poder
+    hacer hacen haces otros otras otro otra mismo misma mismos todos todas siempre nunca tambien
+    propuesta propuestas origen tierra mundo manera modo forma aspecto aspectos punto puntos idea ideas
+    vision postura posturas planteamiento planteas plantea perspectiva contraste contrastar contrasta
+    textos texto pasaje pasajes autor autores segun mencionas afirmas sostienes
     could would explain example examples reason reasons because consequence practice answer question
     questions mentioned said detail details concrete situation further could develop expand
     """.split()
@@ -96,10 +111,44 @@ def words(value: str) -> set[str]:
     return set(_WORD.findall(fold(value)))
 
 
+def _stem(word: str) -> str:
+    return word[:6]
+
+
 def leaked_words(question: str, rubric: str, allowed: str) -> set[str]:
-    """Content words of the question taken from the rubric and found nowhere
-    in what the student saw or said."""
-    return (words(question) & words(rubric)) - words(allowed) - _GENERIC
+    """Content words of the question taken from the rubric (or the
+    reference) and found nowhere in what the student saw or said, compared
+    by stem («bíblicos» ≈ «bíblica»)."""
+    seen = {_stem(w) for w in words(allowed)}
+    return {
+        w
+        for w in words(question) & words(rubric)
+        if w not in _GENERIC and _stem(w) not in seen
+    }
+
+
+_SUPERSCRIPT_OPEN = re.compile(r"^[¹²³?]+")
+_GREETING = re.compile(
+    r"^(?:[¡!]?\s*(?:hola|qu[eé] gusto|buen[oa]s|excelente|muy bien|genial|perfecto|gracias)[^¿?]*?[.!]\s*)+",
+    re.IGNORECASE,
+)
+
+
+def tidy(question: str) -> str:
+    """The model's question without the defects seen in production: a «¿»
+    written as «¹»/«²», a «!Hola! ¡Qué gusto…!» before it, a missing «¿»."""
+    q = " ".join(plain(question).split())
+    q = _GREETING.sub("", q).strip()
+    q = _SUPERSCRIPT_OPEN.sub("¿", q)
+    q = re.sub(r"^!", "¡", q)
+    if q.endswith("?") and "¿" not in q:
+        q = f"¿{q}"
+    return q
+
+
+def opening(question: str) -> str:
+    """The first three words, folded: what makes two follow-ups sound alike."""
+    return " ".join(re.findall(r"[a-zñ]+", fold(question))[:3])
 
 
 def components_block(cycle: dict) -> list[dict]:
@@ -127,10 +176,13 @@ def generic_question(cycle: dict, target: str | None, lang: str) -> str:
 
 
 def validated(
-    plan: FollowupPlan | None, cycle: dict, answer: str
+    plan: FollowupPlan | None, cycle: dict, answer: str, previous: list[str] | None = None
 ) -> tuple[str | None, str | None, str, str]:
     """(question | None, target | None, mode, refusal). None question =
-    refused, and ``refusal`` says why (``leak:w1,w2`` names the words)."""
+    refused, and ``refusal`` says why (``leak:w1,w2`` names the words).
+    ``previous`` are the follow-ups already asked in the attempt: one that
+    opens like any of them — or with the stock «¿Cómo se relaciona…» a second
+    time — is refused."""
     if plan is None:
         return None, None, "deepen", "failed"
     ids = {c["component_id"] for c in cycle.get("component_map") or []}
@@ -138,7 +190,7 @@ def validated(
     if target not in ids:
         target = None
     mode = "gap" if target else "deepen"
-    question = " ".join(plain(plan.question).split())
+    question = tidy(plan.question)
     # «¿…? Piénsalo bien.» keeps the question and drops the tail.
     if "?" in question and not question.endswith("?"):
         question = question[: question.rindex("?") + 1]
@@ -151,9 +203,15 @@ def validated(
     rubric = " ".join(f"{c['name']} {c['criteria']}" for c in components_block(cycle))
     references = " ".join((cycle.get("grader_info") or {}).values())
     rubric = f"{rubric} {references}"
-    leaked = leaked_words(question, rubric, f"{cycle.get('composite_prompt', '')} {answer}")
+    # What the student saw includes the bank's own wording of the question.
+    seen = " ".join([str(cycle.get("composite_prompt", "")), *(cycle.get("question_texts") or {}).values()])
+    leaked = leaked_words(question, rubric, f"{seen} {answer}")
     if leaked:
         return None, target, mode, "leak:" + ",".join(sorted(leaked)[:10])
+    openings = [opening(p) for p in previous or []]
+    first = opening(question)
+    if first and (first in openings or (first == _STOCK_OPENING and _STOCK_OPENING in openings)):
+        return None, target, mode, "repeated_opening"
     return question, target, mode, ""
 
 
@@ -170,14 +228,32 @@ def refusal_note(refusal: str) -> str:
     return f"\n\nTu repregunta anterior no sirvió: {reason}. Escribe otra."
 
 
+def sentence_case(value: str) -> str:
+    """«EL MAL NACE EN EL CORAZÓN» → «El mal nace en el corazón»."""
+    letters = [c for c in value if c.isalpha()]
+    if letters and sum(c.isupper() for c in letters) / len(letters) > 0.8:
+        lowered = value.lower()
+        return lowered[:1].upper() + lowered[1:]
+    return value
+
+
 def answer_fragment(answer: str) -> str | None:
     """A literal piece of the answer to build the fallback on: its first
-    clause, 3–14 words."""
+    sentence when it has 3–20 words; a longer one is cut at its last comma
+    within 20 words, and with no clean cut there is no quote (a phrase cut
+    mid-way reads as a misquote)."""
     first = re.split(r"(?<=[.;:!?])\s+|\n+", " ".join((answer or "").split()))[0]
-    words = first.strip(" .,;:!?¿¡«»\"'").split()
+    first = first.strip(" .,;:!?¿¡«»\"'")
+    words = first.split()
     if len(words) < _QUOTE_WORDS[0]:
         return None
-    return " ".join(words[: _QUOTE_WORDS[1]])
+    if len(words) <= _QUOTE_WORDS[1]:
+        return sentence_case(first)
+    head = " ".join(words[: _QUOTE_WORDS[1]])
+    cut = head.rfind(",")
+    if cut < 0 or len(head[:cut].split()) < _QUOTE_WORDS[0]:
+        return None
+    return sentence_case(head[:cut])
 
 
 def quoted_question(quote: str | None, cycle: dict, lang: str) -> str | None:
@@ -185,6 +261,7 @@ def quoted_question(quote: str | None, cycle: dict, lang: str) -> str | None:
     the cycle's position (never by the answer)."""
     if not quote:
         return None
+    quote = sentence_case(quote)
     index = int(cycle.get("cycle_index") or 0) % 3
     return text(f"followup_quoted_{index}", lang, quote=quote)
 
@@ -199,11 +276,28 @@ def _references_block(cycle: dict) -> str:
     )
 
 
+def _previous_block(previous: list[str] | None) -> str:
+    if not previous:
+        return ""
+    return (
+        "\n\nRepreguntas que ya hiciste en este intento (no repitas su forma ni su apertura):\n"
+        + "\n".join(f"- {p}" for p in previous[-3:])
+    )
+
+
 async def plan_for(
-    config: RunnableConfig, cycle: dict, answer: str, lang: str, persona: str
+    config: RunnableConfig,
+    cycle: dict,
+    answer: str,
+    lang: str,
+    persona: str,
+    previous: list[str] | None = None,
+    deadline: float | None = None,
 ) -> tuple[dict, list]:
     """({question, target_component_id, mode, quote, provenance}, usage). Never
-    raises and always returns a question."""
+    raises and always returns a question. ``deadline`` (``time.monotonic``)
+    bounds both calls so the turn stays inside the backend's 60 s; the retry
+    is skipped with less than ``_MIN_RETRY_SECONDS`` left."""
     system, provenance = system_prompt(config, "ASSESSMENT_FOLLOWUP", FOLLOWUP_PROMPT, lang, persona)
     user = (
         "Pregunta que vio el estudiante:\n"
@@ -211,6 +305,7 @@ async def plan_for(
         + "\n\nComponentes de la rúbrica (JSON, el estudiante no los ve):\n"
         + json.dumps(components_block(cycle), ensure_ascii=False)
         + _references_block(cycle)
+        + _previous_block(previous)
         + "\n\nRespuesta del estudiante:\n"
         + fence("RESPUESTA", answer[:6000])
     )
@@ -228,6 +323,13 @@ async def plan_for(
     note = ""
     for attempt in range(2):
         plan: FollowupPlan | None = None
+        budget = settings.pablo_timeout_followup_seconds
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if attempt and left < _MIN_RETRY_SECONDS:
+                logger.info("pablo_followup_no_time_to_retry", left=round(left, 1))
+                break
+            budget = max(1.0, min(budget, left))
         try:
             provider = get_provider(config)
             model = resolve_model(config)
@@ -239,7 +341,7 @@ async def plan_for(
                     FollowupPlan,
                     thinking_budget=settings.pablo_thinking_followup,
                 ),
-                timeout=settings.pablo_timeout_followup_seconds,
+                timeout=budget,
             )
             usage.append(
                 make_usage_record(
@@ -257,7 +359,7 @@ async def plan_for(
             plan = None
         if plan is not None:
             quote = quote or echo.validated_quote(str(plan.quote or ""), answer)
-        question, target, mode, refusal = validated(plan, cycle, answer)
+        question, target, mode, refusal = validated(plan, cycle, answer, previous)
         if question is not None:
             break
         logger.info("pablo_followup_refused", attempt=attempt, reason=refusal[:200])

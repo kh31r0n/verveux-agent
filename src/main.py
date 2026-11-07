@@ -4,7 +4,7 @@ import traceback
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 import structlog
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -16,7 +16,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.postgres.aio import AsyncPostgresStore  # long-term prospecting memory
 from langgraph.types import Command
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.responses import Response
 
 import asyncio
@@ -1603,7 +1603,6 @@ class CalebRunRequest(BaseModel):
     config: dict
     internal_cost_cap_usd: float = Field(default=11.7, gt=0)
     agent_code_name: str | None = Field(default="caleb", max_length=64)
-    prompts: dict[str, PromptEntry] | None = None
 
 
 _caleb_tasks: set[asyncio.Task] = set()

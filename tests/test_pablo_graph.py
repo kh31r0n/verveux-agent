@@ -471,7 +471,7 @@ class TestProgress:
         assert line == "Volvemos al tema «las obras» con otra pregunta. Es la última pregunta."
 
     def test_single_topic_and_english(self):
-        assert compose.progress_line(_payload(0, 1, 1, "faith", total=2), 0, 2, "es") == "Tema: faith."
+        assert compose.progress_line(_payload(0, 1, 1, "faith", total=1), 0, 1, "es") == "Tema: faith. Es la última pregunta."
         assert compose.progress_line(_payload(1, 2, 3, "grace"), 1, 6, "en") == (
             "Second topic of three: grace."
         )
@@ -624,7 +624,7 @@ class TestFollowup:
         _, reply, _ = await self._answer(graph, "f3", leaky)
         assert "obras" not in reply.split("una pregunta más:")[1]
         # Refused twice: a question on the student's own words instead.
-        assert "Dijiste «Dios perdona al que no lo merece, eso es gracia». ¿Por qué lo ves así?" in reply
+        assert "Escribiste «Dios perdona al que no lo merece, eso es gracia». ¿Puedes explicar un poco más esa idea?" in reply
         provenance = backend["followup"].await_args.args[2]["provenance"]
         assert provenance["fallback"] == "quoted" and provenance["refusal"] == "leak:obras"
 
@@ -632,7 +632,7 @@ class TestFollowup:
         graph = build_pablo_graph(MemorySaver())
         await self._started(graph, "f4")
         _, reply, events = await self._answer(graph, "f4", FakeProvider(error=TimeoutError()))
-        assert "¿Por qué lo ves así?" in reply
+        assert "¿Puedes explicar un poco más esa idea?" in reply
         assert events[0]["event"] == "followup_presented"
         assert backend["followup"].await_args.args[2]["mode"] == "deepen"
 
@@ -669,3 +669,32 @@ class TestFollowup:
         assert followup.leaked_words("¿Podrías dar un ejemplo?", "Explica con un ejemplo propio", "") == set()
         assert followup.leaked_words("¿Y la santificación?", "Santificacion progresiva", "la gracia") == {"santificacion"}
         assert followup.leaked_words("¿Y la gracia?", "gracia", "Hablé de la gracia") == set()
+
+
+class TestReopen:
+    async def test_the_stored_cycle_is_shown_verbatim_and_answered(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        with patch(f"{NODES}.get_provider", return_value=FakeProvider(_composed("q1"))):
+            await _run(graph, "r1", _turn("start", cycle_index=0))
+        stored = {
+            "cycle_index": 0, "composite_prompt": "Primera pregunta de tres.\n\n¿Qué es la gracia?",
+            "question_snapshot_ids": ["q1"],
+            "component_map": [{"component_id": "q1:c1", "rubric_component_id": "c1", "question_snapshot_id": "q1",
+                               "rubric_version_id": "rv", "part": "Parte A", "name": "c1", "max_points": 4}],
+        }
+        backend["cycle"].reset_mock()
+        nodes, reply, events = await _run(graph, "r1", _turn("reopen", cycle_index=0, cycle=stored))
+        assert nodes == ["pablo_triage", "pablo_reopen"]
+        assert reply.startswith("Tu profesor reabrió esta pregunta.") and "¿Qué es la gracia?" in reply
+        assert events == [{"type": "assessment", "event": "cycle_presented", "cycle_index": 0}]
+        backend["next"].assert_awaited_once()  # only the original start composed
+        backend["cycle"].assert_not_awaited()
+        nodes, _, events = await _run(
+            graph, "r1", _turn("answer", cycle_index=0, is_last_cycle=True, answer={"text": "Un regalo de Dios."})
+        )
+        assert events[-1] == {"type": "assessment", "event": "response_recorded", "cycle_index": 0, "is_last": True}
+
+    async def test_without_a_stored_cycle_it_fails_safely(self, backend):
+        graph = build_pablo_graph(MemorySaver())
+        _, _, events = await _run(graph, "r2", _turn("reopen", cycle_index=1, cycle={}))
+        assert events[0]["event"] == "compose_failed"

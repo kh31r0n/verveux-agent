@@ -27,6 +27,7 @@ import time
 import structlog
 
 from ...config import settings
+from ...observability import pablo_points_capped_total
 from ...providers.registry import get_provider, resolve_model
 from ...schemas.pablo import CycleScore, ScoreCycle, ScoreRequest
 from ...usage import make_usage_record
@@ -38,6 +39,7 @@ from .prompts import SCORE_PROMPT
 logger = structlog.get_logger(__name__)
 
 _NO_ANSWER = {"es": "Sin respuesta.", "en": "No answer."}
+_CAPPED = "(Puntos ajustados al veredicto frente a la referencia del profesor.)"
 _NO_TRANSCRIPT = {
     "es": "No se pudo transcribir el audio; la revisa el profesor.",
     "en": "The audio could not be transcribed; the teacher reviews it.",
@@ -149,12 +151,16 @@ def _question_lines(cycle: ScoreCycle) -> list[str]:
     return lines
 
 
-def _verdict(cycle: ScoreCycle, question_id: str, verdict: str, reason: str) -> dict:
+def _verdict(
+    cycle: ScoreCycle, question_id: str, verdict: str, reason: str, missing=(), errors=()
+) -> dict:
     return {
         "cycleIndex": cycle.cycle_index,
         "questionSnapshotId": question_id,
         "verdict": verdict,
         "reason": reason[:1000],
+        "missingRequired": [str(m)[:300] for m in missing if str(m).strip()][:10],
+        "errorsFound": [str(e)[:300] for e in errors if str(e).strip()][:10],
     }
 
 
@@ -170,7 +176,9 @@ def verdicts_from(cycle: ScoreCycle, result: CycleScore) -> list[dict]:
         if not q.grader_info.strip():
             out.append(_verdict(cycle, q.question_snapshot_id, "no_reference", ""))
         elif (v := by_id.get(q.question_snapshot_id)) is not None:
-            out.append(_verdict(cycle, q.question_snapshot_id, v.verdict, v.reason))
+            out.append(
+                _verdict(cycle, q.question_snapshot_id, v.verdict, v.reason, v.missing_required, v.errors_found)
+            )
         else:
             missing.append(q.question_snapshot_id)
     if missing:
@@ -216,9 +224,21 @@ def _zero(cycle: ScoreCycle, rationale: str, needs_review: bool) -> list[dict]:
     ]
 
 
-def components_from(cycle: ScoreCycle, result: CycleScore) -> list[dict]:
-    """The model's scores mapped onto the cycle's components, clamped. Raises
-    when a component is missing — a partial score is not a score."""
+def verdict_cap(verdict: str | None) -> float | None:
+    """The share of a component's max a verdict allows (None = no cap)."""
+    if verdict == "partial":
+        return settings.pablo_partial_cap
+    if verdict == "incorrect":
+        return settings.pablo_incorrect_cap
+    return None
+
+
+def components_from(cycle: ScoreCycle, result: CycleScore, verdicts: list[dict] | None = None) -> list[dict]:
+    """The model's scores mapped onto the cycle's components, clamped to the
+    rubric and capped by their question's verdict (the verdict is the ground
+    truth; in production 14 of 32 "partial" answers had the max). Raises when
+    a component is missing — a partial score is not a score."""
+    verdict_of = {v["questionSnapshotId"]: v["verdict"] for v in verdicts or []}
     by_id = {s.component_id.strip(): s for s in result.components}
     missing = [c.component_id for c in cycle.components if c.component_id not in by_id]
     if missing:
@@ -231,6 +251,20 @@ def components_from(cycle: ScoreCycle, result: CycleScore) -> list[dict]:
             logger.warning(
                 "pablo_points_clamped", component_id=c.component_id, points=score.points, max=c.max_points
             )
+        rationale = score.rationale[:1500]
+        verdict = verdict_of.get(c.question_snapshot_id)
+        cap = verdict_cap(verdict)
+        if cap is not None and points > cap * c.max_points:
+            logger.info(
+                "pablo_points_capped_by_verdict",
+                component_id=c.component_id,
+                verdict=verdict,
+                points=points,
+                cap=cap * c.max_points,
+            )
+            pablo_points_capped_total.labels(verdict=verdict).inc()
+            points, clamped = round(cap * c.max_points, 2), True
+            rationale = f"{rationale} {_CAPPED}".strip()
         rows.append(
             {
                 "cycleIndex": cycle.cycle_index,
@@ -241,7 +275,7 @@ def components_from(cycle: ScoreCycle, result: CycleScore) -> list[dict]:
                 "points": points,
                 "maxPoints": c.max_points,
                 "criterion": score.criterion[:300],
-                "rationale": score.rationale[:1500],
+                "rationale": rationale,
                 "needsReview": False,
                 "clamped": clamped,
             }
@@ -278,7 +312,8 @@ async def _score_cycle(
                     provenance=provenance,
                 )
             )
-            return components_from(cycle, result), verdicts_from(cycle, result), usage, model
+            verdicts = verdicts_from(cycle, result)
+            return components_from(cycle, result, verdicts), verdicts, usage, model
         except Exception as exc:  # noqa: BLE001 — retried, then the attempt fails loudly
             last_error = exc
             logger.warning("pablo_score_cycle_failed", cycle_index=cycle.cycle_index, error=str(exc)[:300])

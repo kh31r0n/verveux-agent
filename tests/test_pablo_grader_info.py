@@ -114,8 +114,10 @@ class TestScoring:
         await _score_run(provider, _request([_cycle(0, {"text": "es un regalo"})]))
         body = jobs_backend["score"].await_args.args[1]
         assert body["verdicts"] == [
-            {"cycleIndex": 0, "questionSnapshotId": "q0a", "verdict": "partial", "reason": "Omite la fe"},
-            {"cycleIndex": 0, "questionSnapshotId": "q0b", "verdict": "no_reference", "reason": ""},
+            {"cycleIndex": 0, "questionSnapshotId": "q0a", "verdict": "partial", "reason": "Omite la fe",
+             "missingRequired": [], "errorsFound": []},
+            {"cycleIndex": 0, "questionSnapshotId": "q0b", "verdict": "no_reference", "reason": "",
+             "missingRequired": [], "errorsFound": []},
         ]
         assert list(CycleScore.model_json_schema()["properties"]) == ["verdicts", "components"]
         system, user = (m["content"] for m in provider.calls[0][1])
@@ -319,7 +321,7 @@ class TestFollowup:
         leaky = GraphProvider(_plan(question="¿Y cómo entra la santificación en esto?"))
         _, reply, _ = await self._answer(graph, "fr2", leaky)
         assert "santificación" not in reply
-        assert "Dijiste «Dios perdona siempre»" in reply
+        assert "Escribiste «Dios perdona siempre»" in reply
 
     def test_leak_guard_covers_the_reference(self):
         cycle = {
@@ -399,6 +401,20 @@ class TestFollowupRetry:
             plan, usage = await followup.plan_for(CONFIG, self.CYCLE, self.ANSWER, "es", "Pablo")
         return plan, usage, provider
 
+    async def _plan_with_deadline(self, deadline):
+        provider = GraphProvider()
+
+        async def generate(messages, model, schema, **_):
+            provider.messages.append(messages)
+            return _plan(question="x" * 500 + "?")
+
+        provider.generate_structured = generate
+        with patch(f"{FOLLOWUP}.get_provider", return_value=provider):
+            plan, usage = await followup.plan_for(
+                CONFIG, self.CYCLE, self.ANSWER, "es", "Pablo", deadline=deadline
+            )
+        return plan, usage, provider
+
     async def test_a_refused_question_is_asked_again_with_the_reason(self):
         leaky = _plan(question="¿Y la santificación?")
         good = _plan(question="Dijiste que es un regalo: ¿qué cambia si alguien lo rechaza?")
@@ -412,7 +428,7 @@ class TestFollowupRetry:
 
     async def test_twice_refused_falls_back_on_the_students_words(self):
         plan, _, _ = await self._plan(_plan(question="x" * 500 + "?"), TimeoutError())
-        assert plan["question"] == "Dijiste «La gracia es un regalo que Dios da sin que lo merezcamos». ¿Por qué lo ves así?"
+        assert plan["question"] == "Escribiste «La gracia es un regalo que Dios da sin que lo merezcamos». ¿Puedes explicar un poco más esa idea?"
         assert plan["provenance"]["fallback"] == "quoted"
 
     def test_a_tail_after_the_question_is_dropped(self):
@@ -426,5 +442,136 @@ class TestFollowupRetry:
             "¿Puedes desarrollar un poco más tu respuesta, con un ejemplo?"
         )
         assert followup.quoted_question("es un regalo", {**self.CYCLE, "cycle_index": 1}, "en") == (
-            "You mentioned “es un regalo”. What leads you to think so?"
+            "About this part of your answer: “es un regalo”. What passage or example supports it?"
         )
+
+
+class TestVerdictCap:
+    """In production 14 of 32 «partial» answers had the max: the verdict now
+    caps its question's points in code."""
+
+    def _result(self, verdict, points):
+        return CycleScore(
+            verdicts=[QuestionVerdict(question_snapshot_id="q0a", verdict=verdict, reason="r",
+                                      missing_required=["humildad de Newton"], errors_found=[])],
+            components=[ComponentScore(component_id="q0a:c1", points=points),
+                        ComponentScore(component_id="q0b:c1", points=4)],
+        )
+
+    def test_partial_never_reaches_the_max_and_incorrect_never_passes_half(self):
+        cycle = scoring.ScoreCycle(**_cycle(0, {"text": "r"}))
+        for verdict, points, expected in (("partial", 4, 3.2), ("incorrect", 4, 2.0), ("correct", 4, 4.0),
+                                          ("partial", 3, 3.0)):
+            result = self._result(verdict, points)
+            verdicts = scoring.verdicts_from(cycle, result)
+            rows = scoring.components_from(cycle, result, verdicts)
+            capped = rows[0]
+            assert capped["points"] == expected, (verdict, points)
+            assert capped["clamped"] is (expected < points)
+            # The question without a reference is never capped.
+            assert rows[1]["points"] == 4.0
+        assert verdicts[0]["missingRequired"] == ["humildad de Newton"]
+
+    def test_the_rule_separates_required_optional_and_errors(self):
+        rule = reference_rule("score", "es")
+        assert "REQUERIDO" in rule and "OPCIONAL" in rule and "nunca baja el veredicto" in rule
+        assert "nunca se presenta" in reference_rule("feedback", "es")
+
+
+class TestProductionReview:
+    """Cases from the 2026-11-07 review of the first real assessment."""
+
+    def test_tidy_fixes_what_the_model_wrote(self):
+        assert followup.tidy("!Hola! !Qué gusto saludarte de nuevo! ¹Cómo se relaciona esa idea con Marx?") == (
+            "¿Cómo se relaciona esa idea con Marx?"
+        )
+        assert followup.tidy("²Qué es exactamente lo que causa ese problema?") == (
+            "¿Qué es exactamente lo que causa ese problema?"
+        )
+        assert followup.tidy("Qué pasaje lo sostiene?") == "¿Qué pasaje lo sostiene?"
+
+    def test_the_guard_lets_common_words_and_bank_wording_through(self):
+        cycle = {
+            "component_map": [{"component_id": "q1:c1", "part": "Parte A", "name": "mitos modernos y visión bíblica",
+                               "question_snapshot_id": "q1"}],
+            "rubric_criteria": {"q1:c1": "incluyendo información sobre el mito moderno y textos bíblicos"},
+            "grader_info": {"q1": "La propuesta final debe describir una razón que opera sometida a la revelación "
+                                  "y la capacidad para pensar; sociedad perfecta en la tierra."},
+            "question_texts": {"q1": "el hombre es un ser autónomo gracias a su capacidad para pensar"},
+            "composite_prompt": "¿Qué contraste ves entre Descartes y la visión bíblica?",
+        }
+        ok = ["¿Qué textos bíblicos sostienen ese contraste entre fe y razón?",
+              "¿De qué forma esa propuesta cambia tu capacidad para pensar?"]
+        for q in ok:
+            assert followup.validated(_plan(target_component_id="q1:c1", question=q), cycle, "algo")[0] == q
+        leak = followup.validated(_plan(target_component_id="q1:c1",
+                                        question="¿Cómo opera la razón sometida a la revelación?"), cycle, "algo")
+        assert leak[0] is None and leak[3].startswith("leak:") and "sometida" in leak[3]
+
+    def test_a_repeated_opening_is_refused(self):
+        cycle = TestFollowupRetry.CYCLE
+        previous = ["¿Cómo se relaciona esta idea con Romanos 3:8?"]
+        again = _plan(target_component_id="q1:c1", question="¿Cómo se relaciona el regalo con la ley?")
+        assert followup.validated(again, cycle, "x", previous)[3] == "repeated_opening"
+        fresh = _plan(target_component_id="q1:c1", question="¿Qué cambiaría si el regalo se pudiera ganar?")
+        assert followup.validated(fresh, cycle, "x", previous)[0] is not None
+        assert "Cómo se relaciona" in followup.refusal_note("repeated_opening")
+
+    def test_the_fallback_quote_is_a_whole_clause_in_sentence_case(self):
+        caps = "EL MAL NACE EN EL CORAZON DE UN HOMBRE APARTADO DE DIOS, Y NO SOLO EN LOS FACTORES EXTERNOS COMO LO EXPONE MARX"
+        assert followup.answer_fragment(caps) == "El mal nace en el corazon de un hombre apartado de dios"
+        # A long first sentence with no clean cut is not quoted at all.
+        assert followup.answer_fragment(" ".join(["palabra"] * 30)) is None
+
+    async def test_the_retry_is_skipped_without_time_left(self):
+        import time as _time
+        plan, usage, provider = await TestFollowupRetry()._plan_with_deadline(_time.monotonic() + 5)
+        assert len(provider.messages) == 1 and plan["provenance"]["fallback"] == "quoted"
+
+    def test_one_topic_counts_the_questions(self):
+        payload = {"learning_outcome": {"name": "Reconoce los mitos."}, "outcome_position": 1,
+                   "outcome_count": 1, "round": 1, "is_last": False}
+        assert compose.progress_line(payload, 1, 3, "es") == "Segunda pregunta de tres."
+        assert compose.progress_line({**payload, "is_last": True}, 2, 3, "es") == (
+            "Tercera pregunta de tres. Es la última pregunta."
+        )
+
+
+class TestReferenceCheck:
+    REF = (
+        "* Debe mencionar el contraste entre el orgullo cartesiano y la humildad de Newton, y la relación con Stg 4:4.\n"
+        "* Puede señalar que solo la astucia es moralmente ambivalente."
+    )
+
+    async def test_only_literal_items_survive(self):
+        from src.agents.pablo import reference_check
+        from src.schemas.pablo import ReferenceCheckRequest, ReferenceCheckResult
+
+        provider = FakeProvider({"ReferenceCheckResult": ReferenceCheckResult(
+            required_not_in_statement=["el contraste entre el orgullo cartesiano y la humildad de Newton",
+                                       "algo que el profesor nunca escribió"],
+            optional_items=["solo la astucia es moralmente ambivalente"],
+        )})
+        req = ReferenceCheckRequest(tenant_id="t1", questions=[
+            {"question_snapshot_id": "q1", "text": "Contraste a Descartes con la Biblia.", "grader_info": self.REF},
+            {"question_snapshot_id": "q2", "text": "Sin referencia", "grader_info": ""},
+        ])
+        with patch("src.agents.pablo.reference_check.get_provider", return_value=provider), \
+             patch("src.agents.pablo.jobs.llm_config", AsyncMock(return_value=CONFIG)):
+            out = await reference_check.check(req)
+        assert out["checks"] == [{
+            "question_snapshot_id": "q1",
+            "required_not_in_statement": ["el contraste entre el orgullo cartesiano y la humildad de Newton"],
+            "optional_items": ["solo la astucia es moralmente ambivalente"],
+        }]
+        assert len(out["turnUsage"]) == 1
+        # The reference reaches the model fenced, the statement too.
+        user = provider.calls[0][1][1]["content"]
+        assert "<<<ENUNCIADO" in user and "<<<REFERENCIA" in user
+
+    def test_endpoint_requires_service_auth(self):
+        from fastapi.testclient import TestClient
+        from src.main import app
+
+        r = TestClient(app).post("/assessment/reference-check", json={"tenant_id": "t", "questions": []})
+        assert r.status_code in (401, 403)

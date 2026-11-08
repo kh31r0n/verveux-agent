@@ -126,17 +126,19 @@ _TEXTS: dict[str, dict[str, str]] = {
     },
     # Built on the student's own words when the model's question was refused
     # twice; picked by the cycle's position, never by the answer.
+    # Neutral: the quote may be the student describing an author, not their
+    # own stance, so nothing presumes they hold it.
     "followup_quoted_0": {
-        "es": "Dijiste «{quote}». ¿Por qué lo ves así?",
-        "en": "You said “{quote}”. Why do you see it that way?",
+        "es": "Escribiste «{quote}». ¿Puedes explicar un poco más esa idea?",
+        "en": "You wrote “{quote}”. Can you explain that idea a little more?",
     },
     "followup_quoted_1": {
-        "es": "Mencionaste «{quote}». ¿Qué te lleva a pensarlo?",
-        "en": "You mentioned “{quote}”. What leads you to think so?",
+        "es": "Sobre esta parte de tu respuesta: «{quote}». ¿Qué pasaje o ejemplo la sostiene?",
+        "en": "About this part of your answer: “{quote}”. What passage or example supports it?",
     },
     "followup_quoted_2": {
-        "es": "Dijiste «{quote}». ¿Qué cambiaría si no fuera así?",
-        "en": "You said “{quote}”. What would change if it were not so?",
+        "es": "Retomo lo que escribiste: «{quote}». ¿Qué consecuencia tiene esa idea?",
+        "en": "Going back to what you wrote: “{quote}”. What follows from that idea?",
     },
     "followup_generic_plain": {
         "es": "¿Puedes desarrollar un poco más tu respuesta, con un ejemplo?",
@@ -150,6 +152,7 @@ _TEXTS: dict[str, dict[str, str]] = {
         "en": "First topic of {count}: {name}.",
     },
     "progress_only": {"es": "Tema: {name}.", "en": "Topic: {name}."},
+    "progress_single": {"es": "{ordinal} pregunta de {count}.", "en": "{ordinal} question of {count}."},
     "progress_next": {
         "es": "{ordinal} tema de {count}: {name}.",
         "en": "{ordinal} topic of {count}: {name}.",
@@ -171,6 +174,10 @@ _TEXTS: dict[str, dict[str, str]] = {
     "survey_invite": {
         "es": "Antes de ver tu resultado, cuéntanos cómo fue tu experiencia.",
         "en": "Before you see your result, tell us how the experience was.",
+    },
+    "reopened": {
+        "es": "Tu profesor reabrió esta pregunta. Tienes el tiempo completo para responderla de nuevo.",
+        "en": "Your teacher reopened this question. You have the full time to answer it again.",
     },
     "attempt_time_up": {
         "es": "Se acabó el tiempo de la evaluación.",
@@ -226,13 +233,21 @@ def effort(cycle_index: int, lang: str) -> str:
     return phrases[max(cycle_index, 0) % len(phrases)]
 
 
-def ordinal(n: int, lang: str) -> str:
+def ordinal(n: int, lang: str, feminine: bool = False) -> str:
     words = _ORDINALS.get(lang) or _ORDINALS["es"]
-    return words[n - 1] if 1 <= n <= len(words) else f"{n}."
+    if not 1 <= n <= len(words):
+        return f"{n}."
+    word = words[n - 1]
+    # «primer tema» but «primera pregunta».
+    if feminine and lang == "es":
+        word = {"primer": "primera", "tercer": "tercera"}.get(word, word[:-1] + "a" if word.endswith("o") else word)
+    return word
 
 
-def cardinal(n: int, lang: str) -> str:
+def cardinal(n: int, lang: str, feminine: bool = False) -> str:
     words = _CARDINALS.get(lang) or _CARDINALS["es"]
+    if feminine and lang == "es" and n == 1:
+        return "una"
     return words[n - 1] if 1 <= n <= len(words) else str(n)
 
 

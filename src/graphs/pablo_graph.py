@@ -10,6 +10,7 @@ Topology:
               ├── pablo_receive_answer  (answer: transcribe, record, acknowledge, ask the follow-up)
               ├── pablo_followup_answer (followup_answer: record it beside the first, acknowledge)
               ├── pablo_timeout         (the backend closed a cycle or the attempt)
+              ├── pablo_reopen          (reopen: a teacher gave a lost question back, shown verbatim)
               └── pablo_error           (a turn this attempt does not expect)
 
 Every branch ends the turn. The timer is paused for all of them; the backend
@@ -28,6 +29,7 @@ from ..agents.pablo.nodes import (
     pablo_next_cycle_node,
     pablo_opening_node,
     pablo_receive_answer_node,
+    pablo_reopen_node,
     pablo_timeout_node,
     pablo_triage_node,
     pablo_warmup_answer_node,
@@ -43,6 +45,7 @@ _ROUTES = {
     "answer": "pablo_receive_answer",
     "followup_answer": "pablo_followup_answer",
     "timeout": "pablo_timeout",
+    "reopen": "pablo_reopen",
     "unexpected": "pablo_error",
 }
 
@@ -62,6 +65,7 @@ def build_pablo_graph(checkpointer):
     graph.add_node("pablo_receive_answer", pablo_receive_answer_node)
     graph.add_node("pablo_followup_answer", pablo_followup_answer_node)
     graph.add_node("pablo_timeout", pablo_timeout_node)
+    graph.add_node("pablo_reopen", pablo_reopen_node)
     graph.add_node("pablo_error", pablo_error_node)
 
     graph.add_edge(START, "pablo_triage")

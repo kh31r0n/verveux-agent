@@ -80,6 +80,11 @@ class QuestionVerdict(BaseModel):
     verdict: Literal["correct", "partial", "incorrect"]
     # Technical, for the teacher; never shown to the student.
     reason: str = ""
+    # What the reference REQUIRED and the answer left out, and the "common
+    # errors" it made — short phrases for the teacher. Optional points
+    # ("Puede…") never appear here.
+    missing_required: list[str] = Field(default_factory=list)
+    errors_found: list[str] = Field(default_factory=list)
 
 
 class CycleScore(BaseModel):
@@ -152,6 +157,26 @@ class ImprovementProposals(BaseModel):
     # General scoring guidance for a DRAFT of the ASSESSMENT_SCORE prompt. No
     # student answer is sent; code drops any that quotes a teacher rationale.
     prompt_guidance: list[str] = Field(default_factory=list)
+
+
+# ── Reference check (configuration time) ─────────────────────────────────────
+
+
+class ReferenceCheckResult(BaseModel):
+    # Literal fragments of the reference, checked in code.
+    required_not_in_statement: list[str] = Field(default_factory=list)
+    optional_items: list[str] = Field(default_factory=list)
+
+
+class ReferenceCheckQuestion(BaseModel):
+    question_snapshot_id: str
+    text: str
+    grader_info: str = ""
+
+
+class ReferenceCheckRequest(BaseModel):
+    tenant_id: str
+    questions: list[ReferenceCheckQuestion] = Field(default_factory=list)
 
 
 # ── Background job requests (backend → agent) ────────────────────────────────

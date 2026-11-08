@@ -69,6 +69,7 @@ _ROUTES = {
     "answer": "answer",
     "followup_answer": "followup_answer",
     "timeout": "timeout",
+    "reopen": "reopen",
 }
 
 
@@ -209,6 +210,9 @@ async def pablo_next_cycle_node(state: AgentState, config: RunnableConfig) -> di
         "rubric_criteria": compose.component_criteria(parts, candidates),
         # The teacher's references, for the follow-up only (never reported).
         "grader_info": compose.question_grader_info(parts, candidates),
+        # The bank's own wording, which the student also saw: the follow-up's
+        # leak guard allows its words (never reported).
+        "question_texts": compose.question_texts(parts, candidates),
         "prompt_provenance": provenance,
     }
     try:
@@ -247,6 +251,42 @@ async def pablo_next_cycle_node(state: AgentState, config: RunnableConfig) -> di
         composed=result is not None,
     )
     return _present(pablo, cycle, usage)
+
+
+# ── Reopen (a teacher gives a question back) ─────────────────────────────────
+
+
+async def pablo_reopen_node(state: AgentState) -> dict:
+    """The teacher reopened a cycle the student lost to a system failure. The
+    backend sends the cycle as it was stored: the same question, verbatim —
+    no composition, nothing reported (the backend already has the cycle)."""
+    record_node_invocation("pablo_reopen")
+    turn = assessment_turn(state)
+    pablo = pablo_dict(state)
+    lang = lang_of(state)
+    stored = turn.get("cycle") if isinstance(turn.get("cycle"), dict) else {}
+    prompt = str(stored.get("composite_prompt") or "").strip()
+    components = [c for c in stored.get("component_map") or [] if isinstance(c, dict) and c.get("component_id")]
+    if not prompt or not components:
+        logger.warning("pablo_reopen_without_cycle", attempt_id=pablo.get("attempt_id"))
+        emit_assessment("compose_failed", reason="reopen_without_cycle")
+        return reply(text("compose_failed", lang), pablo=pablo)
+    cycle_index = int(turn.get("cycle_index", stored.get("cycle_index", 0)))
+    cycle = {
+        "cycle_index": cycle_index,
+        "learning_outcome_id": str(stored.get("learning_outcome_id") or ""),
+        "composite_prompt": prompt,
+        "question_snapshot_ids": [str(q) for q in stored.get("question_snapshot_ids") or []],
+        "component_map": components,
+        "rubric_criteria": dict(stored.get("rubric_criteria") or {}),
+        "grader_info": {k: str(v) for k, v in (stored.get("grader_info") or {}).items() if v},
+        "question_texts": {k: str(v) for k, v in (stored.get("question_texts") or {}).items()},
+        "reopened": True,
+    }
+    pablo.update(current_cycle=cycle_index, phase="answering", cycle=cycle)
+    emit_assessment("cycle_presented", cycle_index=cycle_index)
+    logger.info("pablo_cycle_reopened", attempt_id=pablo.get("attempt_id"), cycle_index=cycle_index)
+    return reply(f"{text('reopened', lang)}\n\n{prompt}", pablo=pablo)
 
 
 # ── Answer ───────────────────────────────────────────────────────────────────
@@ -321,13 +361,24 @@ def _finish(
 
 
 async def _ask_followup(
-    state: AgentState, config: RunnableConfig, pablo: dict, cycle_index: int, typed: str, transcript, content: str
+    state: AgentState,
+    config: RunnableConfig,
+    pablo: dict,
+    cycle_index: int,
+    typed: str,
+    transcript,
+    content: str,
+    started: float | None = None,
 ):
     """(reply | None, quote, usage). The follow-up is reported before it is
     shown; when the backend did not store it, the cycle ends as it would have."""
     lang = lang_of(state)
     cycle = pablo.get("cycle") or {}
-    plan, usage = await followup.plan_for(config, cycle, content, lang, persona(state))
+    previous = list(pablo.get("followups") or [])
+    deadline = (started or time.monotonic()) + settings.pablo_followup_budget_seconds
+    plan, usage = await followup.plan_for(
+        config, cycle, content, lang, persona(state), previous=previous, deadline=deadline
+    )
     # The quote is shown only for typed words; audio already shows its transcript.
     quote = echo.validated_quote(plan["quote"] or "", typed) if typed else None
     try:
@@ -350,7 +401,8 @@ async def _ask_followup(
         "target_component_id": plan["target_component_id"],
         "mode": plan["mode"],
     }
-    pablo.update(cycle=cycle, phase="followup")
+    # Later follow-ups in the attempt must not open the same way.
+    pablo.update(cycle=cycle, phase="followup", followups=[*previous, plan["question"]][-3:])
     lines = _acknowledgement(typed, transcript, quote, cycle_index, lang)
     lines.append(f"{text('followup_intro', lang)}\n{plan['question']}")
     emit_assessment("followup_presented", cycle_index=cycle_index)
@@ -366,6 +418,7 @@ async def _ask_followup(
 
 async def pablo_receive_answer_node(state: AgentState, config: RunnableConfig) -> dict:
     record_node_invocation("pablo_receive_answer")
+    started = time.monotonic()
     turn = assessment_turn(state)
     pablo = pablo_dict(state)
     lang = lang_of(state)
@@ -398,7 +451,9 @@ async def pablo_receive_answer_node(state: AgentState, config: RunnableConfig) -
     content = "\n".join(p for p in (typed, heard) if p)
     quote, usage = None, []
     if followup_allowed and content:
-        presented, quote, usage = await _ask_followup(state, config, pablo, cycle_index, typed, transcript, content)
+        presented, quote, usage = await _ask_followup(
+            state, config, pablo, cycle_index, typed, transcript, content, started
+        )
         if presented:
             return presented
     elif quote_task:

@@ -114,6 +114,12 @@ email_sync_runs_total = Counter(
 # ── Theology agent (ismael) ──────────────────────────────────────────────────
 # outcome: answered | unresolved | no_results | no_pages | search_failed |
 # timeout | error
+pablo_points_capped_total = Counter(
+    "pablo_points_capped_total",
+    "Rubric points lowered in code to what the question's verdict allows",
+    ["verdict"],
+)
+
 pablo_feedback_reference_leaks_total = Counter(
     "pablo_feedback_reference_leaks_total",
     "Feedback that kept copying the teacher's reference and was rewritten without it",

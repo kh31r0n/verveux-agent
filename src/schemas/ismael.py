@@ -53,6 +53,13 @@ class TriageResult(BaseModel):
     # Brain's library catalog in code so the question can be asked of that one
     # document: Brain searches chunk text only, never titles.
     work: str = ""
+    # The message is an item copied from the student's evaluation (a quiz
+    # question, a task's prompt). ``question`` then carries the concept behind
+    # it, and the answer explains that concept without answering the item.
+    assessment_item: bool = False
+    # The message is the student's own text for the course (a forum post, an
+    # essay), not a question for the assistant.
+    own_text: bool = False
 
 
 class MoodleSupportOutcome(StrEnum):
@@ -122,3 +129,13 @@ class SurveyAnswer(BaseModel):
 class FaqAnswer(BaseModel):
     # The FAQ's answer adapted to the exact question, adding nothing it lacks.
     reply: str = Field(max_length=2000)
+
+
+class GroundedAnswer(BaseModel):
+    """A general answer built on the fragments Brain found but judged
+    insufficient: what the library says first, general knowledge for the rest."""
+
+    answer: str = Field(max_length=4000)
+    # Ids (F1, F2…) of the fragments the answer drew on; validated in code
+    # against the ones shown, and only those become References.
+    used: list[str] = Field(default_factory=list)

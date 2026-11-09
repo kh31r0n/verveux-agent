@@ -85,24 +85,31 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": (
             "Buena pregunta{name}. Mientras preparo las fuentes de la biblioteca "
             "(tarda alrededor de un minuto), te hago tres preguntas rápidas. Son solo "
-            "para estadística y no cambian la respuesta; elige una opción o escribe tu respuesta."
+            "para estadística y no cambian la respuesta; elige una opción o escribe tu "
+            "respuesta. La respuesta te llega aquí mismo aunque no las contestes."
         ),
         "en": (
             "Good question{name}. While I get the library's sources ready (it takes "
             "about a minute), here are three quick questions. They are only for "
-            "statistics and do not change the answer; pick an option or type your answer."
+            "statistics and do not change the answer; pick an option or type your "
+            "answer. The answer reaches you here even if you skip them."
         ),
     },
     "survey_next": {"es": "Gracias.", "en": "Thanks."},
     "survey_done": {
         "es": (
-            "¡Gracias! Estoy consultando la biblioteca; te escribo aquí mismo en cuanto "
+            "¡Gracias! Sigo consultando la biblioteca; te escribo aquí mismo en cuanto "
             "tenga la respuesta con sus referencias."
         ),
         "en": (
-            "Thank you! I'm checking the library; I'll write back right here as soon "
-            "as I have the answer with its references."
+            "Thank you! I'm still checking the library; I'll write back right here as "
+            "soon as I have the answer with its references."
         ),
+    },
+    # The survey ends after the answer was already delivered.
+    "survey_thanks": {
+        "es": "¡Gracias por responder! Si tienes otra pregunta, aquí estoy.",
+        "en": "Thanks for answering! If you have another question, I'm here.",
     },
     "consulting": {
         "es": (
@@ -122,6 +129,50 @@ _TEXTS: dict[str, dict[str, str]] = {
         "en": (
             "I'm still working on your previous question: “{question}”. I'll send the "
             "answer as soon as I have it; then you can ask another one."
+        ),
+    },
+    # A theology question that arrives while another one is being answered.
+    "queued": {
+        "es": (
+            "Anotada tu pregunta: «{question}». Te la respondo aquí mismo en cuanto "
+            "termine la anterior."
+        ),
+        "en": (
+            "Got your question: “{question}”. I'll answer it right here as soon as I "
+            "finish the previous one."
+        ),
+    },
+    "queue_full": {
+        "es": (
+            "Ya tengo varias preguntas tuyas en espera. En cuanto te responda esas, "
+            "escríbeme esta de nuevo: «{question}»."
+        ),
+        "en": (
+            "I already have several of your questions waiting. Once I've answered "
+            "them, send me this one again: “{question}”."
+        ),
+    },
+    # Before an answer to a question copied from an evaluation (quiz, task):
+    # the concept is explained, the item is the student's to answer.
+    "guide_note": {
+        "es": (
+            "Te explico el tema con las fuentes de la biblioteca; la respuesta de tu "
+            "evaluación la eliges tú."
+        ),
+        "en": (
+            "Here is the topic, explained with the library's sources; the answer to "
+            "your evaluation is yours to choose."
+        ),
+    },
+    # The student pasted a text of their own (a forum post, an essay).
+    "own_text": {
+        "es": (
+            "Parece que es un texto tuyo para el curso. Si tienes una pregunta sobre "
+            "el tema, escríbemela y la busco en la biblioteca."
+        ),
+        "en": (
+            "That looks like a text of your own for the course. If you have a question "
+            "about the topic, send it to me and I'll look it up in the library."
         ),
     },
     "off_topic": {
@@ -211,6 +262,44 @@ _TEXTS: dict[str, dict[str, str]] = {
         "es": "Si aun así no funciona, cuéntame qué mensaje te aparece exactamente al enviarlo.",
         "en": "If it still doesn't work, tell me exactly what message appears when you submit it.",
     },
+    "support_form_broken": {
+        "es": (
+            "Parece que el formulario de soporte tiene una falla del lado de la institución, "
+            "así que no vale la pena seguir intentándolo."
+        ),
+        "en": (
+            "The support form seems to be failing on the institution's side, so it is not "
+            "worth trying again."
+        ),
+    },
+    "support_form_contacts": {
+        "es": "Escríbeles directamente y cuéntales que el formulario falla: {contacts}.",
+        "en": "Write to them directly and tell them the form is failing: {contacts}.",
+    },
+    "support_form_no_contacts": {
+        "es": (
+            "Escribe a la secretaría o a la coordinación de tu institución, cuéntales que el "
+            "formulario falla y adjunta la captura del error."
+        ),
+        "en": (
+            "Write to your institution's office or coordination, tell them the form is "
+            "failing and attach a screenshot of the error."
+        ),
+    },
+    "support_user_teaches": {
+        "es": (
+            "El usuario es docente en el aula: respóndele como a un colega docente y nunca "
+            "le sugieras contactar a su profesor."
+        ),
+        "en": "The user teaches in the classroom: answer as to a fellow teacher and never suggest contacting their teacher.",
+    },
+    "support_roles_rule": {
+        "es": (
+            "Su rol en cada curso es el que aparece entre paréntesis junto al curso; no le "
+            "atribuyas permisos que no aparecen ahí."
+        ),
+        "en": "Their role in each course is the one in parentheses next to it; never attribute permissions that are not listed.",
+    },
     "research_more_info": {"es": "Más información: {url}", "en": "More information: {url}"},
     "support_messaging_off": {
         "es": "La mensajería entre usuarios del aula está desactivada: no sugieras escribir por la mensajería de Moodle.",
@@ -268,6 +357,14 @@ _TEXTS: dict[str, dict[str, str]] = {
     "teacher_from_support": {
         "es": "Eso lo revisa tu profesor; te ayudo a contactarlo.",
         "en": "That is for your teacher to review; I'll help you reach them.",
+    },
+    "teacher_no_reply": {
+        "es": "Entiendo que tu profesor no te ha respondido.",
+        "en": "I understand your teacher has not replied.",
+    },
+    "teacher_no_reply_coordination": {
+        "es": "Puedes escribir a la coordinación académica de tu institución para que te ayuden a contactarlo.",
+        "en": "You can write to your institution's academic coordination so they help you reach them.",
     },
     "teacher_tell_me": {
         "es": "Con gusto. Cuéntame qué necesitas.",

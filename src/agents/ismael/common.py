@@ -14,7 +14,7 @@ from ...graphs.state import AgentState
 from ...schemas.ismael import IsmaelIntent
 from ..utils import emit_quick_replies
 
-DEFAULT_PERSONA = "Ismael"
+DEFAULT_PERSONA = "Salomón"
 
 # A multi-turn latch (the teacher flow, a support case, the rating question) is
 # forgotten after this long: the next message is a fresh turn, not an answer to

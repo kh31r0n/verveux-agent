@@ -17,7 +17,7 @@ class CampusSettings(BaseSettings):
     llm: str = "gemini"
     # Fixed, not taken from GOOGLE_CLOUD_PROJECT, which on a developer's machine
     # often points at another project.
-    gemini_project: str = "yorch-platform-prod"
+    gemini_project: str = "vervux-platform-prod"
     # The newest models are only served from the global endpoint.
     gemini_location: str = "global"
     # Two tiers: a fast one for what happens live, a smarter one to design

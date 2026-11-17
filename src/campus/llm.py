@@ -133,9 +133,17 @@ class FakeLlm:
     ) -> dict[str, Any]:
         if task == "gm":
             line = data["line"]["line"]
+            # Quien va primero y quien está en racha: por su identificador en
+            # lo escrito y por su alias en lo hablado.
+            first = (data.get("standings") or [None])[0]
+            streaks = [s for s in data.get("standings") or [] if s.get("streak", 0) >= 3]
+            named = f" · primero {{{first['player_id']}}}" if first else ""
+            named += "".join(f" · racha {{{s['player_id']}}}" for s in streaks)
+            said = f", primero {first['alias']}" if first else ""
+            said += "".join(f", {s['alias']} en racha" for s in streaks)
             return {
-                "text": f"[GM] {line}",
-                "spoken": f"Game Master: {line}",
+                "text": f"[GM] {line}{named}",
+                "spoken": f"Game Master: {line}{said}",
                 "rooms": [
                     {"team_id": team["team_id"], "text": f"[GM] {team['team_id']}: {line}"}
                     for team in data.get("rooms_for", [])

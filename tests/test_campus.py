@@ -423,3 +423,43 @@ async def test_a_design_needs_files_and_an_existing_id(api: httpx.AsyncClient) -
     assert (await api.get("/designs/" + "0" * 32)).status_code == 404
     assert (await api.post("/designs/" + "0" * 32 + "/approval", json={"approved": []})).status_code == 404
     assert (await api.get("/designs/no-es-un-id")).status_code == 422
+
+
+async def test_the_game_master_names_the_leader_and_the_streak_by_id_and_says_their_alias(
+    api: httpx.AsyncClient, monkeypatch
+) -> None:
+    from src.campus.llm import FakeLlm
+
+    spoken: list[str] = []
+    original = FakeLlm.speech
+
+    async def record(self, text: str, lang: str) -> bytes:
+        spoken.append(text)
+        return await original(self, text, lang)
+
+    monkeypatch.setattr(FakeLlm, "speech", record)
+    standings = [
+        {"player_id": "p2", "alias": "Ana", "score": 420, "streak": 4},
+        {"player_id": "p1", "alias": "Luis", "score": 300, "streak": 0},
+    ]
+    events = await play(
+        api,
+        "LIDER1",
+        [
+            started("individual"),
+            {**moment(3, {"line": "round_end", "leaders": ["t2"]}), "standings": standings},
+        ],
+    )
+    [narration] = commands(events, "narrate")
+    # Lo escrito nombra por identificador: la pantalla pone el nombre.
+    assert narration["text"] == "[GM] round_end · primero {p2} · racha {p2}"
+    # Lo hablado usa el alias, que nunca viaja por el stream.
+    assert spoken == ["Game Master: round_end, primero Ana, Ana en racha"]
+    assert "Ana" not in json.dumps([e["data"] for e in events], ensure_ascii=False)
+
+
+def test_an_alias_written_by_the_model_goes_back_to_its_id() -> None:
+    from src.campus.live import _unnamed
+
+    standings = [{"player_id": "p2", "alias": "Ana María", "score": 1, "streak": 3}]
+    assert _unnamed("¡Bravo, Ana María! Anabel no.", standings) == "¡Bravo, {p2}! Anabel no."

@@ -4,13 +4,17 @@ publica en el stream de la partida (``emit``); ``session.py`` les pone plazo y
 reintentos.
 
 Reciben lo que el Game Core cuenta de la partida, con identificadores
-seudónimos y nunca alias, y proponen comandos. No escriben estado de juego:
-cada comando sale por el stream, el gateway lo lleva al Game Core y este lo
-valida antes de aplicarlo.
+seudónimos y nunca alias, y proponen comandos. La única excepción son los
+alias de `standings` (quien va primero o está en racha), solo para la frase
+hablada del Game Master: en lo escrito se cambian por su identificador.
+
+No escriben estado de juego: cada comando sale por el stream, el gateway lo
+lleva al Game Core y este lo valida antes de aplicarlo.
 """
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -85,14 +89,20 @@ Recibes en `line` lo que acaba de pasar:
 - coop_end: terminó una misión cooperativa; `success` dice si la lograron.
 - game_over: terminó la partida; `winners` son los ganadores.
 `teams` trae los puntos y la casilla de cada equipo; `outcomes`, lo que le pasó a cada uno
-en su casilla. Cuenta solo lo que está en los datos: no inventes reglas, premios ni cifras.
+en su casilla. `standings` trae a los jugadores que van primero, de más a menos puntos, y a
+los que están en racha (`streak`: aciertos seguidos, desde 3). Cuenta solo lo que está en los
+datos: no inventes reglas, premios ni cifras.
 {who}
 
+Siempre que `standings` no esté vacío, nombra a quien va primero y felicita a quien esté en
+racha, en pocas palabras. Nunca digas quién falló ni quién va último.
+
 Escribe en {language}, con tono {tone}. Máximo 40 palabras por texto.
-- `text`: la narración para todos. Para nombrar a un equipo escribe su identificador entre
-  llaves, por ejemplo {{t2}} o {{g3}}; nunca inventes nombres.
-- `spoken`: la misma narración para leer en voz alta, sin identificadores ni llaves: di
-  «quien va primero» en lugar de un nombre.
+- `text`: la narración para todos. Para nombrar a un jugador o a un equipo escribe su
+  identificador entre llaves, por ejemplo {{p3}}, {{t2}} o {{g3}}; la pantalla lo cambia por su
+  nombre. Nunca escribas el `alias` aquí ni inventes nombres.
+- `spoken`: la misma narración para leer en voz alta, sin identificadores ni llaves. A los
+  jugadores de `standings` llámalos por su `alias`; a cualquier otro, «quien va primero».
 - `rooms`: {rooms}"""
 
 WHO_GROUPS = "Se juega por grupos: cada identificador de `teams` es un grupo de estudiantes."
@@ -118,6 +128,17 @@ ACTIVITIES = {
 }
 
 GM_SCHEMA = _str({"text": TEXT, "spoken": TEXT, "rooms": ROOMS}, "text", "spoken", "rooms")
+
+
+def _unnamed(text: str, standings: list[dict[str, Any]]) -> str:
+    """Lo escrito nombra por identificador: si el modelo puso un alias, se
+    cambia por `{p3}` y la pantalla vuelve a poner el nombre. Así el alias
+    nunca viaja por el stream ni llega al Game Core."""
+    for standing in standings:
+        alias, player = standing.get("alias") or "", standing.get("player_id") or ""
+        if alias and player:
+            text = re.sub(rf"(?<!\w){re.escape(alias)}(?!\w)", f"{{{player}}}", text)
+    return text
 
 
 async def narrate(state: LiveState) -> dict[str, Any]:
@@ -149,11 +170,12 @@ async def narrate(state: LiveState) -> dict[str, Any]:
             "item": feed.get("item"),
             "teams": feed["teams"],
             "outcomes": feed.get("outcomes", []),
+            "standings": feed.get("standings", []),
             "rooms_for": rooms_for,
         },
         schema=GM_SCHEMA,
     )
-    text = (reply.get("text") or "").strip()
+    text = _unnamed((reply.get("text") or "").strip(), feed.get("standings", []))
     if text:
         await write(_command(f"n:{moment}", {"tool": "narrate", "moment": moment, "text": text}))
     known = {team["team_id"] for team in rooms_for}

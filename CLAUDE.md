@@ -143,6 +143,20 @@ Conversational assessments inside the Moodle activity `mod_vervuxassess`. Plan: 
 - **Language**: Pablo's fixed messages follow the activity's language (`assessment_turn.language`, sent by the backend), not the tenant's (`texts.lang_of`).
 - Prompt keys `ASSESSMENT_{COMPOSE,ACK,FOLLOWUP,SCORE,FEEDBACK,CLASS_REPORT,IMPROVE}` (`src/agents/pablo/prompts.py`), to mirror in the backend's `DEFAULT_PROMPTS`; usage rows carry prompt provenance and `latency_ms`. Tests: `tests/test_pablo_graph.py`, `tests/test_pablo_jobs.py`.
 
+### Campus agents (`src/campus/`, routes under `/campus`)
+
+The AI of **Vervux Campus**, a multiplayer educational board game whose gateway lives in `rocky-nest-backend` (`src/campus/`, see its `docs/campus.md`). Moved here from `vervux-campus/services/agents`, where they ran as Temporal workflows on a VM. **Not a chat agent**: no code name, no registry, no checkpointer, no tenant credentials — a self-contained package with its own router (`src/campus/api.py`, included in `main.py`).
+
+- **Agents** (`live.py`): Game Master (narrates each moment, writes in each group's room, speaks in individual games), Evaluator (describes concepts, judges guesses, grades open answers), Companion (answers in a group's chat when called or asked, greets groups when an activity starts), Grader (grades what was left, builds the report with fixed rules, the model only writes summaries). **They never write game state**: each proposes a `command` with a `key`; the gateway sends it to the Game Core (Rust), which validates it and applies it once. **Designer** (`design.py`): a LangGraph graph (extract → generate → validate, regenerating up to 3 times) that proposes questions from the host's material; a question survives only if its `quote` is found in the fragment it cites. Nothing enters a bank without the host's approval.
+- **The contract is vervux-campus's, path for path** — the gateway only points `CAMPUS_AGENTS_URL` at `…/campus`: `POST /sessions/:id/feed` (202), `GET /sessions/:id/stream` (SSE: `command`, `gm.voice`, `end`), `GET /sessions/:id/audio/:n.wav`, `POST /designs` (multipart) + `GET /designs/:id` + `POST /designs/:id/approval`, and the phase-0 `narration-demo`. Every route requires `verify_service_caller`; the gateway sends a Google ID token (`CAMPUS_AGENTS_AUDIENCE` there) or, locally, `X-System-Key`.
+- **No Temporal: streams live in Postgres** (`store.py`, tables `campus_streams`/`campus_events`/`campus_designs` in `migrations/init.sql`), because with `max_instance_count` 3 a `feed` and the SSE `stream` of a session can land on different instances. A stream has an `epoch` (new when a closed or idle session is fed again) and events a growing `offset`; the SSE id is `{epoch}:{offset}` and `Last-Event-ID` resumes. Readers poll every 0.5 s, and are woken at once for events written on their own instance.
+- **Work runs as asyncio tasks after the 202** (`session.py`), which needs `cpu_idle = false` — already this service's setting. Each agent has a deadline and attempts (`live.AGENTS`); one that fails is logged `campus_agent_failed` and never stops the others: the game goes on with its fixed script. `finished` awaits this instance's agents for that session, runs the Grader, then closes the stream. Lost compared to Temporal: work in flight on an instance that dies is not resumed (a design left `working` for 15 min reports `failed`).
+- **The Companion's cooldown** (15 s per group) is claimed atomically in Postgres (`claim_mate`), so two instances never both answer.
+- **Model: Gemini as the platform**, by ADC, project `CAMPUS_GEMINI_PROJECT` (default `yorch-platform-prod`, location `global`), models fixed by `CAMPUS_*_MODEL` (`llm.py`) — not the tenant's provider or key (Rocky has no credentials endpoint; nothing is billed per school). `CAMPUS_LLM=fake` answers with fixed texts and never leaves the process (tests, local gates).
+- **Files: Cloud Storage** (`files.py`): the Game Master's voice (`audio/{session}/{moment}.wav`) and the host's material (`designs/{id}/`) in the private bucket `CAMPUS_BUCKET` (lifecycle deletion on the bucket); without a bucket, a local folder — one machine only. Streams and designs are deleted after `CAMPUS_RETENTION_DAYS` (30) by a loop started in `lifespan`.
+- The Assets agent (Blender, Gemini Image) stayed in vervux-campus: it is a development tool, not a runtime agent.
+- Tests: `tests/test_campus.py` (end to end over HTTP/SSE with the fake model and an in-memory store), `tests/test_campus_store_pg.py` (the Postgres store; runs only with `CAMPUS_TEST_DATABASE_URL`).
+
 ### Key State (`src/graphs/state.py`)
 
 `AgentState` is a `TypedDict` persisted per `thread_id`:
@@ -226,6 +240,8 @@ Copy `.env.example` to `.env`. Required vars:
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string |
 | `SERPER_API_KEY` | Web search for the prospecting agent — a startup validator refuses to boot without it. It checks PRESENCE only: a set-but-invalid key boots fine and then gets `403 Unauthorized` on every `/search` and `/places` call, which `_serper_post` now turns into a fatal `SerperAuthError` so the run ends FAILED instead of reporting `found: 0` (as it silently did before 2026-08-18) |
+
+Campus (`src/campus/`): `CAMPUS_BUCKET` (Cloud Storage for voice and material; required on Cloud Run), `CAMPUS_LLM`, `CAMPUS_GEMINI_PROJECT`, `CAMPUS_GEMINI_LOCATION`, `CAMPUS_FAST_MODEL`, `CAMPUS_SMART_MODEL`, `CAMPUS_TTS_MODEL`, `CAMPUS_RETENTION_DAYS` — see `src/campus/config.py`.
 
 Optional: `SERVICE_AUTH_AUDIENCE` / `SERVICE_AUTH_ALLOWED_SERVICE_ACCOUNTS` / `ALLOW_SHARED_SECRET_AUTH` (see Authentication — leave the audience empty locally), `WEBHOOK_API_KEY`, `NESTJS_BASE_URL`, `OPENAI_API_KEY` (fallback; per-request key preferred), `GEMINI_*` (absent, the Gemini provider falls back to Application Default Credentials — which is the only auth Agent Platform accepts; it rejects API keys), `LANGFUSE_*`.
 

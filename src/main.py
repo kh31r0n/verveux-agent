@@ -59,6 +59,10 @@ from .services.serper import (
     start_serper_accounting,
 )
 from .config import settings
+from .campus.api import router as campus_router
+from .campus.files import default_files as campus_files
+from .campus.session import Campus, configure as configure_campus
+from .campus.store import PgStore as CampusPgStore
 from .db.postgres import (
     close_pool,
     get_pool,
@@ -138,6 +142,12 @@ async def lifespan(app: FastAPI):
     pool = await init_pool()
     await run_migrations(pool)
 
+    # Campus (the board game's agents): streams and designs in this database,
+    # files in Cloud Storage. Independent of the backend validation below.
+    campus = Campus(CampusPgStore(pool), campus_files())
+    configure_campus(campus)
+    campus_retention = asyncio.create_task(campus.purge_forever())
+
     # Checkpoints written before 2026-07 contain StructuredIntent/IntentType
     # Pydantic objects; new code stores plain dicts. Allow-list the legacy
     # types so old threads keep deserializing after LangGraph starts blocking
@@ -212,6 +222,7 @@ async def lifespan(app: FastAPI):
         )
         yield
 
+    campus_retention.cancel()
     await close_pool()
     logger.info("shutdown_complete")
 
@@ -225,6 +236,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(campus_router)
 
 # ---------------------------------------------------------------------------
 # Request / Response models

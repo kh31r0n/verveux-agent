@@ -9,6 +9,8 @@ os.environ.setdefault("SERVICE_AUTH_AUDIENCE", "")
 os.environ.setdefault("ALLOW_SHARED_SECRET_AUTH", "true")
 # Required at boot (config.py validates it) — prospecting web search key.
 os.environ.setdefault("SERPER_API_KEY", "test-serper-key")
+# Campus agents answer with fixed texts and never call Gemini in tests.
+os.environ["CAMPUS_LLM"] = "fake"
 # Google Places is opt-in per test: forced empty (an env var beats `.env`) so
 # business listings fall back to the patched Serper path unless a test sets it.
 os.environ["GOOGLE_PLACES_API_KEY"] = ""

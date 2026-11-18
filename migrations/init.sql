@@ -79,3 +79,43 @@ CREATE INDEX IF NOT EXISTS checkpoint_blobs_thread_id_idx
 
 CREATE INDEX IF NOT EXISTS checkpoint_writes_thread_id_idx
     ON checkpoint_writes (thread_id);
+
+-- ── Campus (src/campus/): the board game's agents ─────────────────────────────
+-- A session's stream of agent events, readable from any instance. See
+-- src/campus/store.py. Deleted after CAMPUS_RETENTION_DAYS by the service.
+CREATE TABLE IF NOT EXISTS campus_streams (
+    id           TEXT PRIMARY KEY,
+    epoch        TEXT NOT NULL,
+    info         JSONB NOT NULL DEFAULT '{}',
+    closed       BOOLEAN NOT NULL DEFAULT false,
+    next_offset  INTEGER NOT NULL DEFAULT 0,
+    mate_spoke   JSONB NOT NULL DEFAULT '{}',
+    mate_seq     INTEGER NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_feed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS campus_events (
+    stream_id  TEXT NOT NULL REFERENCES campus_streams (id) ON DELETE CASCADE,
+    "offset"   INTEGER NOT NULL,
+    event      TEXT NOT NULL,
+    data       JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_id, "offset")
+);
+
+CREATE INDEX IF NOT EXISTS campus_streams_last_feed_at_idx
+    ON campus_streams (last_feed_at);
+
+-- A question design the host asked for; the material is in Cloud Storage.
+CREATE TABLE IF NOT EXISTS campus_designs (
+    id         TEXT PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'working',
+    proposal   JSONB NOT NULL DEFAULT '{}',
+    approved   JSONB,
+    error      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS campus_designs_created_at_idx
+    ON campus_designs (created_at);

@@ -13,12 +13,13 @@ from typing import Any
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 from fastapi import FastAPI
 
 from src.campus.api import router
 from src.campus.design import check, read_office, validated
 from src.campus.files import LocalFiles
-from src.campus.live import build_report
+from src.campus.live import _board_changes, award_candidates, build_report
 from src.campus.session import NARRATION_DEMO, Campus, calls_mate, configure
 from src.campus.store import MemoryStore
 
@@ -70,7 +71,9 @@ async def read_stream(api: httpx.AsyncClient, path: str, headers: dict | None = 
 async def test_every_campus_route_needs_the_service_credential(api: httpx.AsyncClient) -> None:
     anonymous = httpx.AsyncClient(transport=api._transport, base_url="http://agent/campus")
     async with anonymous:
-        assert (await anonymous.post("/sessions/ABC123/feed", json={"feed": "x"})).status_code == 401
+        assert (
+            await anonymous.post("/sessions/ABC123/feed", json={"feed": "x"})
+        ).status_code == 401
         assert (await anonymous.get("/sessions/ABC123/stream")).status_code == 401
         assert (await anonymous.get("/designs/" + "0" * 32)).status_code == 401
 
@@ -84,12 +87,12 @@ TEAMS = [
 ]
 
 
-def started(mode: str) -> dict[str, Any]:
+def started(mode: str, **ai: Any) -> dict[str, Any]:
     return {
         "feed": "started",
         "lang": "es",
         "mode": mode,
-        "ai": AI,
+        "ai": {**AI, **ai},
         "duration_min": 60,
         "topics": ["Ciencias"],
         "teams": TEAMS,
@@ -135,7 +138,9 @@ FINISHED = {
                 attempt("Ciencias", True),
                 attempt("Ciencias", False),
                 # An open answer the Evaluator did not grade live.
-                attempt("Historia", False, kind="open", text="Porque sí", reference="Por la lluvia"),
+                attempt(
+                    "Historia", False, kind="open", text="Porque sí", reference="Por la lluvia"
+                ),
             ],
         }
     ],
@@ -170,7 +175,13 @@ async def test_an_individual_game_gets_narration_voice_evaluation_and_a_report(
             started("individual"),
             moment(1, {"line": "round_start", "round": 1, "rounds": 5}),
             {"feed": "concepts", "concepts": [concept]},
-            {"feed": "guess", "concept": concept, "player_id": "p1", "attempt": 2, "text": "Júpites"},
+            {
+                "feed": "guess",
+                "concept": concept,
+                "player_id": "p1",
+                "attempt": 2,
+                "text": "Júpites",
+            },
             {
                 "feed": "open_answers",
                 "question_id": "q9",
@@ -186,7 +197,9 @@ async def test_an_individual_game_gets_narration_voice_evaluation_and_a_report(
         ],
     )
 
-    assert commands(events, "narrate") == [{"tool": "narrate", "moment": 1, "text": "[GM] round_start"}]
+    assert commands(events, "narrate") == [
+        {"tool": "narrate", "moment": 1, "text": "[GM] round_start"}
+    ]
     assert commands(events, "team_note") == []
     [voice] = [e["data"] for e in events if e["event"] == "gm.voice"]
     assert (voice["moment"], voice["file"]) == (1, "1.wav")
@@ -200,6 +213,8 @@ async def test_an_individual_game_gets_narration_voice_evaluation_and_a_report(
     results = commands(events, "eval_results")[0]["results"]
     assert [r["player_id"] for r in results] == ["p1", "p2"]
     assert results[0]["score"] > results[1]["score"]
+    # Each grade names the model that gave it, to calibrate them later.
+    assert {r["model"] for r in results} == {"fake"}
 
     keys = [e["data"]["key"] for e in events]
     assert len(keys) == len(set(keys))
@@ -243,6 +258,135 @@ async def test_in_groups_the_game_master_and_the_teammate_write_in_each_room(
     assert sorted(m["team_id"] for m in mate) == ["g1", "g1", "g2", "g2"]
 
 
+async def test_each_agent_logs_what_it_did_and_why_there_was_no_voice(
+    api: httpx.AsyncClient,
+) -> None:
+    with capture_logs() as logs:
+        await play(
+            api,
+            "LOGS01",
+            [started("individual"), moment(1, {"line": "round_start", "round": 1, "rounds": 5})],
+        )
+        await play(
+            api,
+            "LOGS02",
+            [started("groups"), moment(1, {"line": "round_start", "round": 1, "rounds": 5})],
+        )
+
+    done = {
+        log["session_id"]: log
+        for log in logs
+        if log["event"] == "campus_agent_done" and log["agent"] == "game_master"
+    }
+    assert done["LOGS01"]["voice"] == "generated"
+    assert done["LOGS01"]["emitted"] == {"command": 1, "gm.voice": 1}
+    assert done["LOGS01"]["ms"] >= 0
+    # Por grupos el Game Master no habla: queda dicho por qué.
+    assert done["LOGS02"]["voice"] == "groups"
+
+
+BRIEF = {
+    "budget": 1,
+    "ahead": [
+        {
+            "team_id": "g1",
+            "squares": [{"node": 5, "kind": "question"}, {"node": 6, "kind": "bonus"}],
+        },
+        {
+            "team_id": "g2",
+            "squares": [{"node": 9, "kind": "question"}, {"node": 10, "kind": "trap"}],
+        },
+    ],
+}
+
+
+async def test_at_the_close_of_a_round_the_director_reshapes_the_board(
+    api: httpx.AsyncClient,
+) -> None:
+    round_end = {**moment(1, {"line": "round_end", "leaders": ["g1"]}), "board": BRIEF}
+    events = await play(
+        api, "DIRIGE", [started("individual", director="subtle", style="playful"), round_end]
+    )
+
+    assert commands(events, "reshape_board") == [
+        {"tool": "reshape_board", "moment": 1, "changes": [{"node": 9, "kind": "bonus"}]}
+    ]
+    assert len(commands(events, "narrate")) == 1
+
+
+async def test_a_moment_the_host_left_silent_is_not_narrated_but_still_directed(
+    api: httpx.AsyncClient,
+) -> None:
+    quiet = {**moment(1, {"line": "squares"}), "narrate": False}
+    directed = {
+        **moment(2, {"line": "round_end", "leaders": ["g1"]}),
+        "narrate": False,
+        "board": BRIEF,
+    }
+    events = await play(
+        api,
+        "CALLA1",
+        [started("individual", frequency="silent", director="subtle"), quiet, directed],
+    )
+
+    assert commands(events, "narrate") == []
+    assert not [e for e in events if e["event"] == "gm.voice"]
+    assert [c["moment"] for c in commands(events, "reshape_board")] == [2]
+
+
+def test_the_director_only_proposes_what_the_game_core_admits() -> None:
+    teams = [{"team_id": "g1", "position": 4}, {"team_id": "g2", "position": 9}]
+    proposed = [
+        {"node": 9, "kind": "bonus"},  # a token is on it
+        {"node": 3, "kind": "bonus"},  # not in the brief
+        {"node": 6, "kind": "bonus"},  # already a bonus
+        {"node": 5, "kind": "start"},  # not a kind it may set
+        {"node": 10, "kind": "question"},
+        {"node": 5, "kind": "trap"},  # over the budget of one
+    ]
+    assert _board_changes(proposed, BRIEF, teams) == [{"node": 10, "kind": "question"}]
+    assert _board_changes("nothing", BRIEF, teams) == []
+
+
+def test_award_candidates_come_from_what_happened_and_spread_across_players() -> None:
+    def answers(*correct: bool, ms: int = 4000) -> list[dict[str, Any]]:
+        return [attempt("Ciencias", c, elapsed_ms=ms) for c in correct]
+
+    students = [
+        {"player_id": "p1", "team_id": "t1", "attempts": answers(True, True, True, True, False)},
+        {"player_id": "p2", "team_id": "t2", "attempts": answers(True, True, True, ms=1500)},
+        {"player_id": "p3", "team_id": "t3", "attempts": answers(False, False, True)},
+    ]
+    candidates = award_candidates(students)
+    by_award = {c["award"]: c for c in candidates}
+    assert by_award["streak"]["player_id"] == "p1"
+    assert by_award["streak"]["fact"] == "4 aciertos seguidos"
+    assert by_award["fast"]["player_id"] == "p2"
+    assert "Ciencias" in by_award["topic"]["fact"]
+    assert all(sum(c["player_id"] == p for c in candidates) <= 2 for p in ("p1", "p2", "p3"))
+    assert award_candidates([]) == []
+
+
+async def test_the_awards_arrive_before_the_report_when_the_host_wants_them(
+    api: httpx.AsyncClient,
+) -> None:
+    finished = {
+        "feed": "finished",
+        "students": [
+            {"player_id": "p1", "team_id": "t1", "attempts": [attempt("Ciencias", True)] * 4}
+        ],
+    }
+    for feed in [started("individual", awards=True), finished]:
+        assert (await api.post("/sessions/PREMIO/feed", json=feed)).status_code == 202
+    events = (await read_stream(api, "/sessions/PREMIO/stream"))[:-1]
+
+    [given] = commands(events, "awards")
+    assert given["awards"][0]["player_id"] == "p1"
+    assert "{p1}" in given["awards"][0]["reason"]
+    tools = [e["data"]["command"]["tool"] for e in events if e["event"] == "command"]
+    assert tools.index("awards") < tools.index("report")
+
+
 async def test_a_new_feed_after_the_end_starts_a_new_epoch(api: httpx.AsyncClient) -> None:
     first = await play(api, "OTRA01", [started("individual")])
     again = await play(api, "OTRA01", [started("individual")])
@@ -253,7 +397,13 @@ async def test_a_new_feed_after_the_end_starts_a_new_epoch(api: httpx.AsyncClien
 
 
 def test_the_teammate_answers_calls_and_questions() -> None:
-    for text in ["¿alguien sabe?", "IA, ayúdanos", "oye @ia", "compañero, una pista", "what is it?"]:
+    for text in [
+        "¿alguien sabe?",
+        "IA, ayúdanos",
+        "oye @ia",
+        "compañero, una pista",
+        "what is it?",
+    ]:
         assert calls_mate(text), text
     for text in ["yo creo que es la b", "había una vez", "vamos equipo"]:
         assert not calls_mate(text), text
@@ -319,7 +469,14 @@ async def test_a_session_without_a_flow_has_no_stream(api: httpx.AsyncClient) ->
 
 # --- the Designer ---------------------------------------------------------------
 
-FRAGMENTS = {"f1": {"id": "f1", "file": "a.pdf", "location": "página 1", "text": "El agua hierve a 100 grados."}}
+FRAGMENTS = {
+    "f1": {
+        "id": "f1",
+        "file": "a.pdf",
+        "location": "página 1",
+        "text": "El agua hierve a 100 grados.",
+    }
+}
 
 
 def question(**changes: Any) -> dict[str, Any]:
@@ -357,12 +514,20 @@ def test_validation_keeps_the_citation_and_drops_repeats() -> None:
         {
             "fragments": list(FRAGMENTS.values()),
             "max_questions": 5,
-            "candidates": [question(), question(), question(prompt="Otra", quote="inventada del todo")],
+            "candidates": [
+                question(),
+                question(),
+                question(prompt="Otra", quote="inventada del todo"),
+            ],
         }
     )
     assert result["discarded"] == 2
     [kept] = result["questions"]
-    assert kept["citation"] == {"file": "a.pdf", "location": "página 1", "quote": "el agua hierve a 100"}
+    assert kept["citation"] == {
+        "file": "a.pdf",
+        "location": "página 1",
+        "quote": "el agua hierve a 100",
+    }
 
 
 def test_office_files_are_read_without_converting_them() -> None:
@@ -395,25 +560,35 @@ async def wait_for(api: httpx.AsyncClient, design_id: str, status: str) -> dict[
     raise AssertionError(f"the design did not reach {status}: {state}")
 
 
-async def test_the_designer_proposes_and_nothing_enters_without_approval(api: httpx.AsyncClient) -> None:
+async def test_the_designer_proposes_and_nothing_enters_without_approval(
+    api: httpx.AsyncClient,
+) -> None:
     files = [
         ("files", ("clase.pdf", b"%PDF-1.4 contenido", "application/pdf")),
         ("files", ("notas.txt", b"Los planetas giran alrededor del Sol.", "text/plain")),
         ("files", ("programa.exe", b"MZ", "application/octet-stream")),
     ]
-    started = await api.post("/designs", files=files, data={"topic": "Ciencias", "max_questions": "4"})
+    started = await api.post(
+        "/designs", files=files, data={"topic": "Ciencias", "max_questions": "4"}
+    )
     assert started.status_code == 202
     design_id = started.json()["design_id"]
 
     proposal = await wait_for(api, design_id, "waiting_approval")
     statuses = {f["name"][3:]: f["status"] for f in proposal["files"]}
-    assert statuses == {"clase.pdf": "processed", "notas.txt": "processed", "programa.exe": "rejected"}
+    assert statuses == {
+        "clase.pdf": "processed",
+        "notas.txt": "processed",
+        "programa.exe": "rejected",
+    }
     questions = proposal["questions"]
     assert len(questions) >= 2 and proposal["discarded"] >= 1
     assert all(q["citation"]["quote"] and q["citation"]["location"] for q in questions)
     assert all(q["prompt"] != "Inventada" for q in questions)
 
-    approved = await api.post(f"/designs/{design_id}/approval", json={"approved": [questions[0]["id"]]})
+    approved = await api.post(
+        f"/designs/{design_id}/approval", json={"approved": [questions[0]["id"]]}
+    )
     assert approved.status_code == 200
     assert (await wait_for(api, design_id, "done"))["status"] == "done"
 
@@ -421,7 +596,9 @@ async def test_the_designer_proposes_and_nothing_enters_without_approval(api: ht
 async def test_a_design_needs_files_and_an_existing_id(api: httpx.AsyncClient) -> None:
     assert (await api.post("/designs", data={"topic": "x"})).status_code == 422
     assert (await api.get("/designs/" + "0" * 32)).status_code == 404
-    assert (await api.post("/designs/" + "0" * 32 + "/approval", json={"approved": []})).status_code == 404
+    assert (
+        await api.post("/designs/" + "0" * 32 + "/approval", json={"approved": []})
+    ).status_code == 404
     assert (await api.get("/designs/no-es-un-id")).status_code == 422
 
 

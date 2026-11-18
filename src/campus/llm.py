@@ -8,15 +8,49 @@ dependen solo de los datos. Así las pruebas y las puertas recorren todo el
 camino de los agentes sin cuota ni credenciales.
 """
 
+import asyncio
 import io
 import json
+import logging
 import wave
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .config import campus_settings as config
 
-LANGUAGES = {"es": "español", "en": "inglés", "pt": "portugués"}
+logger = logging.getLogger(__name__)
+
+# El público es latinoamericano: sin «vosotros», que suena a España.
+LANGUAGES = {
+    "es": "español latinoamericano neutro (trata al grupo de «ustedes», nunca de «vosotros»)",
+    "en": "inglés",
+    "pt": "portugués de Brasil",
+}
+
+# Esperas en segundos ante un 429. El modelo grande comparte poca cuota en el
+# proyecto: si sigue agotado, el rápido contesta en su lugar.
+RETRY_WAITS = (0.0, 2.0, 6.0)
+
+
+def exhausted(error: Exception) -> bool:
+    """Si el error es de cuota (429 RESOURCE_EXHAUSTED) y vale la pena reintentar."""
+    return getattr(error, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(error)
+
+
+def log_usage(task: str, model: str, response: Any) -> None:
+    """Deja en el registro los tokens de una llamada, para medir el costo de una
+    partida: ``uso del modelo tarea=gm modelo=… entrada=… salida=…``."""
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return
+    logger.info(
+        "uso del modelo tarea=%s modelo=%s entrada=%d salida=%d razonamiento=%d",
+        task,
+        model,
+        usage.prompt_token_count or 0,
+        usage.candidates_token_count or 0,
+        getattr(usage, "thoughts_token_count", None) or 0,
+    )
 SPEECH_LOCALES = {"es": "es-US", "en": "en-US", "pt": "pt-BR"}
 
 
@@ -77,19 +111,36 @@ class GeminiLlm:
             types.Part.from_bytes(data=file.data, mime_type=file.mime_type) for file in files or []
         ]
         parts.append(types.Part.from_text(text=json.dumps(data, ensure_ascii=False)))
-        response = await self._client.aio.models.generate_content(
-            model=self.model(smart),
-            contents=[types.Content(role="user", parts=parts)],
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                response_mime_type="application/json",
-                response_schema=schema,
-                # Baja, para que dos respuestas iguales reciban la misma nota.
-                temperature=0.6 if task == "gm" else 0.1,
-                max_output_tokens=16000 if smart else 4000,
-            ),
+        generation = types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            response_schema=schema,
+            # Baja, para que dos respuestas iguales reciban la misma nota.
+            temperature=0.6 if task == "gm" else 0.1,
+            max_output_tokens=16000 if smart else 4000,
         )
-        return json.loads(response.text or "{}")
+        tries = [(self.model(smart), wait) for wait in RETRY_WAITS]
+        if smart:
+            tries.append((self.model(False), 0.0))
+        last: Exception | None = None
+        for model, wait in tries:
+            await asyncio.sleep(wait)
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=model,
+                    contents=[types.Content(role="user", parts=parts)],
+                    config=generation,
+                )
+            except Exception as error:
+                if not exhausted(error):
+                    raise
+                logger.warning("Sin cuota en %s para %s; se reintenta", model, task)
+                last = error
+                continue
+            log_usage(task, model, response)
+            return json.loads(response.text or "{}")
+        assert last is not None
+        raise last
 
     async def speech(self, text: str, lang: str) -> bytes:
         from google.genai import types
@@ -107,6 +158,7 @@ class GeminiLlm:
                 ),
             ),
         )
+        log_usage("voz", config.tts_model, response)
         audio = response.candidates[0].content.parts[0].inline_data
         if "wav" in (audio.mime_type or ""):
             return audio.data
@@ -276,4 +328,4 @@ def get_llm() -> Llm:
 
 
 def language(lang: str) -> str:
-    return LANGUAGES.get(lang, "español")
+    return LANGUAGES.get(lang, LANGUAGES["es"])

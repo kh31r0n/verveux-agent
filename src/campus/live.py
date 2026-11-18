@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import campus_settings as config
@@ -29,6 +29,7 @@ GAME_MASTER = "game_master"
 EVALUATOR = "evaluator"
 TEAMMATE = "teammate"
 GRADER = "grader"
+AWARDER = "awarder"
 
 # Calificación desde la que una respuesta abierta cuenta como acierto.
 PASSING = 60
@@ -51,6 +52,9 @@ class LiveState:
     # Publica un evento en el stream de la partida (``{"event": …, …}``).
     emit: Emit
     files: Files
+    # Lo que el agente cuenta de su trabajo para los registros
+    # (``campus_agent_done``): por ejemplo, qué pasó con la voz.
+    outcome: dict[str, Any] = field(default_factory=dict)
 
 
 def _command(key: str, command: dict[str, Any]) -> dict[str, Any]:
@@ -72,6 +76,21 @@ ROOMS = {
 # --- Game Master -----------------------------------------------------------
 
 TONES = {"neutral": "neutro y claro", "fun": "divertido y cercano", "formal": "formal y sobrio"}
+
+# El personaje del Game Master. Con cualquiera, nunca se burla de un estudiante.
+STYLES = {
+    "family": "Narras con calidez, para todas las edades.",
+    "sportscaster": "Narras como un comentarista deportivo: emoción, ritmo y jugadas destacadas.",
+    "playful": "Narras con humor: puedes bromear sobre una tirada, una casilla o una mala racha, "
+    "nunca sobre una persona, su nombre ni sus respuestas.",
+}
+
+BOARD_RULES = """
+También diriges el tablero para que la partida siga reñida. `board.ahead` trae, del equipo que
+va primero al último, las casillas que tiene delante (`node`, `kind`). Puedes cambiar hasta
+`board.budget` casillas a `question`, `bonus` o `trap`: premios delante de quien va atrás,
+trampas delante de quien va muy adelante. Si la partida va pareja, no cambies nada. Escribe los
+cambios en `board` y no los anuncies en `text`."""
 
 GM_SYSTEM = """Eres el Game Master de un juego de tablero educativo que se juega en clase.
 Narras lo que acaba de pasar. No decides nada del juego: ni el dado, ni los puntos, ni las
@@ -96,6 +115,8 @@ datos: no inventes reglas, premios ni cifras.
 
 Siempre que `standings` no esté vacío, nombra a quien va primero y felicita a quien esté en
 racha, en pocas palabras. Nunca digas quién falló ni quién va último.
+
+{style} Nunca te burles de un estudiante.{board}
 
 Escribe en {language}, con tono {tone}. Máximo 40 palabras por texto.
 - `text`: la narración para todos. Para nombrar a un jugador o a un equipo escribe su
@@ -128,6 +149,43 @@ ACTIVITIES = {
 }
 
 GM_SCHEMA = _str({"text": TEXT, "spoken": TEXT, "rooms": ROOMS}, "text", "spoken", "rooms")
+SQUARE_KINDS = ("question", "bonus", "trap")
+BOARD = {
+    "type": "array",
+    "items": _str(
+        {"node": {"type": "integer"}, "kind": {"type": "string", "enum": list(SQUARE_KINDS)}},
+        "node",
+        "kind",
+    ),
+}
+GM_BOARD_SCHEMA = _str(
+    {"text": TEXT, "spoken": TEXT, "rooms": ROOMS, "board": BOARD}, "text", "spoken", "rooms"
+)
+
+
+def _board_changes(
+    proposed: Any, brief: dict[str, Any], teams: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Lo que propuso el modelo, dentro de lo que el Game Core admite: casillas
+    del resumen, sin fichas encima, con otro tipo y como mucho ``budget``."""
+    current = {
+        square["node"]: square["kind"]
+        for team in brief.get("ahead", [])
+        for square in team["squares"]
+    }
+    occupied = {team.get("position") for team in teams}
+    changes: list[dict[str, Any]] = []
+    for change in proposed if isinstance(proposed, list) else []:
+        node, kind = change.get("node"), change.get("kind")
+        if (
+            node in current
+            and node not in occupied
+            and kind in SQUARE_KINDS
+            and kind != current[node]
+            and all(c["node"] != node for c in changes)
+        ):
+            changes.append({"node": node, "kind": kind})
+    return changes[: brief.get("budget", 0)]
 
 
 def _unnamed(text: str, standings: list[dict[str, Any]]) -> str:
@@ -148,6 +206,13 @@ async def narrate(state: LiveState) -> dict[str, Any]:
     lang = session.get("lang", "es")
     groups = session.get("mode") == "groups"
     moment = feed["moment"]
+    # Según la frecuencia que eligió el host, este momento puede no narrarse;
+    # al cerrar una ronda, igual se dirige el tablero.
+    narrates = feed.get("narrate", True)
+    brief = feed.get("board")
+    if not narrates and not brief:
+        state.outcome["voice"] = "silent"
+        return {}
     # En partidas por grupos escribe también en la sala de cada grupo, en una
     # sola llamada para no multiplicar las solicitudes.
     rooms_for = feed["teams"] if groups and feed["line"]["line"] in ROOM_LINES else []
@@ -163,6 +228,8 @@ async def narrate(state: LiveState) -> dict[str, Any]:
             tone=TONES.get(ai.get("tone"), TONES["fun"]),
             rooms=rooms,
             who=WHO_GROUPS if groups else WHO_SOLO,
+            style=STYLES.get(ai.get("style"), STYLES["family"]),
+            board=BOARD_RULES if brief else "",
         ),
         data={
             "line": feed["line"],
@@ -172,9 +239,19 @@ async def narrate(state: LiveState) -> dict[str, Any]:
             "outcomes": feed.get("outcomes", []),
             "standings": feed.get("standings", []),
             "rooms_for": rooms_for,
+            **({"board": brief} if brief else {}),
         },
-        schema=GM_SCHEMA,
+        schema=GM_BOARD_SCHEMA if brief else GM_SCHEMA,
     )
+    if brief:
+        changes = _board_changes(reply.get("board"), brief, feed["teams"])
+        if changes:
+            command = {"tool": "reshape_board", "moment": moment, "changes": changes}
+            await write(_command(f"b:{moment}", command))
+        state.outcome["board"] = len(changes)
+    if not narrates:
+        state.outcome["voice"] = "silent"
+        return {}
     text = _unnamed((reply.get("text") or "").strip(), feed.get("standings", []))
     if text:
         await write(_command(f"n:{moment}", {"tool": "narrate", "moment": moment, "text": text}))
@@ -187,7 +264,13 @@ async def narrate(state: LiveState) -> dict[str, Any]:
 
     # La voz existe solo en partidas individuales, donde todos comparten sala.
     spoken = (reply.get("spoken") or "").strip()
-    if ai.get("voice") and not groups and spoken:
+    if not ai.get("voice"):
+        state.outcome["voice"] = "off"
+    elif groups:
+        state.outcome["voice"] = "groups"
+    elif not spoken:
+        state.outcome["voice"] = "nothing_to_say"
+    else:
         try:
             audio = await asyncio.wait_for(
                 get_llm().speech(spoken, lang), timeout=config.voice_timeout_seconds
@@ -195,11 +278,15 @@ async def narrate(state: LiveState) -> dict[str, Any]:
         except Exception as error:  # noqa: BLE001 - la voz nunca detiene la narración
             # Sin audio a tiempo, la narración queda solo en texto.
             logger.warning("Sin voz para el momento %s: %s", moment, error)
+            state.outcome["voice"] = (
+                "timeout" if isinstance(error, TimeoutError) else type(error).__name__
+            )
             return {}
         await state.files.put(f"audio/{state.session_id}/{moment}.wav", audio, "audio/wav")
         await write(
             {"event": "gm.voice", "key": f"v:{moment}", "moment": moment, "file": f"{moment}.wav"}
         )
+        state.outcome["voice"] = "generated"
     return {}
 
 
@@ -283,12 +370,14 @@ async def grade_answers(lang: str, question: dict[str, Any]) -> list[dict[str, A
         schema=EVALUATE_SCHEMA,
     )
     asked = {answer["player_id"] for answer in question["answers"]}
+    model = get_llm().model()
     return [
         {
             "player_id": result["player_id"],
             "score": _clamp(result.get("score")),
             "feedback": (result.get("feedback") or "").strip() or "—",
             "confidence": _clamp(result.get("confidence")),
+            "model": model,
         }
         for result in reply.get("results") or []
         if result.get("player_id") in asked
@@ -546,6 +635,149 @@ async def grade(state: LiveState) -> dict[str, Any]:
     return {}
 
 
+# --- Premios del final -----------------------------------------------------
+
+AWARDS_SYSTEM = """Eres el Game Master de un juego educativo que acaba de terminar. Pones nombre
+a los premios del final: reconocimientos, no puntos. `candidates` trae cada premio con quién lo
+gana (`player_id`) y el dato que lo justifica (`fact`). Para cada uno escribe en {language}:
+- `title`: de 2 a 4 palabras, máximo 40 caracteres.
+- `reason`: una frase de máximo 140 caracteres que diga el dato, con el identificador del
+  jugador entre llaves, por ejemplo {{p3}}; la pantalla lo cambia por su nombre.
+{style} Celebra lo que hicieron. Nunca te burles de nadie ni digas quién falló."""
+
+AWARDS_SCHEMA = _str(
+    {
+        "awards": {
+            "type": "array",
+            "items": _str(
+                {"player_id": TEXT, "title": TEXT, "reason": TEXT}, "player_id", "title", "reason"
+            ),
+        }
+    },
+    "awards",
+)
+MAX_AWARDS = 5
+
+
+def award_candidates(students: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Quién gana cada premio, con datos de la partida: la racha más larga, la
+    rapidez, el dominio de un tema y la mejor explicación. El modelo solo les
+    pone nombre."""
+    candidates: list[dict[str, Any]] = []
+
+    def run(attempts: list[dict[str, Any]]) -> int:
+        best = current = 0
+        for attempt in attempts:
+            current = current + 1 if attempt.get("correct") else 0
+            best = max(best, current)
+        return best
+
+    streaks = sorted(((run(s["attempts"]), s["player_id"]) for s in students), reverse=True)
+    if streaks and streaks[0][0] >= 3:
+        candidates.append(
+            {
+                "award": "streak",
+                "player_id": streaks[0][1],
+                "fact": f"{streaks[0][0]} aciertos seguidos",
+            }
+        )
+
+    fast = []
+    for student in students:
+        times = sorted(
+            a["elapsed_ms"] for a in student["attempts"] if a.get("correct") and a.get("elapsed_ms")
+        )
+        if len(times) >= 3:
+            fast.append((times[len(times) // 2], student["player_id"]))
+    if fast:
+        ms, player = min(fast)
+        candidates.append(
+            {
+                "award": "fast",
+                "player_id": player,
+                "fact": f"acertó en {ms / 1000:.1f} s de mediana",
+            }
+        )
+
+    topics: dict[str, list[tuple[float, int, str]]] = {}
+    for student in students:
+        by_topic: dict[str, list[bool]] = {}
+        for attempt in student["attempts"]:
+            by_topic.setdefault(attempt.get("topic", ""), []).append(bool(attempt.get("correct")))
+        for topic, results in by_topic.items():
+            if topic and len(results) >= 3:
+                topics.setdefault(topic, []).append(
+                    (sum(results) / len(results), len(results), student["player_id"])
+                )
+    experts = sorted(((max(rows), topic) for topic, rows in topics.items()), reverse=True)
+    if experts and experts[0][0][0] >= 0.75:
+        (share, _, player), topic = experts[0]
+        candidates.append(
+            {
+                "award": "topic",
+                "player_id": player,
+                "fact": f"{round(share * 100)} % de aciertos en {topic}",
+            }
+        )
+
+    explained = [
+        (max(a["score"] for a in s["attempts"] if a.get("score") is not None), s["player_id"])
+        for s in students
+        if any(a.get("score") is not None for a in s["attempts"])
+    ]
+    if explained:
+        score, player = max(explained)
+        if score >= 80:
+            candidates.append(
+                {
+                    "award": "explainer",
+                    "player_id": player,
+                    "fact": f"la mejor explicación, con {score} de 100",
+                }
+            )
+
+    # Que no se los lleve todos la misma persona.
+    given: dict[str, int] = {}
+    fair = []
+    for candidate in candidates:
+        if given.get(candidate["player_id"], 0) < 2:
+            given[candidate["player_id"]] = given.get(candidate["player_id"], 0) + 1
+            fair.append(candidate)
+    return fair[:MAX_AWARDS]
+
+
+async def award(state: LiveState) -> dict[str, Any]:
+    ai = state.session.get("ai", {})
+    candidates = award_candidates(state.feed.get("students", []))
+    state.outcome["awards"] = len(candidates)
+    if not candidates:
+        return {}
+    reply = await get_llm().json(
+        "awards",
+        system=AWARDS_SYSTEM.format(
+            language=language(state.session.get("lang", "es")),
+            style=STYLES.get(ai.get("style"), STYLES["family"]),
+        ),
+        data={"candidates": candidates},
+        schema=AWARDS_SCHEMA,
+    )
+    winners = {c["player_id"] for c in candidates}
+    awards = [
+        {
+            "player_id": a["player_id"],
+            "title": a["title"].strip()[:40],
+            "reason": a["reason"].strip()[:140],
+        }
+        for a in reply.get("awards") or []
+        if a.get("player_id") in winners
+        and (a.get("title") or "").strip()
+        and (a.get("reason") or "").strip()
+    ][:MAX_AWARDS]
+    if awards:
+        await state.emit(_command("awards", {"tool": "awards", "awards": awards}))
+    return {}
+
+
 @dataclass(frozen=True)
 class Agent:
     run: Callable[[LiveState], Awaitable[dict[str, Any]]]
@@ -556,7 +788,10 @@ class Agent:
 
 
 AGENTS = {
-    GAME_MASTER: Agent(narrate, seconds=20, attempts=1),
+    # Una narración que llega después de su momento ya no sirve: el Game Core
+    # la descarta. Mejor no esperarla más.
+    GAME_MASTER: Agent(narrate, seconds=10, attempts=1),
+    AWARDER: Agent(award, seconds=20, attempts=1),
     EVALUATOR: Agent(evaluate, seconds=25, attempts=2),
     TEAMMATE: Agent(reply, seconds=20, attempts=1),
     GRADER: Agent(grade, seconds=300, attempts=2),

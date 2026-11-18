@@ -17,6 +17,8 @@ missing, and the host still has the game's fixed grades in the Game Core.
 """
 
 import asyncio
+import dataclasses
+import time
 from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -26,7 +28,7 @@ import structlog
 from .config import campus_settings
 from .design import designer
 from .files import Files
-from .live import AGENTS, EVALUATOR, GAME_MASTER, GRADER, TEAMMATE, LiveState
+from .live import AGENTS, AWARDER, EVALUATOR, GAME_MASTER, GRADER, TEAMMATE, LiveState
 from .store import Store
 
 logger = structlog.get_logger(__name__)
@@ -166,14 +168,37 @@ class Campus:
                 return []
             return [(TEAMMATE, state({**feed, "seq": seq}))]
         if kind == "finished":
-            return [(GRADER, state(feed))]
+            # Los premios primero: se ven en el podio; el informe puede tardar.
+            awards = [(AWARDER, state(feed))] if ai.get("awards") else []
+            return [*awards, (GRADER, state(feed))]
         return []
 
     async def _run(self, name: str, state: LiveState) -> None:
         agent = AGENTS[name]
+        # What the agent published, for the log line: a narration, a voice, a grade.
+        emitted: dict[str, int] = {}
+        publish = state.emit
+
+        async def counted(event: dict[str, Any]) -> None:
+            kind = event.get("event", "?")
+            emitted[kind] = emitted.get(kind, 0) + 1
+            await publish(event)
+
+        state = dataclasses.replace(state, emit=counted)
+        started = time.monotonic()
         for attempt in range(1, agent.attempts + 1):
             try:
                 await asyncio.wait_for(agent.run(state), timeout=agent.seconds)
+                logger.info(
+                    "campus_agent_done",
+                    agent=name,
+                    session_id=state.session_id,
+                    feed=state.feed.get("feed"),
+                    attempt=attempt,
+                    ms=round((time.monotonic() - started) * 1000),
+                    emitted=emitted,
+                    **state.outcome,
+                )
                 return
             except Exception as error:  # noqa: BLE001 — a failed agent never stops the game
                 logger.warning(
@@ -183,6 +208,12 @@ class Campus:
                     attempt=attempt,
                     error=f"{type(error).__name__}: {error}"[:300],
                 )
+        logger.warning(
+            "campus_agent_gave_up",
+            agent=name,
+            session_id=state.session_id,
+            ms=round((time.monotonic() - started) * 1000),
+        )
 
     async def _finish(self, stream_id: str, work: list[tuple[str, LiveState]]) -> None:
         # The report is the last thing: what is still running on this instance
@@ -292,4 +323,3 @@ def get_campus() -> Campus:
     if _campus is None:
         raise RuntimeError("Campus is not configured")
     return _campus
-

@@ -44,6 +44,9 @@ class Llm(Protocol):
     async def speech(self, text: str, lang: str) -> bytes:
         """Audio WAV de ``text``."""
 
+    def model(self, smart: bool = False) -> str:
+        """El modelo que responde ``json``: queda con cada nota, para calibrarlas."""
+
 
 class GeminiLlm:
     """Gemini por Vertex AI, con las credenciales de Google Cloud del entorno."""
@@ -54,6 +57,9 @@ class GeminiLlm:
         self._client = genai.Client(
             vertexai=True, project=config.gemini_project, location=config.gemini_location
         )
+
+    def model(self, smart: bool = False) -> str:
+        return config.smart_model if smart else config.fast_model
 
     async def json(
         self,
@@ -72,7 +78,7 @@ class GeminiLlm:
         ]
         parts.append(types.Part.from_text(text=json.dumps(data, ensure_ascii=False)))
         response = await self._client.aio.models.generate_content(
-            model=config.smart_model if smart else config.fast_model,
+            model=self.model(smart),
             contents=[types.Content(role="user", parts=parts)],
             config=types.GenerateContentConfig(
                 system_instruction=system,
@@ -121,6 +127,9 @@ def pcm_to_wav(pcm: bytes, rate: int = 24000) -> bytes:
 class FakeLlm:
     """Respuestas fijas, sin red. Lo que contesta depende solo de los datos."""
 
+    def model(self, smart: bool = False) -> str:
+        return "fake-smart" if smart else "fake"
+
     async def json(
         self,
         task: str,
@@ -141,13 +150,31 @@ class FakeLlm:
             named += "".join(f" · racha {{{s['player_id']}}}" for s in streaks)
             said = f", primero {first['alias']}" if first else ""
             said += "".join(f", {s['alias']} en racha" for s in streaks)
-            return {
+            reply: dict[str, Any] = {
                 "text": f"[GM] {line}{named}",
                 "spoken": f"Game Master: {line}{said}",
                 "rooms": [
                     {"team_id": team["team_id"], "text": f"[GM] {team['team_id']}: {line}"}
                     for team in data.get("rooms_for", [])
                 ],
+            }
+            # Como director: un premio en la primera pregunta delante del último.
+            board = data.get("board")
+            if board and board.get("ahead"):
+                last = board["ahead"][-1]["squares"]
+                first = next((s for s in last if s["kind"] == "question"), None)
+                reply["board"] = [{"node": first["node"], "kind": "bonus"}] if first else []
+            return reply
+        if task == "awards":
+            return {
+                "awards": [
+                    {
+                        "player_id": c["player_id"],
+                        "title": f"Premio {c['award']}",
+                        "reason": f"{{{c['player_id']}}}: {c['fact']}.",
+                    }
+                    for c in data["candidates"]
+                ]
             }
         if task == "describe":
             return {

@@ -100,11 +100,19 @@ Recibes en `line` lo que acaba de pasar:
 - round_start: empieza la ronda `round` de `rounds`; todos tiran el dado. En la ronda 1
   empieza la partida: da la bienvenida.
 - last_round: empieza la última ronda.
-- squares: las fichas ya avanzaron y cada quien resuelve su casilla.
+- squares: las fichas ya avanzaron y todos responden la misma pregunta; la casilla de cada
+  equipo decide cuánto gana o pierde.
 - activity_intro: empieza una actividad; `activity` dice cómo se juega: cuéntalo con tus
   palabras, sin copiarlo. Con `lightning`, es una ronda relámpago extra, porque la partida
   va adelantada.
-- round_end: terminó la ronda; `leaders` son los equipos que van primero.
+- round_end: terminó la ronda; `leaders` son los equipos que van primero y `focus` dice de
+  qué hablar esta vez, para no repetir siempre quién va primero:
+  · `top`: el podio, `teams` del primero al tercero.
+  · `streak`: `team_id` lleva `streak` aciertos seguidos.
+  · `climb`: `team_id` subió del puesto `from` al `to` en esta ronda.
+  · `fastest`: `team_id` dio el acierto más rápido de la ronda, en `elapsed_ms` milisegundos
+    (dilo en segundos con dos decimales).
+  Habla de ese dato. Si `focus` no es `top`, no digas quién va primero.
 - coop_end: terminó una misión cooperativa; `success` dice si la lograron.
 - game_over: terminó la partida; `winners` son los ganadores.
 `teams` trae los puntos y la casilla de cada equipo; `outcomes`, lo que le pasó a cada uno
@@ -113,8 +121,9 @@ los que están en racha (`streak`: aciertos seguidos, desde 3). Cuenta solo lo q
 datos: no inventes reglas, premios ni cifras.
 {who}
 
-Siempre que `standings` no esté vacío, nombra a quien va primero y felicita a quien esté en
-racha, en pocas palabras. Nunca digas quién falló ni quién va último.
+Al cierre de ronda, sigue `focus`. En las demás frases puedes nombrar a quien va primero o
+felicitar a quien esté en racha, pero no lo hagas en cada frase: varía. Nunca digas quién
+falló ni quién va último.
 
 {style} Nunca te burles de un estudiante.{board}
 
@@ -123,7 +132,9 @@ Escribe en {language}, con tono {tone}. Máximo 40 palabras por texto.
   identificador entre llaves, por ejemplo {{p3}}, {{t2}} o {{g3}}; la pantalla lo cambia por su
   nombre. Nunca escribas el `alias` aquí ni inventes nombres.
 - `spoken`: la misma narración para leer en voz alta, sin identificadores ni llaves. A los
-  jugadores de `standings` llámalos por su `alias`; a cualquier otro, «quien va primero».
+  jugadores de `standings` llámalos por su `alias`; a cualquier otro, por lo que hizo
+  («quien va primero», «quien lleva la racha», «quien más subió», «quien respondió más
+  rápido»).
 - `rooms`: {rooms}"""
 
 WHO_GROUPS = "Se juega por grupos: cada identificador de `teams` es un grupo de estudiantes."
